@@ -1,8 +1,8 @@
 # test-affine
 
-Experiments for a loss-tolerant drone video codec based on image warping.
+Experiments for a loss-tolerant image/video codec based on keyframe warping.
 
-Current focus: estimate global affine motion with Lucas-Kanade tracking, then model the remaining local motion with a coarse deformation mesh.
+Current focus: a UDP-oriented codec prototype with periodic JPEG keyframes and intermediate frames represented by partial-affine motion plus a coarse residual deformation mesh.
 
 ## Local test data
 
@@ -12,14 +12,7 @@ Keep flight frames locally in:
 local-data/frames/
 ```
 
-Both `local-data/` and generated `output/` are ignored by Git, so the real flight images are not accidentally published.
-
-With no command-line arguments the programs use:
-
-```text
-input:  local-data/frames
-output: output/affine   or   output/mesh
-```
+Both `local-data/` and generated `output/` are ignored by Git, so local test images are not accidentally published.
 
 ## Build
 
@@ -28,58 +21,105 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-Executables are written to `build/bin/` for a stable path across CMake generators.
+Executables are written to `build/bin/`.
 
 ## VS Code / F5
 
-The repository contains `.vscode/tasks.json` and `.vscode/launch.json`.
-
 1. Put images into `local-data/frames/`.
 2. Open the repository folder in VS Code.
-3. In **Run and Debug**, select either `Run mesh_test` or `Run affine_test`.
+3. In **Run and Debug**, select `Run codec_test`.
 4. Press **F5**.
 
-F5 first runs CMake configure/build and then starts the test with the repository root as the working directory, so no command-line paths are needed.
+F5 configures/builds first, then runs from the repository root.
 
-## Affine test
+## UDP codec prototype
 
-Quick local run:
+Files:
 
-```bash
-build/bin/affine_test.exe
+```text
+udp_image_codec.h
+udp_image_codec.cpp
+codec_test.cpp
 ```
 
-Optional overrides:
+Encoder API:
 
-```bash
-build/bin/affine_test.exe <frames> <output>
+```cpp
+affinecodec::Encoder encoder;
+encoder.pushImage(image, desired_jpeg_size, keyframe_once_in_N);
+
+std::vector<affinecodec::u_char> data;
+while (encoder.getNextChunk(data)) {
+    // data is one packet, maximum 1300 bytes
+}
 ```
 
-The test tracks strong features with pyramidal Lucas-Kanade optical flow, rejects inconsistent tracks with forward/backward checking, and compares partial vs full affine models estimated with RANSAC.
+Decoder API:
 
-## Mesh test
+```cpp
+affinecodec::Decoder decoder;
+decoder.pushData(data);
 
-Quick local run:
+std::vector<affinecodec::u_char> jpeg_data;
+if (decoder.updateKeyframe(jpeg_data)) {
+    // jpeg_data is a normal JPEG bitstream
+}
 
-```bash
-build/bin/mesh_test.exe
+std::vector<affinecodec::PatchData> patch;
+if (decoder.getNextPatch(patch)) {
+    // partial-affine + residual mesh in original-image coordinates
+}
+
+decoder.render(destination, patch, jpeg_data);
 ```
 
-Optional overrides:
+Current v1 model:
+
+- Hard packet size limit: `1300` bytes.
+- Every input image currently produces one packet.
+- Keyframe packet: compact codec header + one ordinary JPEG.
+- JPEG is resized to fit the packet. Width and height are multiples of 8.
+- Original width/height are transmitted separately, and the decoder expands the JPEG back to that size before warping.
+- Motion data therefore does not depend on the transmitted JPEG resolution.
+- Intermediate packet: partial-affine transform + `4x4` residual deformation mesh; currently 176 bytes.
+- Motion is estimated directly from the current full-resolution keyframe, never chained frame-to-frame.
+- LK works on grayscale even when the transmitted JPEG is color.
+- Features are selected once per keyframe on an `8x8` grid, up to 3 Shi-Tomasi corners per cell.
+- The keyframe LK pyramid is cached and reused for all intermediate frames.
+- Decoder caches the decoded/upscaled keyframe and render buffers.
+- Missing warped borders use the existing propagation + diffusion fill.
+- If LK/partial-affine estimation fails, encoder sends a fresh keyframe instead.
+
+Residual image/refinement tiles are intentionally not part of v1 yet; they can be added later as another packet type.
+
+### End-to-end test
+
+Default:
 
 ```bash
-build/bin/mesh_test.exe <frames> <output> [grid-x] [grid-y]
+build/bin/codec_test
 ```
 
-Default mesh size is `4x4`.
+Optional arguments:
 
-Current mesh model:
+```bash
+build/bin/codec_test <frames> <output> [jpeg-bytes] [key-period]
+```
 
-1. Track LK features.
-2. Estimate robust 6-DOF affine transform with RANSAC.
-3. Compute residual motion for each LK track after subtracting affine motion.
-4. Estimate residual displacement at coarse mesh nodes with Gaussian weighting.
-5. Interpolate the coarse mesh to a dense deformation field.
-6. Warp the reference with affine + residual mesh and compare against the next frame.
+For example:
 
-On the supplied 56-frame 416x416 real drone sequence, the first simple `4x4` mesh reduced mean adjacent-frame grayscale MAE from roughly `8.60` to `7.29` (~15%). Denser meshes did not improve this naive estimator, suggesting that robust local fitting should come before increasing mesh resolution.
+```bash
+build/bin/codec_test local-data/frames output/codec 1300 5
+```
+
+The test passes every encoder packet directly into the decoder and writes side-by-side images:
+
+```text
+ORIGINAL | DECODED
+```
+
+It also prints packet bytes and color MAE for every frame.
+
+## Earlier experiments
+
+`affine_test`, `mesh_test`, and `keyframe_test` remain available for the earlier motion-model experiments.

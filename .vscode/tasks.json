@@ -10,6 +10,15 @@
             "problemMatcher": []
         },
         {
+            "label": "build codec_test Release",
+            "type": "process",
+            "command": "cmake",
+            "args": ["--build", "${workspaceFolder}/build", "--config", "Release", "--target", "codec_test"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "dependsOn": "cmake configure",
+            "problemMatcher": []
+        },
+        {
             "label": "build keyframe_test Release",
             "type": "process",
             "command": "cmake",
