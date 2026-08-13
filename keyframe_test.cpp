@@ -26,9 +26,37 @@ static std::vector<fs::path> listImages(const fs::path& dir) {
     return v;
 }
 
+static std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& image,
+                                                    int gridX = 8,
+                                                    int gridY = 8,
+                                                    int pointsPerCell = 3) {
+    std::vector<cv::Point2f> points;
+    points.reserve(gridX * gridY * pointsPerCell);
+
+    for (int gy = 0; gy < gridY; ++gy) {
+        const int y0 = gy * image.rows / gridY;
+        const int y1 = (gy + 1) * image.rows / gridY;
+        for (int gx = 0; gx < gridX; ++gx) {
+            const int x0 = gx * image.cols / gridX;
+            const int x1 = (gx + 1) * image.cols / gridX;
+            const cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
+            if (roi.width < 7 || roi.height < 7) continue;
+
+            std::vector<cv::Point2f> local;
+            cv::goodFeaturesToTrack(image(roi), local, pointsPerCell,
+                                    0.01, 7.0, cv::noArray(), 7, false, 0.04);
+            for (cv::Point2f p : local) {
+                p.x += float(x0);
+                p.y += float(y0);
+                points.push_back(p);
+            }
+        }
+    }
+    return points;
+}
+
 static TrackSet trackLK(const cv::Mat& a, const cv::Mat& b) {
-    std::vector<cv::Point2f> p0;
-    cv::goodFeaturesToTrack(a, p0, 800, 0.01, 7.0, cv::noArray(), 7, false, 0.04);
+    std::vector<cv::Point2f> p0 = selectGridFeatures(a, 8, 8, 3);
     TrackSet out;
     if (p0.empty()) return out;
 
@@ -88,10 +116,10 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     WarpResult r;
     TrackSet t = trackLK(ref, cur);
     r.tracks = int(t.p0.size());
-    if (t.p0.size() < 6) return r;
+    if (t.p0.size() < 4) return r;
 
     cv::Mat inliers;
-    cv::Mat affine = cv::estimateAffine2D(t.p0, t.p1, inliers,
+    cv::Mat affine = cv::estimateAffinePartial2D(t.p0, t.p1, inliers,
         cv::RANSAC, 2.0, 3000, 0.995, 10);
     if (affine.empty()) return r;
     r.inlierRatio = double(cv::countNonZero(inliers)) / double(inliers.total());
@@ -103,13 +131,12 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     cv::warpAffine(srcMask, r.affineValid, affine, cur.size(),
                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, 0);
 
-    // Keep the raw mask for visual filling. Use a slightly eroded copy only
-    // for metrics, so interpolation at the source boundary does not bias MAE.
     cv::Mat affineMetricValid = r.affineValid.clone();
     cv::erode(affineMetricValid, affineMetricValid, cv::Mat::ones(5,5,CV_8U));
 
     std::vector<cv::Point2f> q, residual;
     for (size_t i=0; i<t.p0.size(); ++i) {
+        if (!inliers.empty() && inliers.at<uchar>(int(i), 0) == 0) continue;
         cv::Point2f qi = applyAffine(affine, t.p0[i]);
         cv::Point2f ri = t.p1[i] - qi;
         if (cv::norm(ri) < 10.0) {
@@ -181,8 +208,6 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
     cv::Mat out = gray.clone();
     if (cv::countNonZero(valid) == 0) return out;
 
-    // state: 0 = black/unseen, 1 = queued for this or next wave, 2 = known pixel.
-    // The queued state is the temporary mark that prevents adding a pixel twice.
     cv::Mat state(gray.size(), CV_8U, cv::Scalar(0));
     for (int y = 0; y < gray.rows; ++y) {
         const uchar* vm = valid.ptr<uchar>(y);
@@ -194,76 +219,68 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
     static const int dx[8] = {-1,0,1,-1,1,-1,0,1};
     static const int dy[8] = {-1,-1,-1,0,0,1,1,1};
 
-    std::vector<cv::Point> current;
-    current.reserve(gray.rows + gray.cols);
+    std::vector<cv::Point> queue;
+    queue.reserve(gray.total());
 
-    // Initial wave: missing pixels that already touch known pixels.
     for (int y = 0; y < gray.rows; ++y) {
         for (int x = 0; x < gray.cols; ++x) {
             if (state.at<uchar>(y,x) != 0) continue;
-            bool touchesKnown = false;
             for (int k = 0; k < 8; ++k) {
-                const int nx = x + dx[k];
-                const int ny = y + dy[k];
+                const int nx = x + dx[k], ny = y + dy[k];
                 if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
                 if (state.at<uchar>(ny,nx) == 2) {
-                    touchesKnown = true;
+                    state.at<uchar>(y,x) = 1;
+                    queue.emplace_back(x,y);
                     break;
                 }
-            }
-            if (touchesKnown) {
-                state.at<uchar>(y,x) = 1;
-                current.emplace_back(x,y);
             }
         }
     }
 
-    std::vector<cv::Point> next;
-    std::vector<uchar> values;
+    size_t head = 0;
+    while (head < queue.size()) {
+        const cv::Point p = queue[head++];
 
-    while (!current.empty()) {
-        // Calculate the whole wave before changing any pixel in it. Therefore
-        // all pixels at the same depth see only the previous, already-known wave.
-        values.resize(current.size());
-        for (size_t i = 0; i < current.size(); ++i) {
-            const int x = current[i].x;
-            const int y = current[i].y;
-            int sum = 0;
-            int cnt = 0;
-            for (int k = 0; k < 8; ++k) {
-                const int nx = x + dx[k];
-                const int ny = y + dy[k];
-                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
-                if (state.at<uchar>(ny,nx) == 2) {
-                    sum += out.at<uchar>(ny,nx);
+        int sum = 0, cnt = 0;
+        for (int k = 0; k < 8; ++k) {
+            const int nx = p.x + dx[k], ny = p.y + dy[k];
+            if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+            if (state.at<uchar>(ny,nx) == 2) {
+                sum += out.at<uchar>(ny,nx);
+                ++cnt;
+            }
+        }
+        if (cnt > 0)
+            out.at<uchar>(p.y,p.x) = uchar((sum + cnt/2) / cnt);
+        state.at<uchar>(p.y,p.x) = 2;
+
+        for (int k = 0; k < 8; ++k) {
+            const int nx = p.x + dx[k], ny = p.y + dy[k];
+            if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+            uchar& st = state.at<uchar>(ny,nx);
+            if (st == 0) {
+                st = 1;
+                queue.emplace_back(nx,ny);
+            }
+        }
+    }
+
+    cv::Mat prev = out.clone();
+    for (int pass = 0; pass < 2; ++pass) {
+        out.copyTo(prev);
+        for (int y = 0; y < gray.rows; ++y) {
+            for (int x = 0; x < gray.cols; ++x) {
+                if (valid.at<uchar>(y,x)) continue;
+                int sum = 0, cnt = 0;
+                for (int k = 0; k < 8; ++k) {
+                    const int nx = x + dx[k], ny = y + dy[k];
+                    if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+                    sum += prev.at<uchar>(ny,nx);
                     ++cnt;
                 }
-            }
-            values[i] = cnt > 0 ? uchar((sum + cnt/2) / cnt) : 0;
-        }
-
-        for (size_t i = 0; i < current.size(); ++i) {
-            const cv::Point& p = current[i];
-            out.at<uchar>(p.y,p.x) = values[i];
-            state.at<uchar>(p.y,p.x) = 2;
-        }
-
-        // Expand by one pixel. Mark immediately as queued so the same point
-        // cannot be inserted by several neighbours.
-        next.clear();
-        for (const cv::Point& p : current) {
-            for (int k = 0; k < 8; ++k) {
-                const int nx = p.x + dx[k];
-                const int ny = p.y + dy[k];
-                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
-                uchar& st = state.at<uchar>(ny,nx);
-                if (st == 0) {
-                    st = 1;
-                    next.emplace_back(nx,ny);
-                }
+                if (cnt > 0) out.at<uchar>(y,x) = uchar((sum + cnt/2) / cnt);
             }
         }
-        current.swap(next);
     }
 
     return out;
@@ -364,11 +381,11 @@ int main(int argc, char** argv) {
         cv::Mat originalPanel = labelImage(cur, "ORIGINAL", originalInfo);
         cv::Mat affinePanel = labelImage(
             affineWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (PROPAGATED FILL)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "PARTIAL AFFINE ONLY (filled)",
             affineInfo);
         cv::Mat meshPanel = labelImage(
             meshWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (PROPAGATED FILL)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "PARTIAL AFFINE + MESH (filled)",
             meshInfo);
 
         cv::Mat side;
@@ -396,7 +413,8 @@ int main(int argc, char** argv) {
 
     std::cout << "\nOutput: " << outputDir << "\n"
               << "Every " << N << "th frame is a new reference.\n"
-              << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n"
-              << "Missing pixels use iterative wavefront fill; metrics remain based on valid pixels only.\n";
+              << "LK features: 8x8 spatial grid, up to 3 Shi-Tomasi corners per cell.\n"
+              << "Each output image is ORIGINAL | PARTIAL AFFINE ONLY | PARTIAL AFFINE + MESH.\n"
+              << "Visual previews use iterative filled borders; metrics remain based on valid pixels only.\n";
     return 0;
 }
