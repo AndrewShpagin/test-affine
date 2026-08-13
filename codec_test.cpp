@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
 
     const fs::path input_dir = argc > 1 ? fs::path(argv[1]) : fs::path("local-data/frames");
     const fs::path output_dir = argc > 2 ? fs::path(argv[2]) : fs::path("output/codec");
-    const int jpeg_bytes = argc > 3 ? std::stoi(argv[3]) : 1300;
+    const int jpeg_bytes = argc > 3 ? std::stoi(argv[3]) : 40000;
     const int key_period = argc > 4 ? std::stoi(argv[4]) : 5;
 
     if (!fs::exists(input_dir)) {
@@ -78,6 +78,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     fs::create_directories(output_dir);
+
+    // print parameters:
+    std::cout << "Input folder: " << input_dir << '\n'
+              << "Output folder: " << output_dir << '\n'
+              << "JPEG bytes: " << jpeg_bytes << '\n'
+              << "Keyframe period: " << key_period << '\n'
+              << "Number of images: " << files.size() << "\n\n";
 
     Encoder encoder;
     Decoder decoder;
