@@ -1,0 +1,8 @@
+/build/
+/output/
+/local-data/
+
+# Common local/editor artifacts
+*.user
+*.suo
+.vs/
