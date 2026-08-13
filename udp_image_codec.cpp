@@ -27,6 +27,7 @@ constexpr float kLkForwardErrorMax = 35.0f;
 constexpr float kLkBackwardErrorMax = 1.5f;
 constexpr float kResidualMax = 10.0f;
 constexpr double kTargetBrightness = 128.0;
+constexpr double kTargetLkStdDev = 64.0;
 constexpr std::size_t kCommonHeaderBytes = 20;
 constexpr std::size_t kKeyframeChunkHeaderBytes = 40;
 constexpr std::size_t kKeyframeChunkPayloadBytes = kMaxUdpPacketBytes - kKeyframeChunkHeaderBytes;
@@ -131,6 +132,20 @@ cv::Mat jpegInput8(const cv::Mat& image) {
 double brightnessGainTo128(const cv::Mat& gray) {
     const double mean_brightness = cv::mean(gray)[0];
     return mean_brightness > 1e-6 ? kTargetBrightness / mean_brightness : 1.0;
+}
+
+cv::Mat normalizeGrayForLk(const cv::Mat& gray) {
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(gray, mean, stddev);
+    cv::Mat normalized;
+    if (stddev[0] <= 1e-6) {
+        normalized = cv::Mat(gray.size(), CV_8U, cv::Scalar(kTargetBrightness));
+        return normalized;
+    }
+    const double scale = kTargetLkStdDev / stddev[0];
+    const double shift = kTargetBrightness - mean[0] * scale;
+    gray.convertTo(normalized, CV_8U, scale, shift);
+    return normalized;
 }
 
 cv::Mat normalizeColorBrightness(const cv::Mat& image, double gain) {
@@ -432,8 +447,7 @@ void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once
     if (raw_gray.empty()) return;
 
     const double brightness_gain = brightnessGainTo128(raw_gray);
-    cv::Mat gray;
-    raw_gray.convertTo(gray, CV_8U, brightness_gain);
+    const cv::Mat gray = normalizeGrayForLk(raw_gray);
 
     const std::uint32_t frame_id = next_frame_id_++;
     const int period = std::max(1, keyframe_once_in_N);
