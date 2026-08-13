@@ -65,31 +65,54 @@ static cv::Point2f applyAffine(const cv::Mat& M, const cv::Point2f& p) {
     };
 }
 
+static double maskedMAE(const cv::Mat& a, const cv::Mat& b, const cv::Mat& mask) {
+    cv::Mat diff;
+    cv::absdiff(a, b, diff);
+    return cv::mean(diff, mask)[0];
+}
+
 struct WarpResult {
-    cv::Mat warped;
-    cv::Mat valid;
-    double mae = 0.0;
+    cv::Mat affineWarp;
+    cv::Mat meshWarp;
+    double affineMae = 0.0;
+    double meshMae = 0.0;
     int tracks = 0;
     double inlierRatio = 0.0;
     bool ok = false;
 };
 
-static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur, int gx=4, int gy=4, double sigma=80.0) {
+static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
+                                    int gx=4, int gy=4, double sigma=80.0) {
     WarpResult r;
     TrackSet t = trackLK(ref, cur);
     r.tracks = int(t.p0.size());
     if (t.p0.size() < 6) return r;
 
     cv::Mat inliers;
-    cv::Mat affine = cv::estimateAffine2D(t.p0, t.p1, inliers, cv::RANSAC, 2.0, 3000, 0.995, 10);
+    cv::Mat affine = cv::estimateAffine2D(t.p0, t.p1, inliers,
+        cv::RANSAC, 2.0, 3000, 0.995, 10);
     if (affine.empty()) return r;
     r.inlierRatio = double(cv::countNonZero(inliers)) / double(inliers.total());
 
+    // First reconstruction: global affine only.
+    cv::warpAffine(ref, r.affineWarp, affine, cur.size(),
+                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
+
+    cv::Mat srcMask(ref.size(), CV_8U, cv::Scalar(255));
+    cv::Mat affineValid;
+    cv::warpAffine(srcMask, affineValid, affine, cur.size(),
+                   cv::INTER_NEAREST, cv::BORDER_CONSTANT, 0);
+    cv::erode(affineValid, affineValid, cv::Mat::ones(5,5,CV_8U));
+
+    // Residual LK motion after removing the affine part.
     std::vector<cv::Point2f> q, residual;
     for (size_t i=0; i<t.p0.size(); ++i) {
         cv::Point2f qi = applyAffine(affine, t.p0[i]);
         cv::Point2f ri = t.p1[i] - qi;
-        if (cv::norm(ri) < 10.0) { q.push_back(qi); residual.push_back(ri); }
+        if (cv::norm(ri) < 10.0) {
+            q.push_back(qi);
+            residual.push_back(ri);
+        }
     }
 
     cv::Mat grid(gy, gx, CV_32FC2, cv::Scalar(0,0));
@@ -117,36 +140,47 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur, int 
     cv::Mat inv;
     cv::invertAffineTransform(affine, inv);
     cv::Mat mapx(cur.size(), CV_32F), mapy(cur.size(), CV_32F);
-    r.valid = cv::Mat(cur.size(), CV_8U, cv::Scalar(0));
+    cv::Mat meshValid(cur.size(), CV_8U, cv::Scalar(0));
 
     for (int y=0; y<cur.rows; ++y) {
         const cv::Vec2f* dr=dense.ptr<cv::Vec2f>(y);
         float* mx=mapx.ptr<float>(y);
         float* my=mapy.ptr<float>(y);
-        uchar* vm=r.valid.ptr<uchar>(y);
+        uchar* vm=meshValid.ptr<uchar>(y);
         for (int x=0; x<cur.cols; ++x) {
             const double tx=x-dr[x][0], ty=y-dr[x][1];
             const double sx=inv.at<double>(0,0)*tx + inv.at<double>(0,1)*ty + inv.at<double>(0,2);
             const double sy=inv.at<double>(1,0)*tx + inv.at<double>(1,1)*ty + inv.at<double>(1,2);
-            mx[x]=float(sx); my[x]=float(sy);
+            mx[x]=float(sx);
+            my[x]=float(sy);
             if (sx>=2 && sx<ref.cols-2 && sy>=2 && sy<ref.rows-2) vm[x]=255;
         }
     }
 
-    cv::remap(ref, r.warped, mapx, mapy, cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
-    cv::Mat diff;
-    cv::absdiff(r.warped, cur, diff);
-    r.mae = cv::mean(diff, r.valid)[0];
+    cv::remap(ref, r.meshWarp, mapx, mapy,
+              cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
+
+    // Compare both warps on exactly the same valid pixels.
+    cv::Mat commonValid;
+    cv::bitwise_and(affineValid, meshValid, commonValid);
+    if (cv::countNonZero(commonValid) == 0) return r;
+
+    r.affineMae = maskedMAE(r.affineWarp, cur, commonValid);
+    r.meshMae = maskedMAE(r.meshWarp, cur, commonValid);
     r.ok = true;
     return r;
 }
 
-static cv::Mat labelImage(const cv::Mat& gray, const std::string& title, const std::string& line2) {
+static cv::Mat labelImage(const cv::Mat& gray,
+                          const std::string& title,
+                          const std::string& line2) {
     cv::Mat color;
     cv::cvtColor(gray, color, cv::COLOR_GRAY2BGR);
     cv::rectangle(color, cv::Rect(0,0,color.cols,52), cv::Scalar(0,0,0), cv::FILLED);
-    cv::putText(color, title, {10,21}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255,255,255}, 1, cv::LINE_AA);
-    cv::putText(color, line2, {10,43}, cv::FONT_HERSHEY_SIMPLEX, 0.48, {255,255,255}, 1, cv::LINE_AA);
+    cv::putText(color, title, {10,21}, cv::FONT_HERSHEY_SIMPLEX,
+                0.55, {255,255,255}, 1, cv::LINE_AA);
+    cv::putText(color, line2, {10,43}, cv::FONT_HERSHEY_SIMPLEX,
+                0.43, {255,255,255}, 1, cv::LINE_AA);
     return color;
 }
 
@@ -163,14 +197,20 @@ int main(int argc, char** argv) {
     const int gy = argc>5 ? std::stoi(argv[5]) : 4;
 
     if (N < 1) { std::cerr << "key-period must be >= 1\n"; return 2; }
-    if (!fs::exists(inputDir)) { std::cerr << "Input folder does not exist: " << inputDir << "\n"; return 1; }
+    if (!fs::exists(inputDir)) {
+        std::cerr << "Input folder does not exist: " << inputDir << "\n";
+        return 1;
+    }
 
     const auto files = listImages(inputDir);
-    if (files.size() < 2) { std::cerr << "Need at least two images in " << inputDir << "\n"; return 1; }
+    if (files.size() < 2) {
+        std::cerr << "Need at least two images in " << inputDir << "\n";
+        return 1;
+    }
     fs::create_directories(outputDir);
 
     std::ofstream csv(outputDir / "keyframe_metrics.csv");
-    csv << "frame,keyframe,distance,tracks,inlier_ratio,mae,ok\n";
+    csv << "frame,keyframe,distance,tracks,inlier_ratio,affine_mae,mesh_mae,gain_percent,ok\n";
 
     cv::Mat ref;
     size_t keyIndex = 0;
@@ -185,48 +225,79 @@ int main(int argc, char** argv) {
         }
 
         const int distance = int(i - keyIndex);
-        cv::Mat reconstructed;
-        double mae = 0.0;
+        cv::Mat affineWarp, meshWarp;
+        double affineMae = 0.0;
+        double meshMae = 0.0;
+        double gain = 0.0;
         int tracks = 0;
         double inlierRatio = 1.0;
         bool ok = true;
 
         if (i == keyIndex) {
-            reconstructed = ref.clone();
+            affineWarp = ref.clone();
+            meshWarp = ref.clone();
         } else {
             WarpResult wr = warpFromReference(ref, cur, gx, gy);
             ok = wr.ok;
             tracks = wr.tracks;
             inlierRatio = wr.inlierRatio;
-            mae = wr.mae;
-            if (wr.ok) reconstructed = wr.warped;
-            else reconstructed = cv::Mat(cur.size(), cur.type(), cv::Scalar(0));
+            affineMae = wr.affineMae;
+            meshMae = wr.meshMae;
+            if (wr.ok) {
+                affineWarp = wr.affineWarp;
+                meshWarp = wr.meshWarp;
+                if (affineMae > 1e-9)
+                    gain = 100.0 * (affineMae - meshMae) / affineMae;
+            } else {
+                affineWarp = cv::Mat(cur.size(), cur.type(), cv::Scalar(0));
+                meshWarp = affineWarp.clone();
+            }
         }
 
-        const std::string left2 = "frame " + std::to_string(i) + "   file " + files[i].filename().string();
-        const std::string right2 = "key " + std::to_string(keyIndex) + "   d=" + std::to_string(distance) +
-            "   MAE=" + cv::format("%.2f", mae) + "   inl=" + cv::format("%.1f%%", 100.0*inlierRatio);
+        const std::string originalInfo =
+            "frame " + std::to_string(i) + "  file " + files[i].filename().string();
+        const std::string affineInfo =
+            "key " + std::to_string(keyIndex) + " d=" + std::to_string(distance) +
+            "  MAE=" + cv::format("%.2f", affineMae) +
+            "  inl=" + cv::format("%.0f%%", 100.0*inlierRatio);
+        const std::string meshInfo =
+            cv::format("mesh %dx%d  MAE=%.2f  gain=%+.1f%%", gx, gy, meshMae, gain);
 
-        cv::Mat left = labelImage(cur, "ORIGINAL", left2);
-        cv::Mat right = labelImage(reconstructed, i==keyIndex ? "REFERENCE / KEYFRAME" : "WARP FROM KEYFRAME", right2);
+        cv::Mat originalPanel = labelImage(cur, "ORIGINAL", originalInfo);
+        cv::Mat affinePanel = labelImage(
+            affineWarp,
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY",
+            affineInfo);
+        cv::Mat meshPanel = labelImage(
+            meshWarp,
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH",
+            meshInfo);
+
         cv::Mat side;
-        cv::hconcat(std::vector<cv::Mat>{left,right}, side);
+        cv::hconcat(std::vector<cv::Mat>{originalPanel, affinePanel, meshPanel}, side);
 
         char name[64];
         std::snprintf(name, sizeof(name), "%04zu.jpg", i);
         cv::imwrite((outputDir / name).string(), side, {cv::IMWRITE_JPEG_QUALITY, 95});
 
         csv << i << ',' << keyIndex << ',' << distance << ',' << tracks << ','
-            << inlierRatio << ',' << mae << ',' << (ok ? 1 : 0) << '\n';
+            << inlierRatio << ',' << affineMae << ',' << meshMae << ','
+            << gain << ',' << (ok ? 1 : 0) << '\n';
 
-        std::cout << std::setw(4) << i << " key=" << std::setw(4) << keyIndex
-                  << " d=" << distance << " tracks=" << tracks
-                  << " inliers=" << std::fixed << std::setprecision(1) << 100.0*inlierRatio << "%"
-                  << " MAE=" << std::setprecision(2) << mae
+        std::cout << std::setw(4) << i
+                  << " key=" << std::setw(4) << keyIndex
+                  << " d=" << distance
+                  << " tracks=" << tracks
+                  << " inliers=" << std::fixed << std::setprecision(1)
+                  << 100.0*inlierRatio << "%"
+                  << " affine=" << std::setprecision(2) << affineMae
+                  << " mesh=" << meshMae
+                  << " gain=" << std::setprecision(1) << gain << "%"
                   << (i==keyIndex ? "  KEY" : "") << '\n';
     }
 
     std::cout << "\nOutput: " << outputDir << "\n"
-              << "Every " << N << "th frame is a new reference. Each output image is ORIGINAL | WARP FROM KEYFRAME.\n";
+              << "Every " << N << "th frame is a new reference.\n"
+              << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n";
     return 0;
 }
