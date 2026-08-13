@@ -26,6 +26,7 @@ constexpr int kLkMaxLevel = 5;
 constexpr float kLkForwardErrorMax = 35.0f;
 constexpr float kLkBackwardErrorMax = 1.5f;
 constexpr float kResidualMax = 10.0f;
+constexpr double kTargetBrightness = 128.0;
 constexpr std::size_t kCommonHeaderBytes = 20;
 constexpr std::size_t kKeyframeChunkHeaderBytes = 40;
 constexpr std::size_t kKeyframeChunkPayloadBytes = kMaxUdpPacketBytes - kKeyframeChunkHeaderBytes;
@@ -125,6 +126,19 @@ cv::Mat jpegInput8(const cv::Mat& image) {
     cv::Mat bgr;
     if (src8.channels() == 4) cv::cvtColor(src8, bgr, cv::COLOR_BGRA2BGR);
     return bgr;
+}
+
+double brightnessGainTo128(const cv::Mat& gray) {
+    const double mean_brightness = cv::mean(gray)[0];
+    return mean_brightness > 1e-6 ? kTargetBrightness / mean_brightness : 1.0;
+}
+
+cv::Mat normalizeColorBrightness(const cv::Mat& image, double gain) {
+    const cv::Mat source = jpegInput8(image);
+    if (source.empty()) return cv::Mat();
+    cv::Mat normalized;
+    source.convertTo(normalized, source.type(), gain);
+    return normalized;
 }
 
 std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray) {
@@ -409,14 +423,53 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
     return true;
 }
 
-void Encoder::pushImage(cv::Mat& image,int desired_jpeg_size,int keyframe_once_in_N){
-    if(image.empty())return;if(image.cols>std::numeric_limits<std::uint16_t>::max()||image.rows>std::numeric_limits<std::uint16_t>::max())return;
-    const cv::Mat gray=toGray8(image);if(gray.empty())return;const std::uint32_t frame_id=next_frame_id_++;const int period=std::max(1,keyframe_once_in_N);
-    const bool size_changed=have_reference_&&image.size()!=input_size_;const bool periodic=!have_reference_||period==1||frames_since_keyframe_>=period-1;
-    if(size_changed){have_reference_=false;jpeg_size_hint_=cv::Size();jpeg_budget_hint_=0;}
-    if(!have_reference_||periodic){emitKeyframe(image,gray,desired_jpeg_size,frame_id);return;}
-    PatchData patch;if(!estimatePatch(gray,frame_id,patch)){emitKeyframe(image,gray,desired_jpeg_size,frame_id);return;}
-    std::vector<u_char> packet=serializePatch(patch);if(packet.size()<=kMaxUdpPacketBytes){output_queue_.push_back(std::move(packet));++frames_since_keyframe_;}else emitKeyframe(image,gray,desired_jpeg_size,frame_id);
+void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once_in_N) {
+    if (image.empty()) return;
+    if (image.cols > std::numeric_limits<std::uint16_t>::max() ||
+        image.rows > std::numeric_limits<std::uint16_t>::max()) return;
+
+    const cv::Mat raw_gray = toGray8(image);
+    if (raw_gray.empty()) return;
+
+    const double brightness_gain = brightnessGainTo128(raw_gray);
+    cv::Mat gray;
+    raw_gray.convertTo(gray, CV_8U, brightness_gain);
+
+    const std::uint32_t frame_id = next_frame_id_++;
+    const int period = std::max(1, keyframe_once_in_N);
+    const bool size_changed = have_reference_ && image.size() != input_size_;
+    const bool periodic = !have_reference_ || period == 1 || frames_since_keyframe_ >= period - 1;
+
+    if (size_changed) {
+        have_reference_ = false;
+        jpeg_size_hint_ = cv::Size();
+        jpeg_budget_hint_ = 0;
+    }
+
+    auto emit_normalized_keyframe = [&]() {
+        cv::Mat normalized_image = normalizeColorBrightness(image, brightness_gain);
+        if (!normalized_image.empty())
+            emitKeyframe(normalized_image, gray, desired_jpeg_size, frame_id);
+    };
+
+    if (!have_reference_ || periodic) {
+        emit_normalized_keyframe();
+        return;
+    }
+
+    PatchData patch;
+    if (!estimatePatch(gray, frame_id, patch)) {
+        emit_normalized_keyframe();
+        return;
+    }
+
+    std::vector<u_char> packet = serializePatch(patch);
+    if (packet.size() <= kMaxUdpPacketBytes) {
+        output_queue_.push_back(std::move(packet));
+        ++frames_since_keyframe_;
+    } else {
+        emit_normalized_keyframe();
+    }
 }
 
 bool Encoder::getNextChunk(std::vector<u_char>& data){if(output_queue_.empty())return false;data=std::move(output_queue_.front());output_queue_.pop_front();return true;}
