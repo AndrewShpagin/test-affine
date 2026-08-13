@@ -12,7 +12,7 @@ Keep flight frames locally in:
 local-data/frames/
 ```
 
-Both `local-data/` and generated `output/` are ignored by Git, so local test images are not accidentally published.
+Both `local-data/` and generated `output/` are ignored by Git.
 
 ## Build
 
@@ -30,19 +30,7 @@ Executables are written to `build/bin/`.
 3. In **Run and Debug**, select `Run codec_test`.
 4. Press **F5**.
 
-F5 configures/builds first, then runs from the repository root.
-
 ## UDP codec prototype
-
-Files:
-
-```text
-udp_image_codec.h
-udp_image_codec.cpp
-codec_test.cpp
-```
-
-Encoder API:
 
 ```cpp
 affinecodec::Encoder encoder;
@@ -50,11 +38,13 @@ encoder.pushImage(image, desired_jpeg_size, keyframe_once_in_N);
 
 std::vector<affinecodec::u_char> data;
 while (encoder.getNextChunk(data)) {
-    // data is one packet, maximum 1300 bytes
+    // every chunk is <= 1300 bytes
 }
 ```
 
-Decoder API:
+`desired_jpeg_size` is the target size of the complete keyframe JPEG, not the transport packet size. A 40000-byte JPEG is therefore emitted as roughly 32 chunks.
+
+Decoder:
 
 ```cpp
 affinecodec::Decoder decoder;
@@ -62,7 +52,7 @@ decoder.pushData(data);
 
 std::vector<affinecodec::u_char> jpeg_data;
 if (decoder.updateKeyframe(jpeg_data)) {
-    // jpeg_data is a normal JPEG bitstream
+    // true only after every chunk of the new JPEG has arrived
 }
 
 std::vector<affinecodec::PatchData> patch;
@@ -73,53 +63,33 @@ if (decoder.getNextPatch(patch)) {
 decoder.render(destination, patch, jpeg_data);
 ```
 
-Current v1 model:
+Current model:
 
-- Hard packet size limit: `1300` bytes.
-- Every input image currently produces one packet.
-- Keyframe packet: compact codec header + one ordinary JPEG.
-- JPEG is resized to fit the packet. Width and height are multiples of 8.
-- Original width/height are transmitted separately, and the decoder expands the JPEG back to that size before warping.
-- Motion data therefore does not depend on the transmitted JPEG resolution.
+- Hard transport packet limit: `1300` bytes.
+- A keyframe JPEG may span many chunks.
+- Chunk headers contain frame id, original size, JPEG size, chunk index/count, total JPEG bytes and byte offset.
+- Decoder accepts keyframe chunks out of order and ignores duplicates.
+- A new keyframe becomes active only when all chunks are assembled.
+- If a chunk is lost, the previous valid keyframe remains active; a later keyframe replaces the incomplete assembly.
+- JPEG resolution is chosen to approach `desired_jpeg_size`; width and height are multiples of 8.
+- Original width/height are transmitted separately and the decoder expands the JPEG before warping.
 - Intermediate packet: partial-affine transform + `4x4` residual deformation mesh; currently 176 bytes.
 - Motion is estimated directly from the current full-resolution keyframe, never chained frame-to-frame.
 - LK works on grayscale even when the transmitted JPEG is color.
 - Features are selected once per keyframe on an `8x8` grid, up to 3 Shi-Tomasi corners per cell.
-- The keyframe LK pyramid is cached and reused for all intermediate frames.
-- Decoder caches the decoded/upscaled keyframe and render buffers.
-- Missing warped borders use the existing propagation + diffusion fill.
-- If LK/partial-affine estimation fails, encoder sends a fresh keyframe instead.
+- The keyframe LK pyramid is cached and reused.
+- Missing warped borders use propagation + diffusion fill.
 
-Residual image/refinement tiles are intentionally not part of v1 yet; they can be added later as another packet type.
+Residual image/refinement tiles are intentionally not part of this version yet.
 
 ### End-to-end test
 
-Default:
-
 ```bash
-build/bin/codec_test
+build/bin/codec_test local-data/frames output/codec 40000 5
 ```
 
-Optional arguments:
-
-```bash
-build/bin/codec_test <frames> <output> [jpeg-bytes] [key-period]
-```
-
-For example:
-
-```bash
-build/bin/codec_test local-data/frames output/codec 1300 5
-```
-
-The test passes every encoder packet directly into the decoder and writes side-by-side images:
-
-```text
-ORIGINAL | DECODED
-```
-
-It also prints packet bytes and color MAE for every frame.
+The test feeds every chunk directly into the decoder, writes `ORIGINAL | DECODED`, and prints chunk count, total bytes and color MAE for each frame.
 
 ## Earlier experiments
 
-`affine_test`, `mesh_test`, and `keyframe_test` remain available for the earlier motion-model experiments.
+`affine_test`, `mesh_test`, and `keyframe_test` remain available.
