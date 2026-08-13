@@ -121,9 +121,21 @@ static void saveDiag(const fs::path& path,const cv::Mat& a,const cv::Mat& b,cons
 }
 
 int main(int argc,char** argv){
-    if(argc<2||argc>5){std::cerr<<"Usage: mesh_test <image-folder> [output-folder] [grid-x] [grid-y]\n";return 2;}
-    fs::path in=argv[1],out=argc>2?argv[2]:"mesh-out"; int gx=argc>3?std::stoi(argv[3]):4,gy=argc>4?std::stoi(argv[4]):4;
-    fs::create_directories(out); auto files=listImages(in); if(files.size()<2){std::cerr<<"Need >=2 images\n";return 1;}
+    if(argc>5){
+        std::cerr<<"Usage: mesh_test [image-folder] [output-folder] [grid-x] [grid-y]\n"
+                 <<"Defaults: local-data/frames -> output/mesh, grid 4x4\n";
+        return 2;
+    }
+    fs::path in=argc>1?fs::path(argv[1]):fs::path("local-data/frames");
+    fs::path out=argc>2?fs::path(argv[2]):fs::path("output/mesh");
+    int gx=argc>3?std::stoi(argv[3]):4,gy=argc>4?std::stoi(argv[4]):4;
+    fs::create_directories(out);
+    if(!fs::exists(in)){
+        std::cerr<<"Input folder does not exist: "<<in<<"\n"
+                 <<"Create local-data/frames and put the flight images there.\n";
+        return 1;
+    }
+    auto files=listImages(in); if(files.size()<2){std::cerr<<"Need >=2 images in "<<in<<"\n";return 1;}
     std::ofstream csv(out/"mesh_metrics.csv"); csv<<"pair,file0,file1,lk_points,affine_mae,mesh_mae,gain_percent\n";
     double sa=0,sm=0; int n=0;
     for(size_t i=0;i+1<files.size();++i){
@@ -135,4 +147,6 @@ int main(int argc,char** argv){
         char name[64]; std::snprintf(name,sizeof(name),"%04zu.jpg",i); saveDiag(out/name,a,b,r);
     }
     std::cout<<"\nMean affine MAE="<<(n?sa/n:0)<<" mesh MAE="<<(n?sm/n:0)<<" gain="<<(n?100*(sa-sm)/sa:0)<<"%\n";
+    std::cout<<"Diagnostics: "<<out<<"\n";
+    return 0;
 }
