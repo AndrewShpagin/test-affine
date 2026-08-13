@@ -2,27 +2,45 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run mesh_test",
-            "type": "cppvsdbg",
+            "name": "Run keyframe_test",
+            "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/mesh_test.exe",
+            "program": "${workspaceFolder}/build/bin/keyframe_test",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
-            "console": "integratedTerminal",
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "preLaunchTask": "build keyframe_test Release"
+        },
+        {
+            "name": "Run mesh_test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/mesh_test",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
             "preLaunchTask": "build mesh_test Release"
         },
         {
             "name": "Run affine_test",
-            "type": "cppvsdbg",
+            "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/affine_test.exe",
+            "program": "${workspaceFolder}/build/bin/affine_test",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
-            "console": "integratedTerminal",
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
             "preLaunchTask": "build affine_test Release"
         }
     ]
