@@ -103,8 +103,6 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     cv::warpAffine(srcMask, r.affineValid, affine, cur.size(),
                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, 0);
 
-    // Keep the raw mask for visual filling. Use a slightly eroded copy only
-    // for metrics, so interpolation at the source boundary does not bias MAE.
     cv::Mat affineMetricValid = r.affineValid.clone();
     cv::erode(affineMetricValid, affineMetricValid, cv::Mat::ones(5,5,CV_8U));
 
@@ -181,7 +179,6 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
     cv::Mat out = gray.clone();
     if (cv::countNonZero(valid) == 0) return out;
 
-    // state: 0 = missing/unseen, 1 = queued, 2 = already known/filled.
     cv::Mat state(gray.size(), CV_8U, cv::Scalar(0));
     for (int y = 0; y < gray.rows; ++y) {
         const uchar* vm = valid.ptr<uchar>(y);
@@ -196,7 +193,6 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
     std::vector<cv::Point> queue;
     queue.reserve(gray.total());
 
-    // Initial frontier: every missing pixel touching the real warped image.
     for (int y = 0; y < gray.rows; ++y) {
         for (int x = 0; x < gray.cols; ++x) {
             if (state.at<uchar>(y,x) != 0) continue;
@@ -212,9 +208,6 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
         }
     }
 
-    // True FIFO propagation. A pixel becomes known immediately after it is
-    // calculated, so later pixels may average it too. This avoids hard
-    // same-depth Chebyshev wave bands.
     size_t head = 0;
     while (head < queue.size()) {
         const cv::Point p = queue[head++];
@@ -237,14 +230,12 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
             if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
             uchar& st = state.at<uchar>(ny,nx);
             if (st == 0) {
-                st = 1; // temporary queued mark: insert exactly once
+                st = 1;
                 queue.emplace_back(nx,ny);
             }
         }
     }
 
-    // A couple of Jacobi diffusion passes remove the residual queue-order/grid
-    // direction while keeping all original warped pixels fixed.
     cv::Mat prev = out.clone();
     for (int pass = 0; pass < 2; ++pass) {
         out.copyTo(prev);
@@ -361,11 +352,11 @@ int main(int argc, char** argv) {
         cv::Mat originalPanel = labelImage(cur, "ORIGINAL", originalInfo);
         cv::Mat affinePanel = labelImage(
             affineWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (filled)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (FIFO + DIFFUSION FILL)",
             affineInfo);
         cv::Mat meshPanel = labelImage(
             meshWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (filled)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (FIFO + DIFFUSION FILL)",
             meshInfo);
 
         cv::Mat side;
@@ -394,6 +385,6 @@ int main(int argc, char** argv) {
     std::cout << "\nOutput: " << outputDir << "\n"
               << "Every " << N << "th frame is a new reference.\n"
               << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n"
-              << "Visual previews use iterative filled borders; metrics remain based on valid pixels only.\n";
+              << "Missing pixels use FIFO propagation plus diffusion; metrics remain based on valid pixels only.\n";
     return 0;
 }
