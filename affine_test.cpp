@@ -184,14 +184,21 @@ static void writeDiagnostic(const fs::path& outPath,
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) {
-        std::cerr << "Usage: affine_test <image-folder> [output-folder]\n";
+    if (argc > 3) {
+        std::cerr << "Usage: affine_test [image-folder] [output-folder]\n"
+                  << "Defaults: local-data/frames -> output/affine\n";
         return 2;
     }
 
-    const fs::path inputDir = argv[1];
-    const fs::path outputDir = argc >= 3 ? fs::path(argv[2]) : fs::path("affine-out");
+    const fs::path inputDir = argc >= 2 ? fs::path(argv[1]) : fs::path("local-data/frames");
+    const fs::path outputDir = argc >= 3 ? fs::path(argv[2]) : fs::path("output/affine");
     fs::create_directories(outputDir);
+
+    if (!fs::exists(inputDir)) {
+        std::cerr << "Input folder does not exist: " << inputDir << "\n"
+                  << "Create local-data/frames and put the flight images there.\n";
+        return 1;
+    }
 
     const auto files = listImages(inputDir);
     if (files.size() < 2) {
