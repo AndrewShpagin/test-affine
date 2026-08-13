@@ -79,17 +79,18 @@ int main(int argc, char** argv) {
     }
     fs::create_directories(output_dir);
 
-    // print parameters:
     std::cout << "Input folder: " << input_dir << '\n'
               << "Output folder: " << output_dir << '\n'
-              << "JPEG bytes: " << jpeg_bytes << '\n'
+              << "Target JPEG bytes: " << jpeg_bytes << '\n'
               << "Keyframe period: " << key_period << '\n'
+              << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
               << "Number of images: " << files.size() << "\n\n";
 
     Encoder encoder;
     Decoder decoder;
     std::vector<u_char> current_jpeg;
     std::size_t total_bytes = 0;
+    std::size_t total_packets = 0;
 
     for (std::size_t i = 0; i < files.size(); ++i) {
         cv::Mat original = cv::imread(files[i].string(), cv::IMREAD_COLOR);
@@ -101,9 +102,12 @@ int main(int argc, char** argv) {
         bool produced_frame = false;
         bool was_keyframe = false;
         std::size_t frame_bytes = 0;
+        std::size_t frame_packets = 0;
 
         std::vector<u_char> chunk;
         while (encoder.getNextChunk(chunk)) {
+            ++frame_packets;
+            ++total_packets;
             frame_bytes += chunk.size();
             total_bytes += chunk.size();
 
@@ -132,7 +136,8 @@ int main(int argc, char** argv) {
         }
 
         if (!produced_frame) {
-            std::cout << std::setw(4) << i << "  no decoded frame\n";
+            std::cout << std::setw(4) << i << "  no decoded frame  "
+                      << frame_packets << " packets  " << frame_bytes << " B\n";
             continue;
         }
 
@@ -146,6 +151,7 @@ int main(int argc, char** argv) {
             "frame " + std::to_string(i) + "  " + files[i].filename().string();
         const std::string decoded_info =
             std::string(was_keyframe ? "KEY  " : "PATCH  ") +
+            std::to_string(frame_packets) + " pkt  " +
             std::to_string(frame_bytes) + " B  MAE=" + cv::format("%.2f", mae);
 
         cv::Mat left = addLabel(original, "ORIGINAL", original_info);
@@ -160,12 +166,15 @@ int main(int argc, char** argv) {
 
         std::cout << std::setw(4) << i
                   << (was_keyframe ? "  KEY   " : "  PATCH ")
-                  << std::setw(4) << frame_bytes << " B"
+                  << std::setw(3) << frame_packets << " pkt  "
+                  << std::setw(7) << frame_bytes << " B"
                   << "  MAE=" << std::fixed << std::setprecision(2) << mae << '\n';
     }
 
     std::cout << "\nOutput: " << output_dir << '\n'
+              << "Total codec packets: " << total_packets << '\n'
               << "Total codec bytes: " << total_bytes << '\n'
-              << "Each input image currently produces one packet.\n";
+              << "Every getNextChunk() result is <= "
+              << affinecodec::kMaxUdpPacketBytes << " bytes.\n";
     return 0;
 }

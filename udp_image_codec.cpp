@@ -12,8 +12,8 @@ namespace affinecodec {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x31434641u;
-constexpr std::uint8_t kVersion = 1;
-constexpr std::uint8_t kPacketKeyframe = 1;
+constexpr std::uint8_t kVersion = 2;
+constexpr std::uint8_t kPacketKeyframeChunk = 1;
 constexpr std::uint8_t kPacketPatch = 2;
 
 constexpr int kFeatureGridX = 8;
@@ -27,7 +27,10 @@ constexpr float kLkForwardErrorMax = 35.0f;
 constexpr float kLkBackwardErrorMax = 1.5f;
 constexpr float kResidualMax = 10.0f;
 constexpr std::size_t kCommonHeaderBytes = 20;
-constexpr std::size_t kKeyframeHeaderBytes = 28;
+constexpr std::size_t kKeyframeChunkHeaderBytes = 40;
+constexpr std::size_t kKeyframeChunkPayloadBytes = kMaxUdpPacketBytes - kKeyframeChunkHeaderBytes;
+constexpr std::uint32_t kMaxAcceptedJpegBytes = 64u * 1024u * 1024u;
+constexpr std::size_t kMaxPendingPatches = 64;
 
 void appendU8(std::vector<u_char>& out, std::uint8_t v) { out.push_back(v); }
 void appendU16(std::vector<u_char>& out, std::uint16_t v) {
@@ -99,6 +102,10 @@ bool readCommonHeader(const std::vector<u_char>& data, std::size_t& pos, CommonH
     if (magic != kMagic || version != kVersion || h.header_bytes < kCommonHeaderBytes) return false;
     h.original_size = cv::Size(width, height);
     return width > 0 && height > 0;
+}
+
+bool frameIdNewer(std::uint32_t a, std::uint32_t b) {
+    return static_cast<std::int32_t>(a - b) > 0;
 }
 
 cv::Mat toGray8(const cv::Mat& image) {
@@ -173,8 +180,7 @@ bool encodeJpegToBudget(const cv::Mat& image, int requested_jpeg_bytes,
                         std::vector<u_char>& jpeg, cv::Size& encoded_size) {
     const cv::Mat source = jpegInput8(image);
     if (source.empty()) return false;
-    const int max_payload = static_cast<int>(kMaxUdpPacketBytes - kKeyframeHeaderBytes);
-    const int budget = std::clamp(requested_jpeg_bytes, 1, max_payload);
+    const int budget = std::max(1, requested_jpeg_bytes);
     constexpr int quality = 85;
 
     cv::Size candidate;
@@ -188,23 +194,27 @@ bool encodeJpegToBudget(const cv::Mat& image, int requested_jpeg_bytes,
 
     std::vector<u_char> current;
     if (!encodeJpegAtSize(source, candidate, quality, current)) return false;
-    for (int iter = 0; iter < 5 && static_cast<int>(current.size()) > budget; ++iter) {
+    for (int iter = 0; iter < 8 && static_cast<int>(current.size()) > budget; ++iter) {
         if (candidate.width <= 8 && candidate.height <= 8) break;
-        const double ratio = std::sqrt(static_cast<double>(budget) / current.size()) * 0.94;
+        const double ratio = std::sqrt(static_cast<double>(budget) /
+            std::max<std::size_t>(1, current.size())) * 0.96;
         const double current_scale = std::min(static_cast<double>(candidate.width) / source.cols,
                                               static_cast<double>(candidate.height) / source.rows);
         cv::Size next = scaledSize8(source.size(), current_scale * ratio);
         if (next == candidate) {
-            next.width = std::max(8, candidate.width - 8);
-            next.height = std::max(8, candidate.height - 8);
+            const double step_scale = std::max(0.01, current_scale - 8.0 / std::max(source.cols, source.rows));
+            next = scaledSize8(source.size(), step_scale);
         }
+        if (next == candidate) break;
         candidate = next;
         if (!encodeJpegAtSize(source, candidate, quality, current)) return false;
     }
 
-    if (!current.empty() && static_cast<int>(current.size()) < static_cast<int>(budget * 0.72) &&
-        (candidate.width < source.cols || candidate.height < source.rows)) {
-        const double grow = std::sqrt(static_cast<double>(budget) / current.size()) * 0.96;
+    if (!current.empty() && static_cast<int>(current.size()) < static_cast<int>(budget * 0.78) &&
+        (candidate.width < quantizeTo8(source.cols, source.cols) ||
+         candidate.height < quantizeTo8(source.rows, source.rows))) {
+        const double grow = std::sqrt(static_cast<double>(budget) /
+            std::max<std::size_t>(1, current.size())) * 0.97;
         const double current_scale = std::min(static_cast<double>(candidate.width) / source.cols,
                                               static_cast<double>(candidate.height) / source.rows);
         const cv::Size larger = scaledSize8(source.size(), current_scale * grow);
@@ -217,27 +227,32 @@ bool encodeJpegToBudget(const cv::Mat& image, int requested_jpeg_bytes,
         }
     }
 
-    if (current.size() > static_cast<std::size_t>(max_payload)) {
-        candidate = cv::Size(8, 8);
+    if (static_cast<int>(current.size()) > budget && candidate.width <= 8 && candidate.height <= 8) {
         for (int q : {70, 50, 30, 10}) {
             if (!encodeJpegAtSize(source, candidate, q, current)) return false;
-            if (current.size() <= static_cast<std::size_t>(max_payload)) break;
+            if (static_cast<int>(current.size()) <= budget) break;
         }
     }
-    if (current.empty() || current.size() > static_cast<std::size_t>(max_payload)) return false;
+    if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
     jpeg = std::move(current); encoded_size = candidate; size_hint = candidate; budget_hint = budget;
     return true;
 }
 
-std::vector<u_char> serializeKeyframe(std::uint32_t frame_id, const cv::Size& original_size,
-                                      const cv::Size& jpeg_size, const std::vector<u_char>& jpeg) {
-    std::vector<u_char> packet; packet.reserve(kKeyframeHeaderBytes + jpeg.size());
-    appendCommonHeader(packet, kPacketKeyframe, static_cast<std::uint16_t>(kKeyframeHeaderBytes),
+std::vector<u_char> serializeKeyframeChunk(std::uint32_t frame_id, const cv::Size& original_size,
+                                           const cv::Size& jpeg_size, std::uint32_t jpeg_bytes,
+                                           std::uint16_t chunk_index, std::uint16_t chunk_count,
+                                           std::uint32_t chunk_offset, const u_char* chunk_data,
+                                           std::uint16_t chunk_bytes) {
+    std::vector<u_char> packet; packet.reserve(kKeyframeChunkHeaderBytes + chunk_bytes);
+    appendCommonHeader(packet, kPacketKeyframeChunk, static_cast<std::uint16_t>(kKeyframeChunkHeaderBytes),
                        frame_id, frame_id, original_size);
     appendU16(packet, static_cast<std::uint16_t>(jpeg_size.width));
     appendU16(packet, static_cast<std::uint16_t>(jpeg_size.height));
-    appendU16(packet, static_cast<std::uint16_t>(jpeg.size())); appendU16(packet, 0);
-    packet.insert(packet.end(), jpeg.begin(), jpeg.end()); return packet;
+    appendU16(packet, chunk_index); appendU16(packet, chunk_count);
+    appendU32(packet, jpeg_bytes); appendU32(packet, chunk_offset);
+    appendU16(packet, chunk_bytes); appendU16(packet, 0);
+    packet.insert(packet.end(), chunk_data, chunk_data + chunk_bytes);
+    return packet;
 }
 
 std::vector<u_char> serializePatch(const PatchData& patch) {
@@ -250,6 +265,19 @@ std::vector<u_char> serializePatch(const PatchData& patch) {
     for (float v : patch.affine) appendFloat(packet, v);
     for (const cv::Point2f& p : patch.mesh) { appendFloat(packet, p.x); appendFloat(packet, p.y); }
     return packet;
+}
+
+bool parsePatch(const std::vector<u_char>& data, const CommonHeader& h, std::size_t pos, PatchData& p) {
+    std::uint8_t gx = 0, gy = 0; std::uint16_t reserved = 0;
+    if (!readU8(data, pos, gx) || !readU8(data, pos, gy) || !readU16(data, pos, reserved) || gx == 0 || gy == 0) return false;
+    const std::size_t mesh_count = static_cast<std::size_t>(gx) * gy;
+    const std::size_t expected = kCommonHeaderBytes + 4 + 6 * sizeof(float) + mesh_count * 2 * sizeof(float);
+    if (h.header_bytes != expected || expected != data.size()) return false;
+    p.frame_id = h.frame_id; p.keyframe_id = h.keyframe_id; p.original_size = h.original_size; p.grid_x = gx; p.grid_y = gy;
+    for (float& v : p.affine) if (!readFloat(data, pos, v)) return false;
+    p.mesh.resize(mesh_count);
+    for (cv::Point2f& v : p.mesh) if (!readFloat(data, pos, v.x) || !readFloat(data, pos, v.y)) return false;
+    return true;
 }
 
 template<int Channels>
@@ -270,9 +298,7 @@ cv::Mat fillOutsideImpl(const cv::Mat& image, const cv::Mat& valid) {
         for (int k = 0; k < 8; ++k) {
             const int nx=x+dx[k], ny=y+dy[k];
             if (nx<0 || ny<0 || nx>=image.cols || ny>=image.rows) continue;
-            if (state.at<unsigned char>(ny,nx) == 2) {
-                state.at<unsigned char>(y,x)=1; queue.emplace_back(x,y); break;
-            }
+            if (state.at<unsigned char>(ny,nx) == 2) { state.at<unsigned char>(y,x)=1; queue.emplace_back(x,y); break; }
         }
     }
     std::size_t head=0;
@@ -326,9 +352,21 @@ bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
                            int desired_jpeg_size, std::uint32_t frame_id) {
     std::vector<u_char> jpeg; cv::Size jpeg_size;
     if (!encodeJpegToBudget(image, desired_jpeg_size, jpeg_size_hint_, jpeg_budget_hint_, jpeg, jpeg_size)) return false;
-    std::vector<u_char> packet = serializeKeyframe(frame_id, image.size(), jpeg_size, jpeg);
-    if (packet.size() > kMaxUdpPacketBytes) return false;
-    output_queue_.push_back(std::move(packet)); input_size_ = image.size(); setReference(gray, frame_id); return true;
+    if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+    const std::size_t count_size = (jpeg.size() + kKeyframeChunkPayloadBytes - 1) / kKeyframeChunkPayloadBytes;
+    if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) return false;
+    const std::uint16_t chunk_count = static_cast<std::uint16_t>(count_size);
+    const std::uint32_t jpeg_bytes = static_cast<std::uint32_t>(jpeg.size());
+    for (std::uint16_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        const std::size_t offset = static_cast<std::size_t>(chunk_index) * kKeyframeChunkPayloadBytes;
+        const std::size_t bytes = std::min(kKeyframeChunkPayloadBytes, jpeg.size() - offset);
+        std::vector<u_char> packet = serializeKeyframeChunk(frame_id, image.size(), jpeg_size, jpeg_bytes,
+            chunk_index, chunk_count, static_cast<std::uint32_t>(offset), jpeg.data() + offset,
+            static_cast<std::uint16_t>(bytes));
+        if (packet.size() > kMaxUdpPacketBytes) return false;
+        output_queue_.push_back(std::move(packet));
+    }
+    input_size_ = image.size(); setReference(gray, frame_id); return true;
 }
 
 bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch) {
@@ -383,19 +421,64 @@ void Encoder::pushImage(cv::Mat& image,int desired_jpeg_size,int keyframe_once_i
 
 bool Encoder::getNextChunk(std::vector<u_char>& data){if(output_queue_.empty())return false;data=std::move(output_queue_.front());output_queue_.pop_front();return true;}
 
+void Decoder::resetPendingKeyframe() {
+    pending_keyframe_ = KeyframeAssembly{};
+    pending_patch_queue_.clear();
+}
+
 void Decoder::pushData(const std::vector<u_char>& data){
     if(data.size()<kCommonHeaderBytes||data.size()>kMaxUdpPacketBytes)return;std::size_t pos=0;CommonHeader h;if(!readCommonHeader(data,pos,h)||h.header_bytes>data.size())return;
-    if(h.type==kPacketKeyframe){if(h.header_bytes<kKeyframeHeaderBytes)return;std::uint16_t jw=0,jh=0,jb=0,res=0;if(!readU16(data,pos,jw)||!readU16(data,pos,jh)||!readU16(data,pos,jb)||!readU16(data,pos,res))return;if(jw==0||jh==0||static_cast<std::size_t>(h.header_bytes)+jb>data.size())return;current_jpeg_.assign(data.begin()+h.header_bytes,data.begin()+h.header_bytes+jb);original_size_=h.original_size;keyframe_id_=h.keyframe_id;keyframe_changed_=true;decoded_keyframe_.release();patch_queue_.clear();return;}
-    if(h.type==kPacketPatch){if(current_jpeg_.empty()||h.keyframe_id!=keyframe_id_||h.original_size!=original_size_)return;std::uint8_t gx=0,gy=0;std::uint16_t res=0;if(!readU8(data,pos,gx)||!readU8(data,pos,gy)||!readU16(data,pos,res)||gx==0||gy==0)return;const std::size_t mc=static_cast<std::size_t>(gx)*gy;const std::size_t expected=kCommonHeaderBytes+4+6*sizeof(float)+mc*2*sizeof(float);if(h.header_bytes!=expected||expected>data.size())return;PatchData p;p.frame_id=h.frame_id;p.keyframe_id=h.keyframe_id;p.original_size=h.original_size;p.grid_x=gx;p.grid_y=gy;for(float&v:p.affine)if(!readFloat(data,pos,v))return;p.mesh.resize(mc);for(cv::Point2f&v:p.mesh)if(!readFloat(data,pos,v.x)||!readFloat(data,pos,v.y))return;patch_queue_.push_back(std::move(p));}
+    if(h.type==kPacketKeyframeChunk){
+        if(h.header_bytes!=kKeyframeChunkHeaderBytes||h.keyframe_id!=h.frame_id)return;
+        std::uint16_t jw=0,jh=0,chunk_index=0,chunk_count=0,chunk_bytes=0,reserved=0;std::uint32_t jpeg_bytes=0,chunk_offset=0;
+        if(!readU16(data,pos,jw)||!readU16(data,pos,jh)||!readU16(data,pos,chunk_index)||!readU16(data,pos,chunk_count)||
+           !readU32(data,pos,jpeg_bytes)||!readU32(data,pos,chunk_offset)||!readU16(data,pos,chunk_bytes)||!readU16(data,pos,reserved))return;
+        if(jw==0||jh==0||jpeg_bytes==0||jpeg_bytes>kMaxAcceptedJpegBytes||chunk_count==0||chunk_index>=chunk_count||
+           static_cast<std::size_t>(h.header_bytes)+chunk_bytes!=data.size())return;
+        const std::size_t expected_count=(static_cast<std::size_t>(jpeg_bytes)+kKeyframeChunkPayloadBytes-1)/kKeyframeChunkPayloadBytes;
+        if(expected_count!=chunk_count)return;
+        const std::size_t expected_offset=static_cast<std::size_t>(chunk_index)*kKeyframeChunkPayloadBytes;
+        if(expected_offset>=jpeg_bytes)return;
+        const std::size_t expected_bytes=std::min(kKeyframeChunkPayloadBytes,static_cast<std::size_t>(jpeg_bytes)-expected_offset);
+        if(expected_offset!=chunk_offset||expected_bytes!=chunk_bytes||expected_offset+expected_bytes>jpeg_bytes)return;
+        if(have_keyframe_){if(h.frame_id==keyframe_id_)return;if(!frameIdNewer(h.frame_id,keyframe_id_))return;}
+        if(pending_keyframe_.active&&h.frame_id!=pending_keyframe_.frame_id){if(!frameIdNewer(h.frame_id,pending_keyframe_.frame_id))return;resetPendingKeyframe();}
+        if(!pending_keyframe_.active){
+            pending_keyframe_.active=true;pending_keyframe_.frame_id=h.frame_id;pending_keyframe_.original_size=h.original_size;
+            pending_keyframe_.jpeg_size=cv::Size(jw,jh);pending_keyframe_.jpeg_bytes=jpeg_bytes;pending_keyframe_.chunk_count=chunk_count;
+            pending_keyframe_.received_count=0;pending_keyframe_.bytes.resize(jpeg_bytes);pending_keyframe_.received.assign(chunk_count,0);
+        }else if(pending_keyframe_.original_size!=h.original_size||pending_keyframe_.jpeg_size!=cv::Size(jw,jh)||
+                 pending_keyframe_.jpeg_bytes!=jpeg_bytes||pending_keyframe_.chunk_count!=chunk_count)return;
+        if(!pending_keyframe_.received[chunk_index]){
+            std::copy(data.begin()+h.header_bytes,data.end(),pending_keyframe_.bytes.begin()+chunk_offset);
+            pending_keyframe_.received[chunk_index]=1;++pending_keyframe_.received_count;
+        }
+        if(pending_keyframe_.received_count==pending_keyframe_.chunk_count){
+            current_jpeg_=std::move(pending_keyframe_.bytes);original_size_=pending_keyframe_.original_size;keyframe_id_=pending_keyframe_.frame_id;
+            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();patch_queue_.clear();
+            while(!pending_patch_queue_.empty()){patch_queue_.push_back(std::move(pending_patch_queue_.front()));pending_patch_queue_.pop_front();}
+            pending_keyframe_=KeyframeAssembly{};
+        }
+        return;
+    }
+    if(h.type==kPacketPatch){
+        PatchData patch;if(!parsePatch(data,h,pos,patch))return;
+        if(have_keyframe_&&h.keyframe_id==keyframe_id_&&h.original_size==original_size_){patch_queue_.push_back(std::move(patch));return;}
+        if(pending_keyframe_.active&&h.keyframe_id==pending_keyframe_.frame_id&&h.original_size==pending_keyframe_.original_size){
+            if(pending_patch_queue_.size()>=kMaxPendingPatches)pending_patch_queue_.pop_front();pending_patch_queue_.push_back(std::move(patch));
+        }
+    }
 }
 
 bool Decoder::updateKeyframe(std::vector<u_char>& jpeg_data){if(!keyframe_changed_)return false;jpeg_data=current_jpeg_;keyframe_changed_=false;return true;}
 bool Decoder::getNextPatch(std::vector<PatchData>& patch){if(patch_queue_.empty())return false;patch.clear();patch.push_back(std::move(patch_queue_.front()));patch_queue_.pop_front();return true;}
 
 cv::Mat Decoder::getDecodedKeyframe(const std::vector<u_char>& jpeg_data){
-    const std::vector<u_char>* bytes=&jpeg_data;if(bytes->empty())bytes=&current_jpeg_;if(bytes->empty()||original_size_.width<=0||original_size_.height<=0)return cv::Mat();
-    const bool use_cache=bytes==&current_jpeg_||*bytes==current_jpeg_;if(use_cache&&!decoded_keyframe_.empty())return decoded_keyframe_;
-    cv::Mat encoded(1,static_cast<int>(bytes->size()),CV_8U,const_cast<u_char*>(bytes->data()));cv::Mat decoded=cv::imdecode(encoded,cv::IMREAD_UNCHANGED);if(decoded.empty())return cv::Mat();if(decoded.size()!=original_size_)cv::resize(decoded,decoded,original_size_,0,0,cv::INTER_LINEAR);if(use_cache)decoded_keyframe_=decoded;return decoded;
+    if(!have_keyframe_||original_size_.width<=0||original_size_.height<=0)return cv::Mat();
+    if(!decoded_keyframe_.empty())return decoded_keyframe_;
+    const std::vector<u_char>& bytes=jpeg_data.empty()?current_jpeg_:jpeg_data;if(bytes.empty())return cv::Mat();
+    cv::Mat encoded(1,static_cast<int>(bytes.size()),CV_8U,const_cast<u_char*>(bytes.data()));cv::Mat decoded=cv::imdecode(encoded,cv::IMREAD_UNCHANGED);
+    if(decoded.empty())return cv::Mat();if(decoded.size()!=original_size_)cv::resize(decoded,decoded,original_size_,0,0,cv::INTER_LINEAR);decoded_keyframe_=decoded;return decoded_keyframe_;
 }
 
 void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,const std::vector<u_char>& jpeg_data){
