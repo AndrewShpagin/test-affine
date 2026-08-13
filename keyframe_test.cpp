@@ -181,8 +181,7 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
     cv::Mat out = gray.clone();
     if (cv::countNonZero(valid) == 0) return out;
 
-    // state: 0 = black/unseen, 1 = queued for this or next wave, 2 = known pixel.
-    // The queued state is the temporary mark that prevents adding a pixel twice.
+    // state: 0 = missing/unseen, 1 = queued, 2 = already known/filled.
     cv::Mat state(gray.size(), CV_8U, cv::Scalar(0));
     for (int y = 0; y < gray.rows; ++y) {
         const uchar* vm = valid.ptr<uchar>(y);
@@ -194,76 +193,74 @@ static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& vali
     static const int dx[8] = {-1,0,1,-1,1,-1,0,1};
     static const int dy[8] = {-1,-1,-1,0,0,1,1,1};
 
-    std::vector<cv::Point> current;
-    current.reserve(gray.rows + gray.cols);
+    std::vector<cv::Point> queue;
+    queue.reserve(gray.total());
 
-    // Initial wave: missing pixels that already touch known pixels.
+    // Initial frontier: every missing pixel touching the real warped image.
     for (int y = 0; y < gray.rows; ++y) {
         for (int x = 0; x < gray.cols; ++x) {
             if (state.at<uchar>(y,x) != 0) continue;
-            bool touchesKnown = false;
             for (int k = 0; k < 8; ++k) {
-                const int nx = x + dx[k];
-                const int ny = y + dy[k];
+                const int nx = x + dx[k], ny = y + dy[k];
                 if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
                 if (state.at<uchar>(ny,nx) == 2) {
-                    touchesKnown = true;
+                    state.at<uchar>(y,x) = 1;
+                    queue.emplace_back(x,y);
                     break;
                 }
-            }
-            if (touchesKnown) {
-                state.at<uchar>(y,x) = 1;
-                current.emplace_back(x,y);
             }
         }
     }
 
-    std::vector<cv::Point> next;
-    std::vector<uchar> values;
+    // True FIFO propagation. A pixel becomes known immediately after it is
+    // calculated, so later pixels may average it too. This avoids hard
+    // same-depth Chebyshev wave bands.
+    size_t head = 0;
+    while (head < queue.size()) {
+        const cv::Point p = queue[head++];
 
-    while (!current.empty()) {
-        // Calculate the whole wave before changing any pixel in it. Therefore
-        // all pixels at the same depth see only the previous, already-known wave.
-        values.resize(current.size());
-        for (size_t i = 0; i < current.size(); ++i) {
-            const int x = current[i].x;
-            const int y = current[i].y;
-            int sum = 0;
-            int cnt = 0;
-            for (int k = 0; k < 8; ++k) {
-                const int nx = x + dx[k];
-                const int ny = y + dy[k];
-                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
-                if (state.at<uchar>(ny,nx) == 2) {
-                    sum += out.at<uchar>(ny,nx);
+        int sum = 0, cnt = 0;
+        for (int k = 0; k < 8; ++k) {
+            const int nx = p.x + dx[k], ny = p.y + dy[k];
+            if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+            if (state.at<uchar>(ny,nx) == 2) {
+                sum += out.at<uchar>(ny,nx);
+                ++cnt;
+            }
+        }
+        if (cnt > 0)
+            out.at<uchar>(p.y,p.x) = uchar((sum + cnt/2) / cnt);
+        state.at<uchar>(p.y,p.x) = 2;
+
+        for (int k = 0; k < 8; ++k) {
+            const int nx = p.x + dx[k], ny = p.y + dy[k];
+            if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+            uchar& st = state.at<uchar>(ny,nx);
+            if (st == 0) {
+                st = 1; // temporary queued mark: insert exactly once
+                queue.emplace_back(nx,ny);
+            }
+        }
+    }
+
+    // A couple of Jacobi diffusion passes remove the residual queue-order/grid
+    // direction while keeping all original warped pixels fixed.
+    cv::Mat prev = out.clone();
+    for (int pass = 0; pass < 2; ++pass) {
+        out.copyTo(prev);
+        for (int y = 0; y < gray.rows; ++y) {
+            for (int x = 0; x < gray.cols; ++x) {
+                if (valid.at<uchar>(y,x)) continue;
+                int sum = 0, cnt = 0;
+                for (int k = 0; k < 8; ++k) {
+                    const int nx = x + dx[k], ny = y + dy[k];
+                    if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+                    sum += prev.at<uchar>(ny,nx);
                     ++cnt;
                 }
-            }
-            values[i] = cnt > 0 ? uchar((sum + cnt/2) / cnt) : 0;
-        }
-
-        for (size_t i = 0; i < current.size(); ++i) {
-            const cv::Point& p = current[i];
-            out.at<uchar>(p.y,p.x) = values[i];
-            state.at<uchar>(p.y,p.x) = 2;
-        }
-
-        // Expand by one pixel. Mark immediately as queued so the same point
-        // cannot be inserted by several neighbours.
-        next.clear();
-        for (const cv::Point& p : current) {
-            for (int k = 0; k < 8; ++k) {
-                const int nx = p.x + dx[k];
-                const int ny = p.y + dy[k];
-                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
-                uchar& st = state.at<uchar>(ny,nx);
-                if (st == 0) {
-                    st = 1;
-                    next.emplace_back(nx,ny);
-                }
+                if (cnt > 0) out.at<uchar>(y,x) = uchar((sum + cnt/2) / cnt);
             }
         }
-        current.swap(next);
     }
 
     return out;
@@ -364,11 +361,11 @@ int main(int argc, char** argv) {
         cv::Mat originalPanel = labelImage(cur, "ORIGINAL", originalInfo);
         cv::Mat affinePanel = labelImage(
             affineWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (PROPAGATED FILL)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (filled)",
             affineInfo);
         cv::Mat meshPanel = labelImage(
             meshWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (PROPAGATED FILL)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (filled)",
             meshInfo);
 
         cv::Mat side;
@@ -397,6 +394,6 @@ int main(int argc, char** argv) {
     std::cout << "\nOutput: " << outputDir << "\n"
               << "Every " << N << "th frame is a new reference.\n"
               << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n"
-              << "Missing pixels use iterative wavefront fill; metrics remain based on valid pixels only.\n";
+              << "Visual previews use iterative filled borders; metrics remain based on valid pixels only.\n";
     return 0;
 }
