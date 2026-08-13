@@ -94,9 +94,8 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     if (affine.empty()) return r;
     r.inlierRatio = double(cv::countNonZero(inliers)) / double(inliers.total());
 
-    // First reconstruction: global affine only.
     cv::warpAffine(ref, r.affineWarp, affine, cur.size(),
-                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
+                   cv::INTER_LINEAR, cv::BORDER_REPLICATE);
 
     cv::Mat srcMask(ref.size(), CV_8U, cv::Scalar(255));
     cv::Mat affineValid;
@@ -104,7 +103,6 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, 0);
     cv::erode(affineValid, affineValid, cv::Mat::ones(5,5,CV_8U));
 
-    // Residual LK motion after removing the affine part.
     std::vector<cv::Point2f> q, residual;
     for (size_t i=0; i<t.p0.size(); ++i) {
         cv::Point2f qi = applyAffine(affine, t.p0[i]);
@@ -158,9 +156,8 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     }
 
     cv::remap(ref, r.meshWarp, mapx, mapy,
-              cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
+              cv::INTER_LINEAR, cv::BORDER_REPLICATE);
 
-    // Compare both warps on exactly the same valid pixels.
     cv::Mat commonValid;
     cv::bitwise_and(affineValid, meshValid, commonValid);
     if (cv::countNonZero(commonValid) == 0) return r;
@@ -266,11 +263,11 @@ int main(int argc, char** argv) {
         cv::Mat originalPanel = labelImage(cur, "ORIGINAL", originalInfo);
         cv::Mat affinePanel = labelImage(
             affineWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (EDGE-FILLED)",
             affineInfo);
         cv::Mat meshPanel = labelImage(
             meshWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (EDGE-FILLED)",
             meshInfo);
 
         cv::Mat side;
@@ -298,6 +295,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\nOutput: " << outputDir << "\n"
               << "Every " << N << "th frame is a new reference.\n"
-              << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n";
+              << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n"
+              << "Out-of-reference pixels are edge-filled for visualization; metrics use valid pixels only.\n";
     return 0;
 }
