@@ -74,6 +74,8 @@ static double maskedMAE(const cv::Mat& a, const cv::Mat& b, const cv::Mat& mask)
 struct WarpResult {
     cv::Mat affineWarp;
     cv::Mat meshWarp;
+    cv::Mat affineValid;
+    cv::Mat meshValid;
     double affineMae = 0.0;
     double meshMae = 0.0;
     int tracks = 0;
@@ -95,13 +97,16 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     r.inlierRatio = double(cv::countNonZero(inliers)) / double(inliers.total());
 
     cv::warpAffine(ref, r.affineWarp, affine, cur.size(),
-                   cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
 
     cv::Mat srcMask(ref.size(), CV_8U, cv::Scalar(255));
-    cv::Mat affineValid;
-    cv::warpAffine(srcMask, affineValid, affine, cur.size(),
+    cv::warpAffine(srcMask, r.affineValid, affine, cur.size(),
                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, 0);
-    cv::erode(affineValid, affineValid, cv::Mat::ones(5,5,CV_8U));
+
+    // Keep the raw mask for visual filling. Use a slightly eroded copy only
+    // for metrics, so interpolation at the source boundary does not bias MAE.
+    cv::Mat affineMetricValid = r.affineValid.clone();
+    cv::erode(affineMetricValid, affineMetricValid, cv::Mat::ones(5,5,CV_8U));
 
     std::vector<cv::Point2f> q, residual;
     for (size_t i=0; i<t.p0.size(); ++i) {
@@ -138,34 +143,130 @@ static WarpResult warpFromReference(const cv::Mat& ref, const cv::Mat& cur,
     cv::Mat inv;
     cv::invertAffineTransform(affine, inv);
     cv::Mat mapx(cur.size(), CV_32F), mapy(cur.size(), CV_32F);
-    cv::Mat meshValid(cur.size(), CV_8U, cv::Scalar(0));
+    r.meshValid = cv::Mat(cur.size(), CV_8U, cv::Scalar(0));
+    cv::Mat meshMetricValid(cur.size(), CV_8U, cv::Scalar(0));
 
     for (int y=0; y<cur.rows; ++y) {
         const cv::Vec2f* dr=dense.ptr<cv::Vec2f>(y);
         float* mx=mapx.ptr<float>(y);
         float* my=mapy.ptr<float>(y);
-        uchar* vm=meshValid.ptr<uchar>(y);
+        uchar* vm=r.meshValid.ptr<uchar>(y);
+        uchar* mm=meshMetricValid.ptr<uchar>(y);
         for (int x=0; x<cur.cols; ++x) {
             const double tx=x-dr[x][0], ty=y-dr[x][1];
             const double sx=inv.at<double>(0,0)*tx + inv.at<double>(0,1)*ty + inv.at<double>(0,2);
             const double sy=inv.at<double>(1,0)*tx + inv.at<double>(1,1)*ty + inv.at<double>(1,2);
             mx[x]=float(sx);
             my[x]=float(sy);
-            if (sx>=2 && sx<ref.cols-2 && sy>=2 && sy<ref.rows-2) vm[x]=255;
+            if (sx>=0 && sx<ref.cols-1 && sy>=0 && sy<ref.rows-1) vm[x]=255;
+            if (sx>=2 && sx<ref.cols-2 && sy>=2 && sy<ref.rows-2) mm[x]=255;
         }
     }
 
     cv::remap(ref, r.meshWarp, mapx, mapy,
-              cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+              cv::INTER_LINEAR, cv::BORDER_CONSTANT, 0);
 
     cv::Mat commonValid;
-    cv::bitwise_and(affineValid, meshValid, commonValid);
+    cv::bitwise_and(affineMetricValid, meshMetricValid, commonValid);
     if (cv::countNonZero(commonValid) == 0) return r;
 
     r.affineMae = maskedMAE(r.affineWarp, cur, commonValid);
     r.meshMae = maskedMAE(r.meshWarp, cur, commonValid);
     r.ok = true;
     return r;
+}
+
+static cv::Mat fillOutsideByPropagation(const cv::Mat& gray, const cv::Mat& valid) {
+    CV_Assert(gray.type() == CV_8U && valid.type() == CV_8U && gray.size() == valid.size());
+    cv::Mat out = gray.clone();
+    if (cv::countNonZero(valid) == 0) return out;
+
+    // state: 0 = black/unseen, 1 = queued for this or next wave, 2 = known pixel.
+    // The queued state is the temporary mark that prevents adding a pixel twice.
+    cv::Mat state(gray.size(), CV_8U, cv::Scalar(0));
+    for (int y = 0; y < gray.rows; ++y) {
+        const uchar* vm = valid.ptr<uchar>(y);
+        uchar* sm = state.ptr<uchar>(y);
+        for (int x = 0; x < gray.cols; ++x)
+            if (vm[x]) sm[x] = 2;
+    }
+
+    static const int dx[8] = {-1,0,1,-1,1,-1,0,1};
+    static const int dy[8] = {-1,-1,-1,0,0,1,1,1};
+
+    std::vector<cv::Point> current;
+    current.reserve(gray.rows + gray.cols);
+
+    // Initial wave: missing pixels that already touch known pixels.
+    for (int y = 0; y < gray.rows; ++y) {
+        for (int x = 0; x < gray.cols; ++x) {
+            if (state.at<uchar>(y,x) != 0) continue;
+            bool touchesKnown = false;
+            for (int k = 0; k < 8; ++k) {
+                const int nx = x + dx[k];
+                const int ny = y + dy[k];
+                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+                if (state.at<uchar>(ny,nx) == 2) {
+                    touchesKnown = true;
+                    break;
+                }
+            }
+            if (touchesKnown) {
+                state.at<uchar>(y,x) = 1;
+                current.emplace_back(x,y);
+            }
+        }
+    }
+
+    std::vector<cv::Point> next;
+    std::vector<uchar> values;
+
+    while (!current.empty()) {
+        // Calculate the whole wave before changing any pixel in it. Therefore
+        // all pixels at the same depth see only the previous, already-known wave.
+        values.resize(current.size());
+        for (size_t i = 0; i < current.size(); ++i) {
+            const int x = current[i].x;
+            const int y = current[i].y;
+            int sum = 0;
+            int cnt = 0;
+            for (int k = 0; k < 8; ++k) {
+                const int nx = x + dx[k];
+                const int ny = y + dy[k];
+                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+                if (state.at<uchar>(ny,nx) == 2) {
+                    sum += out.at<uchar>(ny,nx);
+                    ++cnt;
+                }
+            }
+            values[i] = cnt > 0 ? uchar((sum + cnt/2) / cnt) : 0;
+        }
+
+        for (size_t i = 0; i < current.size(); ++i) {
+            const cv::Point& p = current[i];
+            out.at<uchar>(p.y,p.x) = values[i];
+            state.at<uchar>(p.y,p.x) = 2;
+        }
+
+        // Expand by one pixel. Mark immediately as queued so the same point
+        // cannot be inserted by several neighbours.
+        next.clear();
+        for (const cv::Point& p : current) {
+            for (int k = 0; k < 8; ++k) {
+                const int nx = p.x + dx[k];
+                const int ny = p.y + dy[k];
+                if (nx < 0 || ny < 0 || nx >= gray.cols || ny >= gray.rows) continue;
+                uchar& st = state.at<uchar>(ny,nx);
+                if (st == 0) {
+                    st = 1;
+                    next.emplace_back(nx,ny);
+                }
+            }
+        }
+        current.swap(next);
+    }
+
+    return out;
 }
 
 static cv::Mat labelImage(const cv::Mat& gray,
@@ -241,8 +342,8 @@ int main(int argc, char** argv) {
             affineMae = wr.affineMae;
             meshMae = wr.meshMae;
             if (wr.ok) {
-                affineWarp = wr.affineWarp;
-                meshWarp = wr.meshWarp;
+                affineWarp = fillOutsideByPropagation(wr.affineWarp, wr.affineValid);
+                meshWarp = fillOutsideByPropagation(wr.meshWarp, wr.meshValid);
                 if (affineMae > 1e-9)
                     gain = 100.0 * (affineMae - meshMae) / affineMae;
             } else {
@@ -263,11 +364,11 @@ int main(int argc, char** argv) {
         cv::Mat originalPanel = labelImage(cur, "ORIGINAL", originalInfo);
         cv::Mat affinePanel = labelImage(
             affineWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (EDGE-FILLED)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE ONLY (PROPAGATED FILL)",
             affineInfo);
         cv::Mat meshPanel = labelImage(
             meshWarp,
-            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (EDGE-FILLED)",
+            i==keyIndex ? "REFERENCE / KEYFRAME" : "AFFINE + MESH (PROPAGATED FILL)",
             meshInfo);
 
         cv::Mat side;
@@ -296,6 +397,6 @@ int main(int argc, char** argv) {
     std::cout << "\nOutput: " << outputDir << "\n"
               << "Every " << N << "th frame is a new reference.\n"
               << "Each output image is ORIGINAL | AFFINE ONLY | AFFINE + MESH.\n"
-              << "Out-of-reference pixels are edge-filled for visualization; metrics use valid pixels only.\n";
+              << "Missing pixels use iterative wavefront fill; metrics remain based on valid pixels only.\n";
     return 0;
 }
