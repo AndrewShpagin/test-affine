@@ -73,8 +73,8 @@ private:
     std::vector<float> lk_error_back_;
     PatchData previous_patch_;
     bool have_previous_patch_ = false;
-    cv::Size jpeg_size_hint_;
-    int jpeg_budget_hint_ = 0;
+    double jpeg_bytes_per_pixel_ = 0.0;
+    int jpeg_model_channels_ = 0;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
     int frames_since_keyframe_ = 0;

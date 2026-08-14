@@ -31,6 +31,12 @@ constexpr int kFeatureGridY = 8;
 constexpr int kFeaturesPerCell = 4;
 constexpr int kFeatureCandidateMultiplier = 4;
 constexpr int kFeatureDetectorMaxSide = 256;
+constexpr int kJpegQuality = 85;
+constexpr double kJpegTargetFill = 0.95;
+constexpr double kJpegModelAlpha = 0.20;
+constexpr double kJpegInitialGrayBytesPerPixel = 0.16;
+constexpr double kJpegInitialColorBytesPerPixel = 0.22;
+constexpr double kJpegMinBytesPerPixel = 0.01;
 constexpr int kMeshGridX = 6;
 constexpr int kMeshGridY = 6;
 const cv::Size kLkWindow(13, 13);
@@ -172,9 +178,6 @@ std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray, EncoderTiming& 
     constexpr int target_count = kFeatureGridX * kFeatureGridY * kFeaturesPerCell;
     constexpr int candidate_count = target_count * kFeatureCandidateMultiplier;
 
-    // Keep detector work bounded as input resolution grows. Repeated pyrDown also
-    // removes fine high-frequency detail, biasing selection toward stable coarse
-    // landscape features. Coordinates are mapped back to the full-resolution LK image.
     auto stage = ProfileClock::now();
     cv::Mat detector = gray;
     int detector_scale = 1;
@@ -258,8 +261,6 @@ cv::Point2f predictPointFromPatch(const PatchData& patch, const cv::Point2f& p) 
         patch.affine[0] * p.x + patch.affine[1] * p.y + patch.affine[2],
         patch.affine[3] * p.x + patch.affine[4] * p.y + patch.affine[5]);
     cv::Point2f predicted = q;
-    // Decoder defines the mesh in destination coordinates: x = affine(p) + mesh(x).
-    // Two cheap fixed-point iterations make the predictor consistent with that model.
     for (int iter = 0; iter < 2; ++iter)
         predicted = q + samplePatchMesh(patch, predicted);
     return predicted;
@@ -277,73 +278,50 @@ cv::Size scaledSize8(const cv::Size& source, double scale) {
 }
 
 bool encodeJpegAtSize(const cv::Mat& source, const cv::Size& size,
-                      int quality, std::vector<u_char>& jpeg) {
+                      std::vector<u_char>& jpeg) {
     cv::Mat small;
     if (source.size() == size) small = source;
     else cv::resize(source, small, size, 0.0, 0.0, cv::INTER_AREA);
-    return cv::imencode(".jpg", small, jpeg, {cv::IMWRITE_JPEG_QUALITY, quality});
+    return cv::imencode(".jpg", small, jpeg, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality});
 }
 
-bool encodeJpegToBudget(const cv::Mat& image, int requested_jpeg_bytes,
-                        cv::Size& size_hint, int& budget_hint,
-                        std::vector<u_char>& jpeg, cv::Size& encoded_size) {
+bool encodeJpegSinglePass(const cv::Mat& image, int requested_jpeg_bytes,
+                          double& bytes_per_pixel_model, int& model_channels,
+                          std::vector<u_char>& jpeg, cv::Size& encoded_size) {
     const cv::Mat source = jpegInput8(image);
     if (source.empty()) return false;
-    const int budget = std::max(1, requested_jpeg_bytes);
-    constexpr int quality = 85;
 
-    cv::Size candidate;
-    if (budget_hint == budget && size_hint.width >= 8 && size_hint.height >= 8) candidate = size_hint;
-    else {
-        const double estimated_bpp = source.channels() == 1 ? 0.38 : 0.62;
-        const double scale = std::sqrt(static_cast<double>(budget) /
-            std::max(1.0, static_cast<double>(source.total()) * estimated_bpp));
-        candidate = scaledSize8(source.size(), scale);
+    const int channels = source.channels();
+    if (model_channels != channels) {
+        model_channels = channels;
+        bytes_per_pixel_model = 0.0;
     }
 
-    std::vector<u_char> current;
-    if (!encodeJpegAtSize(source, candidate, quality, current)) return false;
-    for (int iter = 0; iter < 8 && static_cast<int>(current.size()) > budget; ++iter) {
-        if (candidate.width <= 8 && candidate.height <= 8) break;
-        const double ratio = std::sqrt(static_cast<double>(budget) /
-            std::max<std::size_t>(1, current.size())) * 0.96;
-        const double current_scale = std::min(static_cast<double>(candidate.width) / source.cols,
-                                              static_cast<double>(candidate.height) / source.rows);
-        cv::Size next = scaledSize8(source.size(), current_scale * ratio);
-        if (next == candidate) {
-            const double step_scale = std::max(0.01, current_scale - 8.0 / std::max(source.cols, source.rows));
-            next = scaledSize8(source.size(), step_scale);
-        }
-        if (next == candidate) break;
-        candidate = next;
-        if (!encodeJpegAtSize(source, candidate, quality, current)) return false;
-    }
+    const double initial_bpp = channels == 1 ?
+        kJpegInitialGrayBytesPerPixel : kJpegInitialColorBytesPerPixel;
+    const double predicted_bpp = std::max(kJpegMinBytesPerPixel,
+        bytes_per_pixel_model > 0.0 ? bytes_per_pixel_model : initial_bpp);
+    const double target_bytes = std::max(1.0,
+        static_cast<double>(std::max(1, requested_jpeg_bytes)) * kJpegTargetFill);
+    const double target_pixels = target_bytes / predicted_bpp;
+    const double scale = std::sqrt(target_pixels / std::max(1.0, static_cast<double>(source.total())));
+    encoded_size = scaledSize8(source.size(), scale);
 
-    if (!current.empty() && static_cast<int>(current.size()) < static_cast<int>(budget * 0.78) &&
-        (candidate.width < quantizeTo8(source.cols, source.cols) ||
-         candidate.height < quantizeTo8(source.rows, source.rows))) {
-        const double grow = std::sqrt(static_cast<double>(budget) /
-            std::max<std::size_t>(1, current.size())) * 0.97;
-        const double current_scale = std::min(static_cast<double>(candidate.width) / source.cols,
-                                              static_cast<double>(candidate.height) / source.rows);
-        const cv::Size larger = scaledSize8(source.size(), current_scale * grow);
-        if (larger != candidate) {
-            std::vector<u_char> trial;
-            if (encodeJpegAtSize(source, larger, quality, trial) &&
-                static_cast<int>(trial.size()) <= budget && trial.size() > current.size()) {
-                candidate = larger; current.swap(trial);
-            }
-        }
-    }
+    // Deliberately one JPEG encode only. desired_jpeg_size is a target, not a hard
+    // transport limit: keyframes are chunked afterwards into <=1300-byte packets.
+    if (!encodeJpegAtSize(source, encoded_size, jpeg)) return false;
+    if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
 
-    if (static_cast<int>(current.size()) > budget && candidate.width <= 8 && candidate.height <= 8) {
-        for (int q : {70, 50, 30, 10}) {
-            if (!encodeJpegAtSize(source, candidate, q, current)) return false;
-            if (static_cast<int>(current.size()) <= budget) break;
-        }
+    const double encoded_pixels = std::max(1.0,
+        static_cast<double>(encoded_size.width) * encoded_size.height);
+    const double observed_bpp = static_cast<double>(jpeg.size()) / encoded_pixels;
+    if (bytes_per_pixel_model <= 0.0) {
+        bytes_per_pixel_model = observed_bpp;
+    } else {
+        bytes_per_pixel_model =
+            (1.0 - kJpegModelAlpha) * bytes_per_pixel_model +
+            kJpegModelAlpha * observed_bpp;
     }
-    if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
-    jpeg = std::move(current); encoded_size = candidate; size_hint = candidate; budget_hint = budget;
     return true;
 }
 
@@ -477,11 +455,10 @@ bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
     std::vector<u_char> jpeg; cv::Size jpeg_size;
 
     auto stage = ProfileClock::now();
-    const bool jpeg_ok = encodeJpegToBudget(
-        image, desired_jpeg_size, jpeg_size_hint_, jpeg_budget_hint_, jpeg, jpeg_size);
+    const bool jpeg_ok = encodeJpegSinglePass(
+        image, desired_jpeg_size, jpeg_bytes_per_pixel_, jpeg_model_channels_, jpeg, jpeg_size);
     last_timing_.jpeg_ms += profileMs(stage);
     if (!jpeg_ok) return false;
-    if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
 
     const std::size_t count_size = (jpeg.size() + kKeyframeChunkPayloadBytes - 1) / kKeyframeChunkPayloadBytes;
     if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) return false;
@@ -543,8 +520,6 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
     for(std::size_t i=0;i<reference_features_.size();++i) if(i<lk_status_forward_.size()&&lk_status_forward_[i]&&i<lk_error_forward_.size()&&lk_error_forward_[i]<kLkForwardErrorMax){g0.push_back(reference_features_[i]);g1.push_back(lk_forward_[i]);}
     if(g0.size()<4) return false;
 
-    // For the backward consistency check we already know the expected destination in the
-    // reference image exactly: g0. Use it as the initial flow rather than searching from g1.
     lk_back_ = g0; lk_status_back_.clear(); lk_error_back_.clear();
     stage = ProfileClock::now();
     cv::calcOpticalFlowPyrLK(current_pyramid_, reference_pyramid_, g1, lk_back_, lk_status_back_, lk_error_back_,
@@ -604,11 +579,8 @@ void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once
     const bool size_changed = have_reference_ && image.size() != input_size_;
     const bool periodic = !have_reference_ || period == 1 || frames_since_keyframe_ >= period - 1;
 
-    if (size_changed) {
+    if (size_changed)
         have_reference_ = false;
-        jpeg_size_hint_ = cv::Size();
-        jpeg_budget_hint_ = 0;
-    }
 
     auto emit_normalized_keyframe = [&]() {
         const auto stage = ProfileClock::now();
