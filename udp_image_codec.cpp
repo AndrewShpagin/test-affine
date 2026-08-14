@@ -39,6 +39,9 @@ constexpr int kJpegQuality = 85;
 constexpr double kJpegTargetFill = 0.95;
 constexpr double kJpegSizeTolerance = 0.20;
 constexpr int kJpegMaxEncodePasses = 3;
+constexpr int kMosaicMinJpegQuality = 20;
+constexpr int kMosaicMaxJpegQuality = kJpegQuality;
+constexpr int kMosaicMaxQualityPasses = 3;
 constexpr double kJpegModelAlpha = 1.0;
 constexpr double kJpegInitialGrayBytesPerPixel = 0.16;
 constexpr double kJpegInitialColorBytesPerPixel = 0.22;
@@ -286,12 +289,72 @@ cv::Size scaledSize8(const cv::Size& source, double scale) {
                     quantizeTo8(static_cast<int>(std::floor(source.height * scale)), source.height));
 }
 
+bool encodeJpegAtQuality(const cv::Mat& source, int quality, std::vector<u_char>& jpeg) {
+    const cv::Mat input = jpegInput8(source);
+    if (input.empty()) return false;
+    quality = std::clamp(quality, 1, 100);
+    return cv::imencode(".jpg", input, jpeg, {cv::IMWRITE_JPEG_QUALITY, quality});
+}
+
 bool encodeJpegAtSize(const cv::Mat& source, const cv::Size& size,
                       std::vector<u_char>& jpeg) {
     cv::Mat small;
     if (source.size() == size) small = source;
     else cv::resize(source, small, size, 0.0, 0.0, cv::INTER_AREA);
-    return cv::imencode(".jpg", small, jpeg, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality});
+    return encodeJpegAtQuality(small, kJpegQuality, jpeg);
+}
+
+bool encodeJpegQualityBounded(const cv::Mat& image, int requested_jpeg_bytes,
+                              int& quality_state, std::vector<u_char>& jpeg,
+                              int& encoded_quality) {
+    const cv::Mat source = jpegInput8(image);
+    if (source.empty()) return false;
+
+    const double requested_bytes = static_cast<double>(std::max(1, requested_jpeg_bytes));
+    const double lower_bytes = requested_bytes * (1.0 - kJpegSizeTolerance);
+    const double upper_bytes = requested_bytes * (1.0 + kJpegSizeTolerance);
+    const double target_bytes = std::max(1.0, requested_bytes * kJpegTargetFill);
+
+    int low_quality = kMosaicMinJpegQuality;
+    int high_quality = kMosaicMaxJpegQuality;
+    int quality = std::clamp(quality_state, low_quality, high_quality);
+    std::vector<u_char> current;
+    bool final_within_tolerance = false;
+
+    for (int pass = 0; pass < kMosaicMaxQualityPasses; ++pass) {
+        current.clear();
+        if (!encodeJpegAtQuality(source, quality, current)) return false;
+        if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+
+        const double current_bytes = static_cast<double>(current.size());
+        final_within_tolerance = current_bytes >= lower_bytes && current_bytes <= upper_bytes;
+        if (final_within_tolerance || pass + 1 >= kMosaicMaxQualityPasses) break;
+
+        if (current_bytes > upper_bytes) {
+            high_quality = quality - 1;
+        } else {
+            if (quality >= kMosaicMaxJpegQuality) break;
+            low_quality = quality + 1;
+        }
+        if (low_quality > high_quality) break;
+
+        int next_quality;
+        if (pass == 0) {
+            const double ratio = target_bytes / current_bytes;
+            next_quality = static_cast<int>(std::lround(quality * ratio));
+            next_quality = std::clamp(next_quality, low_quality, high_quality);
+        } else {
+            next_quality = (low_quality + high_quality) / 2;
+        }
+        if (next_quality == quality) break;
+        quality = next_quality;
+    }
+
+    jpeg = std::move(current);
+    encoded_quality = quality;
+    if (final_within_tolerance)
+        quality_state = quality;
+    return true;
 }
 
 bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
@@ -606,18 +669,18 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
 
     last_timing_.keyframe = true;
     std::array<std::vector<u_char>, 3> jpegs;
-    cv::Size jpeg_size;
+    const cv::Size jpeg_size = layers[0].size();
     const int layer_target = std::max(1, desired_jpeg_size / static_cast<int>(kMosaicLayerCount));
+    int jpeg_quality = kJpegQuality;
 
     auto stage = ProfileClock::now();
-    if (!encodeJpegBounded(layers[0], layer_target,
-                           mosaic_jpeg_bytes_per_pixel_, mosaic_jpeg_model_channels_,
-                           jpegs[0], jpeg_size)) {
+    if (!encodeJpegQualityBounded(layers[0], layer_target,
+                                  mosaic_jpeg_quality_, jpegs[0], jpeg_quality)) {
         last_timing_.jpeg_ms += profileMs(stage);
         return false;
     }
-    if (!encodeJpegAtSize(layers[1], jpeg_size, jpegs[1]) ||
-        !encodeJpegAtSize(layers[2], jpeg_size, jpegs[2])) {
+    if (!encodeJpegAtQuality(layers[1], jpeg_quality, jpegs[1]) ||
+        !encodeJpegAtQuality(layers[2], jpeg_quality, jpegs[2])) {
         last_timing_.jpeg_ms += profileMs(stage);
         return false;
     }
@@ -627,6 +690,8 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
         if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
 
     last_timing_.mosaic_keyframe = true;
+    last_timing_.jpeg_size = jpeg_size;
+    last_timing_.jpeg_quality = jpeg_quality;
     for (std::size_t i = 0; i < jpegs.size(); ++i)
         last_timing_.jpeg_layer_bytes[i] = jpegs[i].size();
 
@@ -677,6 +742,8 @@ bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
     last_timing_.jpeg_ms += profileMs(stage);
     if (!jpeg_ok) return false;
     last_timing_.jpeg_layer_bytes[0] = jpeg.size();
+    last_timing_.jpeg_size = jpeg_size;
+    last_timing_.jpeg_quality = kJpegQuality;
 
     const std::size_t count_size = (jpeg.size() + kKeyframeChunkPayloadBytes - 1) / kKeyframeChunkPayloadBytes;
     if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) return false;
