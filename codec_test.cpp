@@ -15,6 +15,7 @@
 namespace fs = std::filesystem;
 using affinecodec::Decoder;
 using affinecodec::Encoder;
+using affinecodec::EncoderTiming;
 using affinecodec::LKDebugData;
 using affinecodec::PatchData;
 using affinecodec::u_char;
@@ -22,6 +23,78 @@ using Clock = std::chrono::steady_clock;
 
 static double ms(const Clock::time_point& a, const Clock::time_point& b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+static double profiledEncoderMs(const EncoderTiming& t) {
+    return t.prep_ms + t.color_norm_ms + t.jpeg_ms + t.chunk_ms +
+           t.features_ms + t.ref_pyramid_ms + t.cur_pyramid_ms +
+           t.predictor_ms + t.lk_forward_ms + t.lk_backward_ms +
+           t.affine_ms + t.mesh_ms + t.serialize_ms;
+}
+
+static void addEncoderTiming(EncoderTiming& sum, const EncoderTiming& t) {
+    sum.prep_ms += t.prep_ms;
+    sum.color_norm_ms += t.color_norm_ms;
+    sum.jpeg_ms += t.jpeg_ms;
+    sum.chunk_ms += t.chunk_ms;
+    sum.features_ms += t.features_ms;
+    sum.ref_pyramid_ms += t.ref_pyramid_ms;
+    sum.cur_pyramid_ms += t.cur_pyramid_ms;
+    sum.predictor_ms += t.predictor_ms;
+    sum.lk_forward_ms += t.lk_forward_ms;
+    sum.lk_backward_ms += t.lk_backward_ms;
+    sum.affine_ms += t.affine_ms;
+    sum.mesh_ms += t.mesh_ms;
+    sum.serialize_ms += t.serialize_ms;
+}
+
+static EncoderTiming divideEncoderTiming(const EncoderTiming& sum, double n, bool keyframe) {
+    EncoderTiming t;
+    t.keyframe = keyframe;
+    if (n <= 0.0) return t;
+    t.prep_ms = sum.prep_ms / n;
+    t.color_norm_ms = sum.color_norm_ms / n;
+    t.jpeg_ms = sum.jpeg_ms / n;
+    t.chunk_ms = sum.chunk_ms / n;
+    t.features_ms = sum.features_ms / n;
+    t.ref_pyramid_ms = sum.ref_pyramid_ms / n;
+    t.cur_pyramid_ms = sum.cur_pyramid_ms / n;
+    t.predictor_ms = sum.predictor_ms / n;
+    t.lk_forward_ms = sum.lk_forward_ms / n;
+    t.lk_backward_ms = sum.lk_backward_ms / n;
+    t.affine_ms = sum.affine_ms / n;
+    t.mesh_ms = sum.mesh_ms / n;
+    t.serialize_ms = sum.serialize_ms / n;
+    return t;
+}
+
+static void printEncoderTiming(const EncoderTiming& t, double total_ms,
+                               const std::string& prefix = "      ") {
+    std::cout << prefix << "enc-prof:" << std::fixed << std::setprecision(2);
+    if (t.keyframe) {
+        std::cout << " prep=" << t.prep_ms
+                  << " color=" << t.color_norm_ms
+                  << " jpeg=" << t.jpeg_ms
+                  << " chunk=" << t.chunk_ms
+                  << " feat=" << t.features_ms
+                  << " refPyr=" << t.ref_pyramid_ms;
+        const double fallback_patch = t.cur_pyramid_ms + t.predictor_ms + t.lk_forward_ms +
+                                      t.lk_backward_ms + t.affine_ms + t.mesh_ms + t.serialize_ms;
+        if (fallback_patch > 0.01)
+            std::cout << " fallbackPatch=" << fallback_patch;
+    } else {
+        std::cout << " prep=" << t.prep_ms
+                  << " curPyr=" << t.cur_pyramid_ms
+                  << " pred=" << t.predictor_ms
+                  << " LKf=" << t.lk_forward_ms
+                  << " LKb=" << t.lk_backward_ms
+                  << " affine=" << t.affine_ms
+                  << " mesh=" << t.mesh_ms
+                  << " ser=" << t.serialize_ms;
+        if (t.predictor_used) std::cout << " predictor=yes";
+    }
+    const double other = std::max(0.0, total_ms - profiledEncoderMs(t));
+    std::cout << " other=" << other << " ms\n";
 }
 
 static bool isImageFile(const fs::path& p) {
@@ -116,9 +189,12 @@ int main(int argc, char** argv) {
     std::vector<u_char> current_jpeg;
     std::size_t total_bytes = 0, total_packets = 0, timed_frames = 0;
     std::size_t key_frames = 0, patch_frames = 0;
+    std::size_t predictor_patch_frames = 0;
     double total_enc_ms = 0.0, total_dec_ms = 0.0;
     double key_enc_ms = 0.0, key_dec_ms = 0.0;
     double patch_enc_ms = 0.0, patch_dec_ms = 0.0;
+    EncoderTiming key_timing_sum;
+    EncoderTiming patch_timing_sum;
 
     for (std::size_t i = 0; i < files.size(); ++i) {
         cv::Mat original = cv::imread(files[i].string(), cv::IMREAD_COLOR);
@@ -127,6 +203,7 @@ int main(int argc, char** argv) {
         const auto enc_start = Clock::now();
         encoder.pushImage(original, jpeg_bytes, key_period);
         const double enc_ms = ms(enc_start, Clock::now());
+        const EncoderTiming enc_timing = encoder.lastTiming();
 
         LKDebugData lk_debug;
         const bool have_lk_debug = encoder.getLastLKDebug(lk_debug);
@@ -178,13 +255,17 @@ int main(int argc, char** argv) {
                       << frame_packets << " packets  " << frame_bytes << " B"
                       << "  enc=" << std::fixed << std::setprecision(2) << enc_ms << " ms"
                       << "  dec=" << dec_ms << " ms\n";
+            printEncoderTiming(enc_timing, enc_ms);
             continue;
         }
 
         if (was_keyframe) {
             ++key_frames; key_enc_ms += enc_ms; key_dec_ms += dec_ms;
+            addEncoderTiming(key_timing_sum, enc_timing);
         } else {
             ++patch_frames; patch_enc_ms += enc_ms; patch_dec_ms += dec_ms;
+            addEncoderTiming(patch_timing_sum, enc_timing);
+            if (enc_timing.predictor_used) ++predictor_patch_frames;
         }
 
         if (decoded.channels() == 1) cv::cvtColor(decoded, decoded, cv::COLOR_GRAY2BGR);
@@ -230,6 +311,7 @@ int main(int argc, char** argv) {
                   << "  MAE=" << std::fixed << std::setprecision(2) << mae
                   << "  enc=" << enc_ms << " ms"
                   << "  dec=" << dec_ms << " ms\n";
+        printEncoderTiming(enc_timing, enc_ms);
     }
 
     std::cout << "\nOutput: " << output_dir << '\n'
@@ -242,14 +324,23 @@ int main(int argc, char** argv) {
                   << "Average decode: " << total_dec_ms / timed_frames << " ms/frame\n";
     }
     if (key_frames) {
-        std::cout << "Keyframe average: encode=" << key_enc_ms / key_frames
+        const double avg_enc = key_enc_ms / key_frames;
+        std::cout << "Keyframe average: encode=" << avg_enc
                   << " ms  decode=" << key_dec_ms / key_frames
                   << " ms  (" << key_frames << " frames)\n";
+        const EncoderTiming avg = divideEncoderTiming(key_timing_sum, static_cast<double>(key_frames), true);
+        printEncoderTiming(avg, avg_enc, "  KEY avg:   ");
     }
     if (patch_frames) {
-        std::cout << "Patch average:    encode=" << patch_enc_ms / patch_frames
+        const double avg_enc = patch_enc_ms / patch_frames;
+        std::cout << "Patch average:    encode=" << avg_enc
                   << " ms  decode=" << patch_dec_ms / patch_frames
                   << " ms  (" << patch_frames << " frames)\n";
+        EncoderTiming avg = divideEncoderTiming(patch_timing_sum, static_cast<double>(patch_frames), false);
+        avg.predictor_used = predictor_patch_frames > 0;
+        printEncoderTiming(avg, avg_enc, "  PATCH avg: ");
+        std::cout << "  Predictor used on " << predictor_patch_frames << "/"
+                  << patch_frames << " patch frames\n";
     }
 
     std::cout << "Every getNextChunk() result is <= "
