@@ -25,6 +25,9 @@ constexpr std::uint32_t kMagic = 0x31434641u;
 constexpr std::uint8_t kVersion = 2;
 constexpr std::uint8_t kPacketKeyframeChunk = 1;
 constexpr std::uint8_t kPacketPatch = 2;
+constexpr std::uint8_t kPacketMosaicKeyframeChunk = 3;
+constexpr std::uint8_t kPacketMosaicKeyframeEnd = 4;
+constexpr std::uint8_t kMosaicLayerCount = 3;
 
 constexpr int kFeatureGridX = 8;
 constexpr int kFeatureGridY = 8;
@@ -51,6 +54,9 @@ constexpr double kTargetLkStdDev = 64.0;
 constexpr std::size_t kCommonHeaderBytes = 20;
 constexpr std::size_t kKeyframeChunkHeaderBytes = 40;
 constexpr std::size_t kKeyframeChunkPayloadBytes = kMaxUdpPacketBytes - kKeyframeChunkHeaderBytes;
+constexpr std::size_t kMosaicChunkHeaderBytes = 44;
+constexpr std::size_t kMosaicChunkPayloadBytes = kMaxUdpPacketBytes - kMosaicChunkHeaderBytes;
+constexpr std::size_t kMosaicEndHeaderBytes = 24;
 constexpr std::uint32_t kMaxAcceptedJpegBytes = 64u * 1024u * 1024u;
 constexpr std::size_t kMaxPendingPatches = 64;
 
@@ -334,10 +340,6 @@ bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
             static_cast<double>(current_size.height) / source.rows);
         const double corrected_scale = current_scale * std::sqrt(target_bytes / current_bytes);
         const cv::Size next_size = scaledSize8(source.size(), corrected_scale);
-
-        // A very low-entropy frame (nearly white/black) can remain below the lower
-        // bound even at full source resolution. Likewise 8x8 is the absolute floor.
-        // In either case another encode cannot improve the size by changing resolution.
         if (next_size == current_size) break;
         current_size = next_size;
     }
@@ -345,9 +347,6 @@ bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
     jpeg = std::move(current);
     encoded_size = current_size;
 
-    // Do not let a pathological frame poison the predictor. Normal frames update the
-    // model immediately (alpha=1 today). A corrected frame may update it only if the
-    // correction actually brought the JPEG back into the accepted size band.
     if (first_pass_within_tolerance || final_within_tolerance) {
         const double encoded_pixels = std::max(1.0,
             static_cast<double>(encoded_size.width) * encoded_size.height);
@@ -359,6 +358,97 @@ bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
                 (1.0 - kJpegModelAlpha) * bytes_per_pixel_model +
                 kJpegModelAlpha * observed_bpp;
         }
+    }
+    return true;
+}
+
+bool mosaicEligible(const cv::Size& size) {
+    return size.width >= 16 && size.height >= 16 &&
+           (size.width & 1) == 0 && (size.height & 1) == 0;
+}
+
+std::vector<cv::Point> mosaicDPositions(const cv::Size& size) {
+    std::vector<cv::Point> positions;
+    if (!mosaicEligible(size)) return positions;
+    const int mw = size.width / 2;
+    const int mh = size.height / 2;
+    const std::size_t wanted = static_cast<std::size_t>(mw) * mh;
+    positions.reserve(wanted);
+
+    // For square frames this is the exact 45-degree packing shown in the MOSAIC
+    // pattern: the W/2 x H/2 packed JPEG unfolds into the central diamond.
+    if (size.width == size.height) {
+        for (int py = 0; py < mh; ++py) {
+            for (int px = 0; px < mw; ++px) {
+                const int x = px + py + 1;
+                const int y = px - py + size.height / 2;
+                positions.emplace_back(x, y);
+            }
+        }
+        return positions;
+    }
+
+    // Rectangular fallback: choose exactly one quarter of all pixels from the
+    // complementary checkerboard parity, prioritizing the aspect-correct center.
+    struct Candidate { long long score; cv::Point p; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(static_cast<std::size_t>(size.width) * size.height / 2);
+    const int cx = size.width / 2;
+    const int cy = size.height / 2;
+    for (int y = 0; y < size.height; ++y) {
+        for (int x = 0; x < size.width; ++x) {
+            if (((x + y) & 1) == 0) continue;
+            const long long score =
+                static_cast<long long>(std::abs(x - cx)) * size.height +
+                static_cast<long long>(std::abs(y - cy)) * size.width;
+            candidates.push_back({score, cv::Point(x, y)});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.score != b.score) return a.score < b.score;
+        if (a.p.y != b.p.y) return a.p.y < b.p.y;
+        return a.p.x < b.p.x;
+    });
+    if (candidates.size() < wanted) return {};
+    candidates.resize(wanted);
+
+    // Pack nearby diagonals together to keep the D JPEG reasonably coherent.
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        const int au = a.p.x + a.p.y, bu = b.p.x + b.p.y;
+        if (au != bu) return au < bu;
+        const int av = a.p.x - a.p.y, bv = b.p.x - b.p.y;
+        return av < bv;
+    });
+    for (const Candidate& c : candidates) positions.push_back(c.p);
+    return positions;
+}
+
+bool buildMosaicLayers(const cv::Mat& image, std::array<cv::Mat, 3>& layers) {
+    const cv::Mat source = jpegInput8(image);
+    if (source.empty() || !mosaicEligible(source.size())) return false;
+    const int mw = source.cols / 2;
+    const int mh = source.rows / 2;
+    const cv::Size mosaic_size(mw, mh);
+    for (cv::Mat& layer : layers) layer.create(mosaic_size, source.type());
+
+    const std::size_t elem = source.elemSize();
+    for (int y = 0; y < mh; ++y) {
+        for (int x = 0; x < mw; ++x) {
+            std::memcpy(layers[0].ptr(y) + static_cast<std::size_t>(x) * elem,
+                        source.ptr(2 * y) + static_cast<std::size_t>(2 * x) * elem, elem);
+            std::memcpy(layers[1].ptr(y) + static_cast<std::size_t>(x) * elem,
+                        source.ptr(2 * y + 1) + static_cast<std::size_t>(2 * x + 1) * elem, elem);
+        }
+    }
+
+    const std::vector<cv::Point> d_positions = mosaicDPositions(source.size());
+    if (d_positions.size() != static_cast<std::size_t>(mw) * mh) return false;
+    for (std::size_t i = 0; i < d_positions.size(); ++i) {
+        const int py = static_cast<int>(i / mw);
+        const int px = static_cast<int>(i % mw);
+        const cv::Point p = d_positions[i];
+        std::memcpy(layers[2].ptr(py) + static_cast<std::size_t>(px) * elem,
+                    source.ptr(p.y) + static_cast<std::size_t>(p.x) * elem, elem);
     }
     return true;
 }
@@ -377,6 +467,32 @@ std::vector<u_char> serializeKeyframeChunk(std::uint32_t frame_id, const cv::Siz
     appendU32(packet, jpeg_bytes); appendU32(packet, chunk_offset);
     appendU16(packet, chunk_bytes); appendU16(packet, 0);
     packet.insert(packet.end(), chunk_data, chunk_data + chunk_bytes);
+    return packet;
+}
+
+std::vector<u_char> serializeMosaicKeyframeChunk(std::uint32_t frame_id, const cv::Size& original_size,
+                                                 std::uint8_t layer_index, const cv::Size& jpeg_size,
+                                                 std::uint32_t jpeg_bytes, std::uint16_t chunk_index,
+                                                 std::uint16_t chunk_count, std::uint32_t chunk_offset,
+                                                 const u_char* chunk_data, std::uint16_t chunk_bytes) {
+    std::vector<u_char> packet; packet.reserve(kMosaicChunkHeaderBytes + chunk_bytes);
+    appendCommonHeader(packet, kPacketMosaicKeyframeChunk, static_cast<std::uint16_t>(kMosaicChunkHeaderBytes),
+                       frame_id, frame_id, original_size);
+    appendU8(packet, layer_index); appendU8(packet, kMosaicLayerCount); appendU16(packet, 0);
+    appendU16(packet, static_cast<std::uint16_t>(jpeg_size.width));
+    appendU16(packet, static_cast<std::uint16_t>(jpeg_size.height));
+    appendU16(packet, chunk_index); appendU16(packet, chunk_count);
+    appendU32(packet, jpeg_bytes); appendU32(packet, chunk_offset);
+    appendU16(packet, chunk_bytes); appendU16(packet, 0);
+    packet.insert(packet.end(), chunk_data, chunk_data + chunk_bytes);
+    return packet;
+}
+
+std::vector<u_char> serializeMosaicKeyframeEnd(std::uint32_t frame_id, const cv::Size& original_size) {
+    std::vector<u_char> packet; packet.reserve(kMosaicEndHeaderBytes);
+    appendCommonHeader(packet, kPacketMosaicKeyframeEnd, static_cast<std::uint16_t>(kMosaicEndHeaderBytes),
+                       frame_id, frame_id, original_size);
+    appendU8(packet, kMosaicLayerCount); appendU8(packet, 0); appendU16(packet, 0);
     return packet;
 }
 
@@ -487,8 +603,71 @@ void Encoder::setReference(const cv::Mat& gray, std::uint32_t frame_id) {
     keyframe_id_ = frame_id; frames_since_keyframe_ = 0; have_reference_ = true;
 }
 
+bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
+                                 int desired_jpeg_size, std::uint32_t frame_id) {
+    std::array<cv::Mat, 3> layers;
+    if (!buildMosaicLayers(image, layers)) return false;
+
+    last_timing_.keyframe = true;
+    std::array<std::vector<u_char>, 3> jpegs;
+    cv::Size jpeg_size;
+    const int layer_target = std::max(1, desired_jpeg_size / static_cast<int>(kMosaicLayerCount));
+
+    auto stage = ProfileClock::now();
+    if (!encodeJpegBounded(layers[0], layer_target,
+                           mosaic_jpeg_bytes_per_pixel_, mosaic_jpeg_model_channels_,
+                           jpegs[0], jpeg_size)) {
+        last_timing_.jpeg_ms += profileMs(stage);
+        return false;
+    }
+    if (!encodeJpegAtSize(layers[1], jpeg_size, jpegs[1]) ||
+        !encodeJpegAtSize(layers[2], jpeg_size, jpegs[2])) {
+        last_timing_.jpeg_ms += profileMs(stage);
+        return false;
+    }
+    last_timing_.jpeg_ms += profileMs(stage);
+
+    for (const auto& jpeg : jpegs)
+        if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+
+    std::vector<std::vector<u_char>> packets;
+    stage = ProfileClock::now();
+    for (std::uint8_t layer_index = 0; layer_index < kMosaicLayerCount; ++layer_index) {
+        const std::vector<u_char>& jpeg = jpegs[layer_index];
+        const std::size_t count_size = (jpeg.size() + kMosaicChunkPayloadBytes - 1) / kMosaicChunkPayloadBytes;
+        if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) {
+            last_timing_.chunk_ms += profileMs(stage);
+            return false;
+        }
+        const std::uint16_t chunk_count = static_cast<std::uint16_t>(count_size);
+        const std::uint32_t jpeg_bytes = static_cast<std::uint32_t>(jpeg.size());
+        for (std::uint16_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+            const std::size_t offset = static_cast<std::size_t>(chunk_index) * kMosaicChunkPayloadBytes;
+            const std::size_t bytes = std::min(kMosaicChunkPayloadBytes, jpeg.size() - offset);
+            std::vector<u_char> packet = serializeMosaicKeyframeChunk(
+                frame_id, image.size(), layer_index, jpeg_size, jpeg_bytes,
+                chunk_index, chunk_count, static_cast<std::uint32_t>(offset),
+                jpeg.data() + offset, static_cast<std::uint16_t>(bytes));
+            if (packet.size() > kMaxUdpPacketBytes) {
+                last_timing_.chunk_ms += profileMs(stage);
+                return false;
+            }
+            packets.push_back(std::move(packet));
+        }
+    }
+    packets.push_back(serializeMosaicKeyframeEnd(frame_id, image.size()));
+    for (auto& packet : packets) output_queue_.push_back(std::move(packet));
+    last_timing_.chunk_ms += profileMs(stage);
+
+    input_size_ = image.size(); setReference(gray, frame_id); return true;
+}
+
 bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
                            int desired_jpeg_size, std::uint32_t frame_id) {
+    if (mosaic_keyframes_ && mosaicEligible(image.size())) {
+        if (emitMosaicKeyframe(image, gray, desired_jpeg_size, frame_id)) return true;
+    }
+
     last_timing_.keyframe = true;
     std::vector<u_char> jpeg; cv::Size jpeg_size;
 
@@ -693,11 +872,98 @@ bool Encoder::getLastLKDebug(LKDebugData& debug) const {
 
 void Decoder::resetPendingKeyframe() {
     pending_keyframe_ = KeyframeAssembly{};
+    pending_mosaic_ = MosaicAssembly{};
     pending_patch_queue_.clear();
+}
+
+bool Decoder::decodeMosaicLayer(std::uint8_t layer_index) {
+    if (!pending_mosaic_.active || layer_index >= kMosaicLayerCount) return false;
+    MosaicLayerAssembly& layer = pending_mosaic_.layers[layer_index];
+    if (layer.complete) return true;
+    if (layer.bytes.empty() || layer.received_count != layer.chunk_count) return false;
+
+    cv::Mat encoded(1, static_cast<int>(layer.bytes.size()), CV_8U, layer.bytes.data());
+    cv::Mat decoded = cv::imdecode(encoded, cv::IMREAD_UNCHANGED);
+    if (decoded.empty() || decoded.size() != layer.jpeg_size) return false;
+    const cv::Size sample_size(pending_mosaic_.original_size.width / 2,
+                               pending_mosaic_.original_size.height / 2);
+    if (decoded.size() != sample_size)
+        cv::resize(decoded, decoded, sample_size, 0.0, 0.0, cv::INTER_LINEAR);
+    layer.decoded = decoded;
+    layer.complete = true;
+    return true;
+}
+
+bool Decoder::rebuildMosaicKeyframe() {
+    if (!pending_mosaic_.active || !mosaicEligible(pending_mosaic_.original_size)) return false;
+
+    int type = -1;
+    for (const MosaicLayerAssembly& layer : pending_mosaic_.layers) {
+        if (layer.complete && !layer.decoded.empty()) { type = layer.decoded.type(); break; }
+    }
+    if (type < 0) return false;
+
+    const cv::Size full_size = pending_mosaic_.original_size;
+    const int mw = full_size.width / 2;
+    const int mh = full_size.height / 2;
+    cv::Mat assembled(full_size, type, cv::Scalar::all(0));
+    cv::Mat valid(full_size, CV_8U, cv::Scalar(0));
+    const std::size_t elem = assembled.elemSize();
+
+    auto put = [&](int x, int y, const cv::Mat& layer, int lx, int ly) {
+        if (x < 0 || y < 0 || x >= full_size.width || y >= full_size.height || layer.type() != type) return;
+        std::memcpy(assembled.ptr(y) + static_cast<std::size_t>(x) * elem,
+                    layer.ptr(ly) + static_cast<std::size_t>(lx) * elem, elem);
+        valid.at<unsigned char>(y, x) = 255;
+    };
+
+    const MosaicLayerAssembly& a = pending_mosaic_.layers[0];
+    if (a.complete && !a.decoded.empty())
+        for (int y = 0; y < mh; ++y) for (int x = 0; x < mw; ++x)
+            put(2 * x, 2 * y, a.decoded, x, y);
+
+    const MosaicLayerAssembly& b = pending_mosaic_.layers[1];
+    if (b.complete && !b.decoded.empty())
+        for (int y = 0; y < mh; ++y) for (int x = 0; x < mw; ++x)
+            put(2 * x + 1, 2 * y + 1, b.decoded, x, y);
+
+    const MosaicLayerAssembly& d = pending_mosaic_.layers[2];
+    if (d.complete && !d.decoded.empty()) {
+        const std::vector<cv::Point> positions = mosaicDPositions(full_size);
+        if (positions.size() != static_cast<std::size_t>(mw) * mh) return false;
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            const int ly = static_cast<int>(i / mw);
+            const int lx = static_cast<int>(i % mw);
+            put(positions[i].x, positions[i].y, d.decoded, lx, ly);
+        }
+    }
+
+    if (cv::countNonZero(valid) == 0) return false;
+    cv::Mat reconstructed = fillOutside(assembled, valid);
+    if (reconstructed.empty()) return false;
+
+    const bool new_keyframe = !have_keyframe_ || keyframe_id_ != pending_mosaic_.frame_id;
+    original_size_ = full_size;
+    keyframe_id_ = pending_mosaic_.frame_id;
+    have_keyframe_ = true;
+    current_jpeg_.clear();
+    decoded_keyframe_ = reconstructed;
+    keyframe_changed_ = true;
+    previous_render_.release();
+
+    if (new_keyframe) {
+        patch_queue_.clear();
+        while (!pending_patch_queue_.empty()) {
+            patch_queue_.push_back(std::move(pending_patch_queue_.front()));
+            pending_patch_queue_.pop_front();
+        }
+    }
+    return true;
 }
 
 void Decoder::pushData(const std::vector<u_char>& data){
     if(data.size()<kCommonHeaderBytes||data.size()>kMaxUdpPacketBytes)return;std::size_t pos=0;CommonHeader h;if(!readCommonHeader(data,pos,h)||h.header_bytes>data.size())return;
+
     if(h.type==kPacketKeyframeChunk){
         if(h.header_bytes!=kKeyframeChunkHeaderBytes||h.keyframe_id!=h.frame_id)return;
         std::uint16_t jw=0,jh=0,chunk_index=0,chunk_count=0,chunk_bytes=0,reserved=0;std::uint32_t jpeg_bytes=0,chunk_offset=0;
@@ -712,7 +978,8 @@ void Decoder::pushData(const std::vector<u_char>& data){
         const std::size_t expected_bytes=std::min(kKeyframeChunkPayloadBytes,static_cast<std::size_t>(jpeg_bytes)-expected_offset);
         if(expected_offset!=chunk_offset||expected_bytes!=chunk_bytes||expected_offset+expected_bytes>jpeg_bytes)return;
         if(have_keyframe_){if(h.frame_id==keyframe_id_)return;if(!frameIdNewer(h.frame_id,keyframe_id_))return;}
-        if(pending_keyframe_.active&&h.frame_id!=pending_keyframe_.frame_id){if(!frameIdNewer(h.frame_id,pending_keyframe_.frame_id))return;resetPendingKeyframe();}
+        if(pending_mosaic_.active){if(!frameIdNewer(h.frame_id,pending_mosaic_.frame_id))return;pending_mosaic_=MosaicAssembly{};pending_patch_queue_.clear();}
+        if(pending_keyframe_.active&&h.frame_id!=pending_keyframe_.frame_id){if(!frameIdNewer(h.frame_id,pending_keyframe_.frame_id))return;pending_keyframe_=KeyframeAssembly{};pending_patch_queue_.clear();}
         if(!pending_keyframe_.active){
             pending_keyframe_.active=true;pending_keyframe_.frame_id=h.frame_id;pending_keyframe_.original_size=h.original_size;
             pending_keyframe_.jpeg_size=cv::Size(jw,jh);pending_keyframe_.jpeg_bytes=jpeg_bytes;pending_keyframe_.chunk_count=chunk_count;
@@ -727,12 +994,73 @@ void Decoder::pushData(const std::vector<u_char>& data){
             current_jpeg_=std::move(pending_keyframe_.bytes);original_size_=pending_keyframe_.original_size;keyframe_id_=pending_keyframe_.frame_id;
             have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();previous_render_.release();patch_queue_.clear();
             while(!pending_patch_queue_.empty()){patch_queue_.push_back(std::move(pending_patch_queue_.front()));pending_patch_queue_.pop_front();}
-            pending_keyframe_=KeyframeAssembly{};
+            pending_keyframe_=KeyframeAssembly{};pending_mosaic_=MosaicAssembly{};
         }
         return;
     }
+
+    if(h.type==kPacketMosaicKeyframeChunk){
+        if(h.header_bytes!=kMosaicChunkHeaderBytes||h.keyframe_id!=h.frame_id||!mosaicEligible(h.original_size))return;
+        std::uint8_t layer_index=0,layer_count=0;std::uint16_t reserved0=0,jw=0,jh=0,chunk_index=0,chunk_count=0,chunk_bytes=0,reserved1=0;std::uint32_t jpeg_bytes=0,chunk_offset=0;
+        if(!readU8(data,pos,layer_index)||!readU8(data,pos,layer_count)||!readU16(data,pos,reserved0)||
+           !readU16(data,pos,jw)||!readU16(data,pos,jh)||!readU16(data,pos,chunk_index)||!readU16(data,pos,chunk_count)||
+           !readU32(data,pos,jpeg_bytes)||!readU32(data,pos,chunk_offset)||!readU16(data,pos,chunk_bytes)||!readU16(data,pos,reserved1))return;
+        if(layer_count!=kMosaicLayerCount||layer_index>=kMosaicLayerCount||jw==0||jh==0||jpeg_bytes==0||jpeg_bytes>kMaxAcceptedJpegBytes||
+           chunk_count==0||chunk_index>=chunk_count||static_cast<std::size_t>(h.header_bytes)+chunk_bytes!=data.size())return;
+        const std::size_t expected_count=(static_cast<std::size_t>(jpeg_bytes)+kMosaicChunkPayloadBytes-1)/kMosaicChunkPayloadBytes;
+        const std::size_t expected_offset=static_cast<std::size_t>(chunk_index)*kMosaicChunkPayloadBytes;
+        if(expected_count!=chunk_count||expected_offset>=jpeg_bytes)return;
+        const std::size_t expected_bytes=std::min(kMosaicChunkPayloadBytes,static_cast<std::size_t>(jpeg_bytes)-expected_offset);
+        if(expected_offset!=chunk_offset||expected_bytes!=chunk_bytes||expected_offset+expected_bytes>jpeg_bytes)return;
+
+        if(have_keyframe_&&h.frame_id!=keyframe_id_&&!frameIdNewer(h.frame_id,keyframe_id_))return;
+        if(have_keyframe_&&h.frame_id==keyframe_id_&&(!pending_mosaic_.active||pending_mosaic_.frame_id!=h.frame_id))return;
+        if(pending_keyframe_.active){if(!frameIdNewer(h.frame_id,pending_keyframe_.frame_id))return;pending_keyframe_=KeyframeAssembly{};pending_patch_queue_.clear();}
+        if(pending_mosaic_.active&&h.frame_id!=pending_mosaic_.frame_id){if(!frameIdNewer(h.frame_id,pending_mosaic_.frame_id))return;pending_mosaic_=MosaicAssembly{};pending_patch_queue_.clear();}
+        if(!pending_mosaic_.active){
+            pending_mosaic_.active=true;pending_mosaic_.frame_id=h.frame_id;pending_mosaic_.original_size=h.original_size;pending_mosaic_.layer_count=layer_count;
+        }else if(pending_mosaic_.original_size!=h.original_size||pending_mosaic_.layer_count!=layer_count)return;
+
+        MosaicLayerAssembly& layer=pending_mosaic_.layers[layer_index];
+        if(layer.jpeg_bytes==0){
+            layer.jpeg_size=cv::Size(jw,jh);layer.jpeg_bytes=jpeg_bytes;layer.chunk_count=chunk_count;layer.received_count=0;
+            layer.bytes.resize(jpeg_bytes);layer.received.assign(chunk_count,0);
+        }else if(layer.jpeg_size!=cv::Size(jw,jh)||layer.jpeg_bytes!=jpeg_bytes||layer.chunk_count!=chunk_count)return;
+        if(!layer.received[chunk_index]){
+            std::copy(data.begin()+h.header_bytes,data.end(),layer.bytes.begin()+chunk_offset);
+            layer.received[chunk_index]=1;++layer.received_count;
+        }
+        if(!layer.complete&&layer.received_count==layer.chunk_count){
+            if(decodeMosaicLayer(layer_index)&&(pending_mosaic_.end_received||(have_keyframe_&&keyframe_id_==pending_mosaic_.frame_id)))
+                rebuildMosaicKeyframe();
+        }
+        return;
+    }
+
+    if(h.type==kPacketMosaicKeyframeEnd){
+        if(h.header_bytes!=kMosaicEndHeaderBytes||data.size()!=kMosaicEndHeaderBytes||h.keyframe_id!=h.frame_id||!mosaicEligible(h.original_size))return;
+        std::uint8_t layer_count=0,reserved0=0;std::uint16_t reserved1=0;
+        if(!readU8(data,pos,layer_count)||!readU8(data,pos,reserved0)||!readU16(data,pos,reserved1)||layer_count!=kMosaicLayerCount)return;
+        if(have_keyframe_&&h.frame_id!=keyframe_id_&&!frameIdNewer(h.frame_id,keyframe_id_))return;
+        if(pending_keyframe_.active){if(!frameIdNewer(h.frame_id,pending_keyframe_.frame_id))return;pending_keyframe_=KeyframeAssembly{};pending_patch_queue_.clear();}
+        if(pending_mosaic_.active&&h.frame_id!=pending_mosaic_.frame_id){if(!frameIdNewer(h.frame_id,pending_mosaic_.frame_id))return;pending_mosaic_=MosaicAssembly{};pending_patch_queue_.clear();}
+        if(!pending_mosaic_.active){pending_mosaic_.active=true;pending_mosaic_.frame_id=h.frame_id;pending_mosaic_.original_size=h.original_size;pending_mosaic_.layer_count=layer_count;}
+        else if(pending_mosaic_.original_size!=h.original_size||pending_mosaic_.layer_count!=layer_count)return;
+        pending_mosaic_.end_received=true;
+        rebuildMosaicKeyframe();
+        return;
+    }
+
     if(h.type==kPacketPatch){
         PatchData patch;if(!parsePatch(data,h,pos,patch))return;
+        if(pending_mosaic_.active&&h.keyframe_id==pending_mosaic_.frame_id&&h.original_size==pending_mosaic_.original_size){
+            if(!have_keyframe_||keyframe_id_!=pending_mosaic_.frame_id){
+                if(!rebuildMosaicKeyframe()){
+                    if(pending_patch_queue_.size()>=kMaxPendingPatches)pending_patch_queue_.pop_front();pending_patch_queue_.push_back(std::move(patch));return;
+                }
+            }
+            if(have_keyframe_&&h.keyframe_id==keyframe_id_&&h.original_size==original_size_){patch_queue_.push_back(std::move(patch));return;}
+        }
         if(have_keyframe_&&h.keyframe_id==keyframe_id_&&h.original_size==original_size_){patch_queue_.push_back(std::move(patch));return;}
         if(pending_keyframe_.active&&h.keyframe_id==pending_keyframe_.frame_id&&h.original_size==pending_keyframe_.original_size){
             if(pending_patch_queue_.size()>=kMaxPendingPatches)pending_patch_queue_.pop_front();pending_patch_queue_.push_back(std::move(patch));
