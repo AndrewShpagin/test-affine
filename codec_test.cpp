@@ -15,6 +15,7 @@
 namespace fs = std::filesystem;
 using affinecodec::Decoder;
 using affinecodec::Encoder;
+using affinecodec::LKDebugData;
 using affinecodec::PatchData;
 using affinecodec::u_char;
 using Clock = std::chrono::steady_clock;
@@ -59,6 +60,24 @@ static cv::Mat addLabel(const cv::Mat& image, const std::string& title,
                 0.55, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     cv::putText(out, info, cv::Point(10, 43), cv::FONT_HERSHEY_SIMPLEX,
                 0.43, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    return out;
+}
+
+static cv::Mat makeLkPanel(const LKDebugData& debug) {
+    cv::Mat out;
+    if (debug.image.empty()) return out;
+    if (debug.image.channels() == 1) cv::cvtColor(debug.image, out, cv::COLOR_GRAY2BGR);
+    else out = debug.image.clone();
+
+    const std::size_t count = std::min(debug.from.size(), debug.to.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const cv::Point2f a = debug.from[i];
+        const cv::Point2f b = debug.to[i];
+        cv::circle(out, a, 2, cv::Scalar(0, 255, 255), cv::FILLED, cv::LINE_AA);
+        if (cv::norm(b - a) > 0.05f)
+            cv::arrowedLine(out, a, b, cv::Scalar(0, 255, 0), 1, cv::LINE_AA, 0, 0.25);
+        cv::circle(out, b, 2, cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
+    }
     return out;
 }
 
@@ -108,6 +127,9 @@ int main(int argc, char** argv) {
         const auto enc_start = Clock::now();
         encoder.pushImage(original, jpeg_bytes, key_period);
         const double enc_ms = ms(enc_start, Clock::now());
+
+        LKDebugData lk_debug;
+        const bool have_lk_debug = encoder.getLastLKDebug(lk_debug);
 
         cv::Mat decoded;
         bool produced_frame = false;
@@ -179,7 +201,23 @@ int main(int argc, char** argv) {
         cv::Mat left = addLabel(original, "ORIGINAL", original_info);
         cv::Mat right = addLabel(decoded, "DECODED", decoded_info);
         cv::Mat side;
-        cv::hconcat(left, right, side);
+
+        if (have_lk_debug && !lk_debug.image.empty()) {
+            cv::Mat lk = makeLkPanel(lk_debug);
+            if (lk.size() != original.size()) cv::resize(lk, lk, original.size(), 0.0, 0.0, cv::INTER_NEAREST);
+            cv::Scalar lk_mean, lk_stddev;
+            cv::meanStdDev(lk_debug.image, lk_mean, lk_stddev);
+            const std::string lk_info =
+                std::string(was_keyframe ? "features " : "FB-valid ") +
+                std::to_string(std::min(lk_debug.from.size(), lk_debug.to.size())) +
+                "  mean=" + cv::format("%.1f", lk_mean[0]) +
+                " std=" + cv::format("%.1f", lk_stddev[0]);
+            lk = addLabel(lk, "LK NORMALIZED", lk_info);
+            std::vector<cv::Mat> panels{left, right, lk};
+            cv::hconcat(panels, side);
+        } else {
+            cv::hconcat(left, right, side);
+        }
 
         char name[64];
         std::snprintf(name, sizeof(name), "%04zu.jpg", i);
