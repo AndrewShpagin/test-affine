@@ -11,6 +11,8 @@
 namespace affinecodec {
 namespace {
 
+constexpr bool kShowLKImage = true;
+
 constexpr std::uint32_t kMagic = 0x31434641u;
 constexpr std::uint8_t kVersion = 2;
 constexpr std::uint8_t kPacketKeyframeChunk = 1;
@@ -18,11 +20,11 @@ constexpr std::uint8_t kPacketPatch = 2;
 
 constexpr int kFeatureGridX = 8;
 constexpr int kFeatureGridY = 8;
-constexpr int kFeaturesPerCell = 3;
-constexpr int kMeshGridX = 4;
-constexpr int kMeshGridY = 4;
-const cv::Size kLkWindow(21, 21);
-constexpr int kLkMaxLevel = 5;
+constexpr int kFeaturesPerCell = 4;
+constexpr int kMeshGridX = 6;
+constexpr int kMeshGridY = 6;
+const cv::Size kLkWindow(13, 13);
+constexpr int kLkMaxLevel = 3;
 constexpr float kLkForwardErrorMax = 35.0f;
 constexpr float kLkBackwardErrorMax = 1.5f;
 constexpr float kResidualMax = 10.0f;
