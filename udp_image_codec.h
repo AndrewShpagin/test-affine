@@ -48,6 +48,8 @@ private:
     std::vector<unsigned char> lk_status_back_;
     std::vector<float> lk_error_forward_;
     std::vector<float> lk_error_back_;
+    PatchData previous_patch_;
+    bool have_previous_patch_ = false;
     cv::Size jpeg_size_hint_;
     int jpeg_budget_hint_ = 0;
     std::uint32_t next_frame_id_ = 0;
