@@ -35,6 +35,10 @@ struct EncoderTiming {
     double jpeg_ms = 0.0;
     double chunk_ms = 0.0;
     double features_ms = 0.0;
+    double feature_copy_ms = 0.0;
+    double feature_downsample_ms = 0.0;
+    double feature_gftt_ms = 0.0;
+    double feature_bucket_ms = 0.0;
     double ref_pyramid_ms = 0.0;
     double cur_pyramid_ms = 0.0;
     double predictor_ms = 0.0;
@@ -85,6 +89,8 @@ public:
     bool updateKeyframe(std::vector<u_char>& jpeg_data);
     bool getNextPatch(std::vector<PatchData>& patch);
     void render(cv::Mat& destination, const std::vector<PatchData>& patch, const std::vector<u_char>& jpeg_data);
+    void setReusePreviousFrameBorders(bool enabled) { reuse_previous_frame_borders_ = enabled; }
+    bool reusePreviousFrameBorders() const { return reuse_previous_frame_borders_; }
     cv::Size originalSize() const { return original_size_; }
     std::uint32_t keyframeId() const { return keyframe_id_; }
 private:
@@ -114,5 +120,7 @@ private:
     cv::Mat map_x_;
     cv::Mat map_y_;
     cv::Mat valid_mask_;
+    cv::Mat previous_render_;
+    bool reuse_previous_frame_borders_ = false;
 };
 } // namespace affinecodec
