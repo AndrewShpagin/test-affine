@@ -55,8 +55,11 @@ public:
     bool getNextChunk(std::vector<u_char>& data);
     bool getLastLKDebug(LKDebugData& debug) const;
     const EncoderTiming& lastTiming() const { return last_timing_; }
+    void setMosaicKeyframes(bool enabled) { mosaic_keyframes_ = enabled; }
+    bool mosaicKeyframes() const { return mosaic_keyframes_; }
 private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
+    bool emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch);
     void setReference(const cv::Mat& gray, std::uint32_t frame_id);
     cv::Size input_size_;
@@ -75,6 +78,9 @@ private:
     bool have_previous_patch_ = false;
     double jpeg_bytes_per_pixel_ = 0.0;
     int jpeg_model_channels_ = 0;
+    double mosaic_jpeg_bytes_per_pixel_ = 0.0;
+    int mosaic_jpeg_model_channels_ = 0;
+    bool mosaic_keyframes_ = false;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
     int frames_since_keyframe_ = 0;
@@ -105,8 +111,28 @@ private:
         std::vector<u_char> bytes;
         std::vector<unsigned char> received;
     };
+    struct MosaicLayerAssembly {
+        cv::Size jpeg_size;
+        std::uint32_t jpeg_bytes = 0;
+        std::uint16_t chunk_count = 0;
+        std::uint16_t received_count = 0;
+        std::vector<u_char> bytes;
+        std::vector<unsigned char> received;
+        cv::Mat decoded;
+        bool complete = false;
+    };
+    struct MosaicAssembly {
+        bool active = false;
+        std::uint32_t frame_id = 0;
+        cv::Size original_size;
+        std::uint8_t layer_count = 0;
+        bool end_received = false;
+        std::array<MosaicLayerAssembly, 3> layers;
+    };
     cv::Mat getDecodedKeyframe(const std::vector<u_char>& jpeg_data);
     void resetPendingKeyframe();
+    bool decodeMosaicLayer(std::uint8_t layer_index);
+    bool rebuildMosaicKeyframe();
     cv::Size original_size_;
     std::uint32_t keyframe_id_ = 0;
     bool have_keyframe_ = false;
@@ -114,6 +140,7 @@ private:
     bool keyframe_changed_ = false;
     cv::Mat decoded_keyframe_;
     KeyframeAssembly pending_keyframe_;
+    MosaicAssembly pending_mosaic_;
     std::deque<PatchData> pending_patch_queue_;
     std::deque<PatchData> patch_queue_;
     cv::Mat dense_mesh_;
