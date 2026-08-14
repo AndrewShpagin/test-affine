@@ -82,7 +82,8 @@ private:
     bool have_previous_patch_ = false;
     double jpeg_bytes_per_pixel_ = 0.0;
     int jpeg_model_channels_ = 0;
-    int mosaic_jpeg_quality_ = 85;
+    double mosaic_jpeg_bytes_per_pixel_ = 0.0;
+    int mosaic_jpeg_model_channels_ = 0;
     bool mosaic_keyframes_ = false;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
