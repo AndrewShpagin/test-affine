@@ -21,10 +21,17 @@ struct PatchData {
     std::vector<cv::Point2f> mesh;
 };
 
+struct LKDebugData {
+    cv::Mat image;
+    std::vector<cv::Point2f> from;
+    std::vector<cv::Point2f> to;
+};
+
 class Encoder {
 public:
     void pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once_in_N);
     bool getNextChunk(std::vector<u_char>& data);
+    bool getLastLKDebug(LKDebugData& debug) const;
 private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch);

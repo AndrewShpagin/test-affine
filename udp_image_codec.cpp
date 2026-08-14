@@ -490,6 +490,43 @@ void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once
 
 bool Encoder::getNextChunk(std::vector<u_char>& data){if(output_queue_.empty())return false;data=std::move(output_queue_.front());output_queue_.pop_front();return true;}
 
+bool Encoder::getLastLKDebug(LKDebugData& debug) const {
+    debug = LKDebugData{};
+    if constexpr (!kShowLKImage) return false;
+    if (!have_reference_) return false;
+
+    if (frames_since_keyframe_ == 0) {
+        if (reference_pyramid_.empty() || reference_pyramid_.front().empty()) return false;
+        debug.image = reference_pyramid_.front();
+        debug.from = reference_features_;
+        debug.to = reference_features_;
+        return true;
+    }
+
+    if (current_pyramid_.empty() || current_pyramid_.front().empty()) return false;
+    debug.image = current_pyramid_.front();
+    debug.from.reserve(reference_features_.size());
+    debug.to.reserve(reference_features_.size());
+
+    std::size_t backward_index = 0;
+    for (std::size_t i = 0; i < reference_features_.size(); ++i) {
+        const bool forward_valid =
+            i < lk_status_forward_.size() && lk_status_forward_[i] &&
+            i < lk_error_forward_.size() && lk_error_forward_[i] < kLkForwardErrorMax &&
+            i < lk_forward_.size();
+        if (!forward_valid) continue;
+
+        if (backward_index < lk_status_back_.size() && lk_status_back_[backward_index] &&
+            backward_index < lk_back_.size() &&
+            cv::norm(lk_back_[backward_index] - reference_features_[i]) <= kLkBackwardErrorMax) {
+            debug.from.push_back(reference_features_[i]);
+            debug.to.push_back(lk_forward_[i]);
+        }
+        ++backward_index;
+    }
+    return true;
+}
+
 void Decoder::resetPendingKeyframe() {
     pending_keyframe_ = KeyframeAssembly{};
     pending_patch_queue_.clear();
