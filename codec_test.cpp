@@ -114,12 +114,19 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
 
 static std::string jpegSizeInfo(const EncoderTiming& t) {
     if (!t.keyframe || t.jpeg_layer_bytes[0] == 0) return std::string();
+    std::string info;
     if (t.mosaic_keyframe) {
-        return " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
+        info = " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
                cv::format("%.1f", t.jpeg_layer_bytes[1] / 1024.0) + "/" +
                cv::format("%.1f", t.jpeg_layer_bytes[2] / 1024.0) + "k";
+    } else {
+        info = " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "k";
     }
-    return " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "k";
+    if (t.jpeg_quality > 0)
+        info += " Q=" + std::to_string(t.jpeg_quality);
+    if (t.jpeg_size.width > 0 && t.jpeg_size.height > 0)
+        info += " " + std::to_string(t.jpeg_size.width) + "x" + std::to_string(t.jpeg_size.height);
+    return info;
 }
 
 static bool isImageFile(const fs::path& p) {
