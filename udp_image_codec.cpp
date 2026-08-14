@@ -3,6 +3,7 @@
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -10,6 +11,12 @@
 
 namespace affinecodec {
 namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+
+double profileMs(const ProfileClock::time_point& start) {
+    return std::chrono::duration<double, std::milli>(ProfileClock::now() - start).count();
+}
 
 constexpr bool kShowLKImage = true;
 
@@ -411,10 +418,17 @@ cv::Mat fillOutside(const cv::Mat& image, const cv::Mat& valid) {
 } // namespace
 
 void Encoder::setReference(const cv::Mat& gray, std::uint32_t frame_id) {
-    reference_gray_ = gray.clone(); reference_features_ = selectGridFeatures(reference_gray_);
+    auto stage = ProfileClock::now();
+    reference_gray_ = gray.clone();
+    reference_features_ = selectGridFeatures(reference_gray_);
+    last_timing_.features_ms += profileMs(stage);
+
+    stage = ProfileClock::now();
     reference_pyramid_.clear();
     reference_max_level_ = cv::buildOpticalFlowPyramid(reference_gray_, reference_pyramid_,
         kLkWindow, kLkMaxLevel, true, cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, false);
+    last_timing_.ref_pyramid_ms += profileMs(stage);
+
     current_pyramid_.clear();
     lk_forward_.clear(); lk_back_.clear();
     lk_status_forward_.clear(); lk_status_back_.clear();
@@ -425,36 +439,56 @@ void Encoder::setReference(const cv::Mat& gray, std::uint32_t frame_id) {
 
 bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
                            int desired_jpeg_size, std::uint32_t frame_id) {
+    last_timing_.keyframe = true;
     std::vector<u_char> jpeg; cv::Size jpeg_size;
-    if (!encodeJpegToBudget(image, desired_jpeg_size, jpeg_size_hint_, jpeg_budget_hint_, jpeg, jpeg_size)) return false;
+
+    auto stage = ProfileClock::now();
+    const bool jpeg_ok = encodeJpegToBudget(
+        image, desired_jpeg_size, jpeg_size_hint_, jpeg_budget_hint_, jpeg, jpeg_size);
+    last_timing_.jpeg_ms += profileMs(stage);
+    if (!jpeg_ok) return false;
     if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+
     const std::size_t count_size = (jpeg.size() + kKeyframeChunkPayloadBytes - 1) / kKeyframeChunkPayloadBytes;
     if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) return false;
     const std::uint16_t chunk_count = static_cast<std::uint16_t>(count_size);
     const std::uint32_t jpeg_bytes = static_cast<std::uint32_t>(jpeg.size());
+
+    stage = ProfileClock::now();
     for (std::uint16_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
         const std::size_t offset = static_cast<std::size_t>(chunk_index) * kKeyframeChunkPayloadBytes;
         const std::size_t bytes = std::min(kKeyframeChunkPayloadBytes, jpeg.size() - offset);
         std::vector<u_char> packet = serializeKeyframeChunk(frame_id, image.size(), jpeg_size, jpeg_bytes,
             chunk_index, chunk_count, static_cast<std::uint32_t>(offset), jpeg.data() + offset,
             static_cast<std::uint16_t>(bytes));
-        if (packet.size() > kMaxUdpPacketBytes) return false;
+        if (packet.size() > kMaxUdpPacketBytes) {
+            last_timing_.chunk_ms += profileMs(stage);
+            return false;
+        }
         output_queue_.push_back(std::move(packet));
     }
+    last_timing_.chunk_ms += profileMs(stage);
+
     input_size_ = image.size(); setReference(gray, frame_id); return true;
 }
 
 bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch) {
     if (!have_reference_ || reference_features_.size() < 4) return false;
+
+    auto stage = ProfileClock::now();
     current_pyramid_.clear();
     const int current_max_level = cv::buildOpticalFlowPyramid(current_gray, current_pyramid_,
         kLkWindow, kLkMaxLevel, true, cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, false);
     const int max_level = std::min(reference_max_level_, current_max_level);
+    last_timing_.cur_pyramid_ms += profileMs(stage);
 
     lk_status_forward_.clear(); lk_error_forward_.clear();
     int forward_flags = 0;
     const bool can_predict = have_previous_patch_ &&
         previous_patch_.keyframe_id == keyframe_id_ && previous_patch_.original_size == input_size_;
+    last_timing_.predictor_used = can_predict;
+
+    stage = ProfileClock::now();
     if (can_predict) {
         lk_forward_.resize(reference_features_.size());
         for (std::size_t i = 0; i < reference_features_.size(); ++i)
@@ -463,10 +497,13 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
     } else {
         lk_forward_.clear();
     }
+    last_timing_.predictor_ms += profileMs(stage);
 
+    stage = ProfileClock::now();
     cv::calcOpticalFlowPyrLK(reference_pyramid_, current_pyramid_, reference_features_, lk_forward_,
         lk_status_forward_, lk_error_forward_, kLkWindow, max_level,
         cv::TermCriteria(cv::TermCriteria::COUNT|cv::TermCriteria::EPS,40,0.01), forward_flags, 1e-4);
+    last_timing_.lk_forward_ms += profileMs(stage);
 
     std::vector<cv::Point2f> g0,g1; g0.reserve(reference_features_.size()); g1.reserve(reference_features_.size());
     for(std::size_t i=0;i<reference_features_.size();++i) if(i<lk_status_forward_.size()&&lk_status_forward_[i]&&i<lk_error_forward_.size()&&lk_error_forward_[i]<kLkForwardErrorMax){g0.push_back(reference_features_[i]);g1.push_back(lk_forward_[i]);}
@@ -475,15 +512,26 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
     // For the backward consistency check we already know the expected destination in the
     // reference image exactly: g0. Use it as the initial flow rather than searching from g1.
     lk_back_ = g0; lk_status_back_.clear(); lk_error_back_.clear();
+    stage = ProfileClock::now();
     cv::calcOpticalFlowPyrLK(current_pyramid_, reference_pyramid_, g1, lk_back_, lk_status_back_, lk_error_back_,
         kLkWindow,max_level,cv::TermCriteria(cv::TermCriteria::COUNT|cv::TermCriteria::EPS,40,0.01),
         cv::OPTFLOW_USE_INITIAL_FLOW,1e-4);
+    last_timing_.lk_backward_ms += profileMs(stage);
+
     std::vector<cv::Point2f> p0,p1; p0.reserve(g0.size()); p1.reserve(g0.size());
     for(std::size_t i=0;i<g0.size();++i){if(i>=lk_status_back_.size()||!lk_status_back_[i])continue;if(cv::norm(lk_back_[i]-g0[i])>kLkBackwardErrorMax)continue;p0.push_back(g0[i]);p1.push_back(g1[i]);}
     if(p0.size()<4) return false;
 
+    stage = ProfileClock::now();
     cv::Mat inliers; cv::Mat affine=cv::estimateAffinePartial2D(p0,p1,inliers,cv::RANSAC,2.0,3000,0.995,10);
-    if(affine.empty()) return false; if(affine.type()!=CV_64F) affine.convertTo(affine,CV_64F);
+    if(affine.empty()) {
+        last_timing_.affine_ms += profileMs(stage);
+        return false;
+    }
+    if(affine.type()!=CV_64F) affine.convertTo(affine,CV_64F);
+    last_timing_.affine_ms += profileMs(stage);
+
+    stage = ProfileClock::now();
     patch.frame_id=frame_id; patch.keyframe_id=keyframe_id_; patch.original_size=input_size_; patch.grid_x=kMeshGridX; patch.grid_y=kMeshGridY;
     patch.mesh.assign(kMeshGridX*kMeshGridY,cv::Point2f(0,0));
     patch.affine={static_cast<float>(affine.at<double>(0,0)),static_cast<float>(affine.at<double>(0,1)),static_cast<float>(affine.at<double>(0,2)),static_cast<float>(affine.at<double>(1,0)),static_cast<float>(affine.at<double>(1,1)),static_cast<float>(affine.at<double>(1,2))};
@@ -496,19 +544,26 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
         for(int ix=0;ix<kMeshGridX;++ix){const float x=static_cast<float>(ix)*(input_size_.width-1)/(kMeshGridX-1);cv::Point2d sum(0,0);double sw=0;
             for(std::size_t k=0;k<q.size();++k){const double dx=q[k].x-x,dy=q[k].y-y,w=std::exp(-(dx*dx+dy*dy)*inv2s2);sum.x+=w*residual[k].x;sum.y+=w*residual[k].y;sw+=w;}
             if(sw>1e-9)patch.mesh[iy*kMeshGridX+ix]=cv::Point2f(static_cast<float>(sum.x/sw),static_cast<float>(sum.y/sw));}}
+    last_timing_.mesh_ms += profileMs(stage);
     return true;
 }
 
 void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once_in_N) {
+    last_timing_ = EncoderTiming{};
     if (image.empty()) return;
     if (image.cols > std::numeric_limits<std::uint16_t>::max() ||
         image.rows > std::numeric_limits<std::uint16_t>::max()) return;
 
+    const auto prep_start = ProfileClock::now();
     const cv::Mat raw_gray = toGray8(image);
-    if (raw_gray.empty()) return;
+    if (raw_gray.empty()) {
+        last_timing_.prep_ms = profileMs(prep_start);
+        return;
+    }
 
     const double brightness_gain = brightnessGainTo128(raw_gray);
     const cv::Mat gray = normalizeGrayForLk(raw_gray);
+    last_timing_.prep_ms = profileMs(prep_start);
 
     const std::uint32_t frame_id = next_frame_id_++;
     const int period = std::max(1, keyframe_once_in_N);
@@ -522,7 +577,9 @@ void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once
     }
 
     auto emit_normalized_keyframe = [&]() {
+        const auto stage = ProfileClock::now();
         cv::Mat normalized_image = normalizeColorBrightness(image, brightness_gain);
+        last_timing_.color_norm_ms += profileMs(stage);
         if (!normalized_image.empty())
             emitKeyframe(normalized_image, gray, desired_jpeg_size, frame_id);
     };
@@ -538,7 +595,9 @@ void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once
         return;
     }
 
+    const auto serialize_start = ProfileClock::now();
     std::vector<u_char> packet = serializePatch(patch);
+    last_timing_.serialize_ms += profileMs(serialize_start);
     if (packet.size() <= kMaxUdpPacketBytes) {
         output_queue_.push_back(std::move(packet));
         previous_patch_ = patch;
