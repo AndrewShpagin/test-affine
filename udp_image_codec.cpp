@@ -39,9 +39,6 @@ constexpr int kJpegQuality = 85;
 constexpr double kJpegTargetFill = 0.95;
 constexpr double kJpegSizeTolerance = 0.20;
 constexpr int kJpegMaxEncodePasses = 3;
-constexpr int kMosaicMinJpegQuality = 20;
-constexpr int kMosaicMaxJpegQuality = kJpegQuality;
-constexpr int kMosaicMaxQualityPasses = 3;
 constexpr double kJpegModelAlpha = 1.0;
 constexpr double kJpegInitialGrayBytesPerPixel = 0.16;
 constexpr double kJpegInitialColorBytesPerPixel = 0.22;
@@ -289,72 +286,12 @@ cv::Size scaledSize8(const cv::Size& source, double scale) {
                     quantizeTo8(static_cast<int>(std::floor(source.height * scale)), source.height));
 }
 
-bool encodeJpegAtQuality(const cv::Mat& source, int quality, std::vector<u_char>& jpeg) {
-    const cv::Mat input = jpegInput8(source);
-    if (input.empty()) return false;
-    quality = std::clamp(quality, 1, 100);
-    return cv::imencode(".jpg", input, jpeg, {cv::IMWRITE_JPEG_QUALITY, quality});
-}
-
 bool encodeJpegAtSize(const cv::Mat& source, const cv::Size& size,
                       std::vector<u_char>& jpeg) {
     cv::Mat small;
     if (source.size() == size) small = source;
     else cv::resize(source, small, size, 0.0, 0.0, cv::INTER_AREA);
-    return encodeJpegAtQuality(small, kJpegQuality, jpeg);
-}
-
-bool encodeJpegQualityBounded(const cv::Mat& image, int requested_jpeg_bytes,
-                              int& quality_state, std::vector<u_char>& jpeg,
-                              int& encoded_quality) {
-    const cv::Mat source = jpegInput8(image);
-    if (source.empty()) return false;
-
-    const double requested_bytes = static_cast<double>(std::max(1, requested_jpeg_bytes));
-    const double lower_bytes = requested_bytes * (1.0 - kJpegSizeTolerance);
-    const double upper_bytes = requested_bytes * (1.0 + kJpegSizeTolerance);
-    const double target_bytes = std::max(1.0, requested_bytes * kJpegTargetFill);
-
-    int low_quality = kMosaicMinJpegQuality;
-    int high_quality = kMosaicMaxJpegQuality;
-    int quality = std::clamp(quality_state, low_quality, high_quality);
-    std::vector<u_char> current;
-    bool final_within_tolerance = false;
-
-    for (int pass = 0; pass < kMosaicMaxQualityPasses; ++pass) {
-        current.clear();
-        if (!encodeJpegAtQuality(source, quality, current)) return false;
-        if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
-
-        const double current_bytes = static_cast<double>(current.size());
-        final_within_tolerance = current_bytes >= lower_bytes && current_bytes <= upper_bytes;
-        if (final_within_tolerance || pass + 1 >= kMosaicMaxQualityPasses) break;
-
-        if (current_bytes > upper_bytes) {
-            high_quality = quality - 1;
-        } else {
-            if (quality >= kMosaicMaxJpegQuality) break;
-            low_quality = quality + 1;
-        }
-        if (low_quality > high_quality) break;
-
-        int next_quality;
-        if (pass == 0) {
-            const double ratio = target_bytes / current_bytes;
-            next_quality = static_cast<int>(std::lround(quality * ratio));
-            next_quality = std::clamp(next_quality, low_quality, high_quality);
-        } else {
-            next_quality = (low_quality + high_quality) / 2;
-        }
-        if (next_quality == quality) break;
-        quality = next_quality;
-    }
-
-    jpeg = std::move(current);
-    encoded_quality = quality;
-    if (final_within_tolerance)
-        quality_state = quality;
-    return true;
+    return cv::imencode(".jpg", small, jpeg, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality});
 }
 
 bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
@@ -669,18 +606,18 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
 
     last_timing_.keyframe = true;
     std::array<std::vector<u_char>, 3> jpegs;
-    const cv::Size jpeg_size = layers[0].size();
+    cv::Size jpeg_size;
     const int layer_target = std::max(1, desired_jpeg_size / static_cast<int>(kMosaicLayerCount));
-    int jpeg_quality = kJpegQuality;
 
     auto stage = ProfileClock::now();
-    if (!encodeJpegQualityBounded(layers[0], layer_target,
-                                  mosaic_jpeg_quality_, jpegs[0], jpeg_quality)) {
+    if (!encodeJpegBounded(layers[0], layer_target,
+                           mosaic_jpeg_bytes_per_pixel_, mosaic_jpeg_model_channels_,
+                           jpegs[0], jpeg_size)) {
         last_timing_.jpeg_ms += profileMs(stage);
         return false;
     }
-    if (!encodeJpegAtQuality(layers[1], jpeg_quality, jpegs[1]) ||
-        !encodeJpegAtQuality(layers[2], jpeg_quality, jpegs[2])) {
+    if (!encodeJpegAtSize(layers[1], jpeg_size, jpegs[1]) ||
+        !encodeJpegAtSize(layers[2], jpeg_size, jpegs[2])) {
         last_timing_.jpeg_ms += profileMs(stage);
         return false;
     }
@@ -691,7 +628,7 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
 
     last_timing_.mosaic_keyframe = true;
     last_timing_.jpeg_size = jpeg_size;
-    last_timing_.jpeg_quality = jpeg_quality;
+    last_timing_.jpeg_quality = kJpegQuality;
     for (std::size_t i = 0; i < jpegs.size(); ++i)
         last_timing_.jpeg_layer_bytes[i] = jpegs[i].size();
 
@@ -953,10 +890,6 @@ bool Decoder::decodeMosaicLayer(std::uint8_t layer_index) {
     cv::Mat encoded(1, static_cast<int>(layer.bytes.size()), CV_8U, layer.bytes.data());
     cv::Mat decoded = cv::imdecode(encoded, cv::IMREAD_UNCHANGED);
     if (decoded.empty() || decoded.size() != layer.jpeg_size) return false;
-    const cv::Size sample_size(pending_mosaic_.original_size.width / 2,
-                               pending_mosaic_.original_size.height / 2);
-    if (decoded.size() != sample_size)
-        cv::resize(decoded, decoded, sample_size, 0.0, 0.0, cv::INTER_LINEAR);
     layer.decoded = decoded;
     layer.complete = true;
     return true;
@@ -965,39 +898,52 @@ bool Decoder::decodeMosaicLayer(std::uint8_t layer_index) {
 bool Decoder::rebuildMosaicKeyframe() {
     if (!pending_mosaic_.active || !mosaicEligible(pending_mosaic_.original_size)) return false;
 
+    cv::Size sample_size;
     int type = -1;
     for (const MosaicLayerAssembly& layer : pending_mosaic_.layers) {
-        if (layer.complete && !layer.decoded.empty()) { type = layer.decoded.type(); break; }
+        if (layer.complete && !layer.decoded.empty()) {
+            sample_size = layer.decoded.size();
+            type = layer.decoded.type();
+            break;
+        }
     }
-    if (type < 0) return false;
+    if (type < 0 || sample_size.width <= 0 || sample_size.height <= 0) return false;
 
-    const cv::Size full_size = pending_mosaic_.original_size;
-    const int mw = full_size.width / 2;
-    const int mh = full_size.height / 2;
-    cv::Mat assembled(full_size, type, cv::Scalar::all(0));
-    cv::Mat valid(full_size, CV_8U, cv::Scalar(0));
+    const cv::Size assembled_size(sample_size.width * 2, sample_size.height * 2);
+    if (!mosaicEligible(assembled_size)) return false;
+    if (assembled_size.width > pending_mosaic_.original_size.width ||
+        assembled_size.height > pending_mosaic_.original_size.height) return false;
+
+    const int mw = sample_size.width;
+    const int mh = sample_size.height;
+    cv::Mat assembled(assembled_size, type, cv::Scalar::all(0));
+    cv::Mat valid(assembled_size, CV_8U, cv::Scalar(0));
     const std::size_t elem = assembled.elemSize();
 
+    auto layerUsable = [&](const MosaicLayerAssembly& layer) {
+        return layer.complete && !layer.decoded.empty() &&
+               layer.decoded.size() == sample_size && layer.decoded.type() == type;
+    };
     auto put = [&](int x, int y, const cv::Mat& layer, int lx, int ly) {
-        if (x < 0 || y < 0 || x >= full_size.width || y >= full_size.height || layer.type() != type) return;
+        if (x < 0 || y < 0 || x >= assembled_size.width || y >= assembled_size.height) return;
         std::memcpy(assembled.ptr(y) + static_cast<std::size_t>(x) * elem,
                     layer.ptr(ly) + static_cast<std::size_t>(lx) * elem, elem);
         valid.at<unsigned char>(y, x) = 255;
     };
 
     const MosaicLayerAssembly& a = pending_mosaic_.layers[0];
-    if (a.complete && !a.decoded.empty())
+    if (layerUsable(a))
         for (int y = 0; y < mh; ++y) for (int x = 0; x < mw; ++x)
             put(2 * x, 2 * y, a.decoded, x, y);
 
     const MosaicLayerAssembly& b = pending_mosaic_.layers[1];
-    if (b.complete && !b.decoded.empty())
+    if (layerUsable(b))
         for (int y = 0; y < mh; ++y) for (int x = 0; x < mw; ++x)
             put(2 * x + 1, 2 * y + 1, b.decoded, x, y);
 
     const MosaicLayerAssembly& d = pending_mosaic_.layers[2];
-    if (d.complete && !d.decoded.empty()) {
-        const std::vector<cv::Point> positions = mosaicDPositions(full_size);
+    if (layerUsable(d)) {
+        const std::vector<cv::Point> positions = mosaicDPositions(assembled_size);
         if (positions.size() != static_cast<std::size_t>(mw) * mh) return false;
         for (std::size_t i = 0; i < positions.size(); ++i) {
             const int ly = static_cast<int>(i / mw);
@@ -1011,7 +957,7 @@ bool Decoder::rebuildMosaicKeyframe() {
     if (reconstructed.empty()) return false;
 
     const bool new_keyframe = !have_keyframe_ || keyframe_id_ != pending_mosaic_.frame_id;
-    original_size_ = full_size;
+    original_size_ = pending_mosaic_.original_size;
     keyframe_id_ = pending_mosaic_.frame_id;
     have_keyframe_ = true;
     current_jpeg_.clear();
@@ -1148,16 +1094,27 @@ cv::Mat Decoder::getDecodedKeyframe(const std::vector<u_char>& jpeg_data){
 }
 
 void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,const std::vector<u_char>& jpeg_data){
-    cv::Mat keyframe=getDecodedKeyframe(jpeg_data);if(keyframe.empty()){destination.release();return;}if(patch.empty()){keyframe.copyTo(destination);previous_render_=destination;return;}
+    cv::Mat keyframe=getDecodedKeyframe(jpeg_data);
+    if(keyframe.empty()){destination.release();return;}
+    if(patch.empty()){
+        if(keyframe.size()==original_size_)keyframe.copyTo(destination);
+        else cv::resize(keyframe,destination,original_size_,0,0,cv::INTER_LINEAR);
+        previous_render_=destination;
+        return;
+    }
     const PatchData&p=patch.back();if(p.keyframe_id!=keyframe_id_||p.original_size!=original_size_||p.grid_x==0||p.grid_y==0||p.mesh.size()!=static_cast<std::size_t>(p.grid_x)*p.grid_y){destination.release();return;}
     cv::Mat grid(p.grid_y,p.grid_x,CV_32FC2);for(int y=0;y<p.grid_y;++y){cv::Vec2f*row=grid.ptr<cv::Vec2f>(y);for(int x=0;x<p.grid_x;++x){const cv::Point2f v=p.mesh[y*p.grid_x+x];row[x]=cv::Vec2f(v.x,v.y);}}
     cv::resize(grid,dense_mesh_,original_size_,0,0,cv::INTER_CUBIC);
     const float a00=p.affine[0],a01=p.affine[1],a02=p.affine[2],a10=p.affine[3],a11=p.affine[4],a12=p.affine[5],det=a00*a11-a01*a10;if(std::abs(det)<1e-9f){destination.release();return;}
     const float i00=a11/det,i01=-a01/det,i10=-a10/det,i11=a00/det,i02=-(i00*a02+i01*a12),i12=-(i10*a02+i11*a12);
+    const float source_scale_x=(original_size_.width>1&&keyframe.cols>1)?static_cast<float>(keyframe.cols-1)/static_cast<float>(original_size_.width-1):1.0f;
+    const float source_scale_y=(original_size_.height>1&&keyframe.rows>1)?static_cast<float>(keyframe.rows-1)/static_cast<float>(original_size_.height-1):1.0f;
     map_x_.create(original_size_,CV_32F);map_y_.create(original_size_,CV_32F);valid_mask_.create(original_size_,CV_8U);valid_mask_.setTo(cv::Scalar(0));
-    cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],sx=i00*tx+i01*ty+i02,sy=i10*tx+i11*ty+i12;mx[x]=sx;my[x]=sy;if(sx>=0&&sx<keyframe.cols-1&&sy>=0&&sy<keyframe.rows-1)vm[x]=255;}}});
+    cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],sx=i00*tx+i01*ty+i02,sy=i10*tx+i11*ty+i12;const float kx=sx*source_scale_x,ky=sy*source_scale_y;mx[x]=kx;my[x]=ky;if(kx>=0&&kx<keyframe.cols-1&&ky>=0&&ky<keyframe.rows-1)vm[x]=255;}}});
     if(reuse_previous_frame_borders_){
-        if(!previous_render_.empty()&&previous_render_.size()==original_size_&&previous_render_.type()==keyframe.type())previous_render_.copyTo(destination);else keyframe.copyTo(destination);
+        if(!previous_render_.empty()&&previous_render_.size()==original_size_&&previous_render_.type()==keyframe.type())previous_render_.copyTo(destination);
+        else if(keyframe.size()==original_size_)keyframe.copyTo(destination);
+        else cv::resize(keyframe,destination,original_size_,0,0,cv::INTER_LINEAR);
         cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_TRANSPARENT);
     }else{
         cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_CONSTANT,cv::Scalar(0));
