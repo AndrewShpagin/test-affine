@@ -254,7 +254,7 @@ cv::Point2f samplePatchMesh(const PatchData& patch, const cv::Point2f& p) {
     const cv::Point2f& d01 = patch.mesh[y1 * patch.grid_x + x0];
     const cv::Point2f& d11 = patch.mesh[y1 * patch.grid_x + x1];
     const cv::Point2f d0 = d00 * (1.0f - tx) + d10 * tx;
-    const cv::Point2f d1 = d01 * (1.0f - ty) + d11 * ty;
+    const cv::Point2f d1 = d01 * (1.0f - tx) + d11 * tx;
     return d0 * (1.0f - ty) + d1 * ty;
 }
 
