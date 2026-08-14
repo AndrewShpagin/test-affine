@@ -27,11 +27,30 @@ struct LKDebugData {
     std::vector<cv::Point2f> to;
 };
 
+struct EncoderTiming {
+    bool keyframe = false;
+    bool predictor_used = false;
+    double prep_ms = 0.0;
+    double color_norm_ms = 0.0;
+    double jpeg_ms = 0.0;
+    double chunk_ms = 0.0;
+    double features_ms = 0.0;
+    double ref_pyramid_ms = 0.0;
+    double cur_pyramid_ms = 0.0;
+    double predictor_ms = 0.0;
+    double lk_forward_ms = 0.0;
+    double lk_backward_ms = 0.0;
+    double affine_ms = 0.0;
+    double mesh_ms = 0.0;
+    double serialize_ms = 0.0;
+};
+
 class Encoder {
 public:
     void pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once_in_N);
     bool getNextChunk(std::vector<u_char>& data);
     bool getLastLKDebug(LKDebugData& debug) const;
+    const EncoderTiming& lastTiming() const { return last_timing_; }
 private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch);
@@ -56,6 +75,7 @@ private:
     std::uint32_t keyframe_id_ = 0;
     int frames_since_keyframe_ = 0;
     bool have_reference_ = false;
+    EncoderTiming last_timing_;
     std::deque<std::vector<u_char>> output_queue_;
 };
 
