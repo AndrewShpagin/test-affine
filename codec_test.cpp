@@ -21,6 +21,8 @@ using affinecodec::PatchData;
 using affinecodec::u_char;
 using Clock = std::chrono::steady_clock;
 
+constexpr bool kReusePreviousFrameBorders = true;
+
 static double ms(const Clock::time_point& a, const Clock::time_point& b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
@@ -38,6 +40,10 @@ static void addEncoderTiming(EncoderTiming& sum, const EncoderTiming& t) {
     sum.jpeg_ms += t.jpeg_ms;
     sum.chunk_ms += t.chunk_ms;
     sum.features_ms += t.features_ms;
+    sum.feature_copy_ms += t.feature_copy_ms;
+    sum.feature_downsample_ms += t.feature_downsample_ms;
+    sum.feature_gftt_ms += t.feature_gftt_ms;
+    sum.feature_bucket_ms += t.feature_bucket_ms;
     sum.ref_pyramid_ms += t.ref_pyramid_ms;
     sum.cur_pyramid_ms += t.cur_pyramid_ms;
     sum.predictor_ms += t.predictor_ms;
@@ -57,6 +63,10 @@ static EncoderTiming divideEncoderTiming(const EncoderTiming& sum, double n, boo
     t.jpeg_ms = sum.jpeg_ms / n;
     t.chunk_ms = sum.chunk_ms / n;
     t.features_ms = sum.features_ms / n;
+    t.feature_copy_ms = sum.feature_copy_ms / n;
+    t.feature_downsample_ms = sum.feature_downsample_ms / n;
+    t.feature_gftt_ms = sum.feature_gftt_ms / n;
+    t.feature_bucket_ms = sum.feature_bucket_ms / n;
     t.ref_pyramid_ms = sum.ref_pyramid_ms / n;
     t.cur_pyramid_ms = sum.cur_pyramid_ms / n;
     t.predictor_ms = sum.predictor_ms / n;
@@ -77,6 +87,10 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
                   << " jpeg=" << t.jpeg_ms
                   << " chunk=" << t.chunk_ms
                   << " feat=" << t.features_ms
+                  << "(copy=" << t.feature_copy_ms
+                  << " down=" << t.feature_downsample_ms
+                  << " GFTT=" << t.feature_gftt_ms
+                  << " bucket=" << t.feature_bucket_ms << ")"
                   << " refPyr=" << t.ref_pyramid_ms;
         const double fallback_patch = t.cur_pyramid_ms + t.predictor_ms + t.lk_forward_ms +
                                       t.lk_backward_ms + t.affine_ms + t.mesh_ms + t.serialize_ms;
@@ -181,11 +195,13 @@ int main(int argc, char** argv) {
               << "Output folder: " << output_dir << '\n'
               << "Target JPEG bytes: " << jpeg_bytes << '\n'
               << "Keyframe period: " << key_period << '\n'
+              << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
               << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
               << "Number of images: " << files.size() << "\n\n";
 
     Encoder encoder;
     Decoder decoder;
+    decoder.setReusePreviousFrameBorders(kReusePreviousFrameBorders);
     std::vector<u_char> current_jpeg;
     std::size_t total_bytes = 0, total_packets = 0, timed_frames = 0;
     std::size_t key_frames = 0, patch_frames = 0;

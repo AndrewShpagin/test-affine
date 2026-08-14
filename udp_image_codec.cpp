@@ -168,13 +168,14 @@ cv::Mat normalizeColorBrightness(const cv::Mat& image, double gain) {
     return normalized;
 }
 
-std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray) {
+std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray, EncoderTiming& timing) {
     constexpr int target_count = kFeatureGridX * kFeatureGridY * kFeaturesPerCell;
     constexpr int candidate_count = target_count * kFeatureCandidateMultiplier;
 
     // Keep detector work bounded as input resolution grows. Repeated pyrDown also
     // removes fine high-frequency detail, biasing selection toward stable coarse
     // landscape features. Coordinates are mapped back to the full-resolution LK image.
+    auto stage = ProfileClock::now();
     cv::Mat detector = gray;
     int detector_scale = 1;
     while (std::max(detector.cols, detector.rows) >= kFeatureDetectorMaxSide) {
@@ -183,13 +184,17 @@ std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray) {
         detector = std::move(smaller);
         detector_scale *= 2;
     }
+    timing.feature_downsample_ms += profileMs(stage);
 
+    stage = ProfileClock::now();
     std::vector<cv::Point2f> candidates;
     candidates.reserve(candidate_count);
     const double min_distance = std::max(2.0, 7.0 / static_cast<double>(detector_scale));
     cv::goodFeaturesToTrack(detector, candidates, candidate_count,
                             0.01, min_distance, cv::noArray(), 7, false, 0.04);
+    timing.feature_gftt_ms += profileMs(stage);
 
+    stage = ProfileClock::now();
     std::array<unsigned char, kFeatureGridX * kFeatureGridY> cell_counts{};
     std::vector<cv::Point2f> points;
     points.reserve(target_count);
@@ -211,6 +216,7 @@ std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray) {
         ++cell_counts[cell];
         if (static_cast<int>(points.size()) == target_count) break;
     }
+    timing.feature_bucket_ms += profileMs(stage);
     return points;
 }
 
@@ -444,10 +450,12 @@ cv::Mat fillOutside(const cv::Mat& image, const cv::Mat& valid) {
 } // namespace
 
 void Encoder::setReference(const cv::Mat& gray, std::uint32_t frame_id) {
+    const auto features_start = ProfileClock::now();
     auto stage = ProfileClock::now();
     reference_gray_ = gray.clone();
-    reference_features_ = selectGridFeatures(reference_gray_);
-    last_timing_.features_ms += profileMs(stage);
+    last_timing_.feature_copy_ms += profileMs(stage);
+    reference_features_ = selectGridFeatures(reference_gray_, last_timing_);
+    last_timing_.features_ms += profileMs(features_start);
 
     stage = ProfileClock::now();
     reference_pyramid_.clear();
@@ -707,7 +715,7 @@ void Decoder::pushData(const std::vector<u_char>& data){
         }
         if(pending_keyframe_.received_count==pending_keyframe_.chunk_count){
             current_jpeg_=std::move(pending_keyframe_.bytes);original_size_=pending_keyframe_.original_size;keyframe_id_=pending_keyframe_.frame_id;
-            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();patch_queue_.clear();
+            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();previous_render_.release();patch_queue_.clear();
             while(!pending_patch_queue_.empty()){patch_queue_.push_back(std::move(pending_patch_queue_.front()));pending_patch_queue_.pop_front();}
             pending_keyframe_=KeyframeAssembly{};
         }
@@ -734,7 +742,7 @@ cv::Mat Decoder::getDecodedKeyframe(const std::vector<u_char>& jpeg_data){
 }
 
 void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,const std::vector<u_char>& jpeg_data){
-    cv::Mat keyframe=getDecodedKeyframe(jpeg_data);if(keyframe.empty()){destination.release();return;}if(patch.empty()){keyframe.copyTo(destination);return;}
+    cv::Mat keyframe=getDecodedKeyframe(jpeg_data);if(keyframe.empty()){destination.release();return;}if(patch.empty()){keyframe.copyTo(destination);previous_render_=destination;return;}
     const PatchData&p=patch.back();if(p.keyframe_id!=keyframe_id_||p.original_size!=original_size_||p.grid_x==0||p.grid_y==0||p.mesh.size()!=static_cast<std::size_t>(p.grid_x)*p.grid_y){destination.release();return;}
     cv::Mat grid(p.grid_y,p.grid_x,CV_32FC2);for(int y=0;y<p.grid_y;++y){cv::Vec2f*row=grid.ptr<cv::Vec2f>(y);for(int x=0;x<p.grid_x;++x){const cv::Point2f v=p.mesh[y*p.grid_x+x];row[x]=cv::Vec2f(v.x,v.y);}}
     cv::resize(grid,dense_mesh_,original_size_,0,0,cv::INTER_CUBIC);
@@ -742,7 +750,14 @@ void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,co
     const float i00=a11/det,i01=-a01/det,i10=-a10/det,i11=a00/det,i02=-(i00*a02+i01*a12),i12=-(i10*a02+i11*a12);
     map_x_.create(original_size_,CV_32F);map_y_.create(original_size_,CV_32F);valid_mask_.create(original_size_,CV_8U);valid_mask_.setTo(cv::Scalar(0));
     cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],sx=i00*tx+i01*ty+i02,sy=i10*tx+i11*ty+i12;mx[x]=sx;my[x]=sy;if(sx>=0&&sx<keyframe.cols-1&&sy>=0&&sy<keyframe.rows-1)vm[x]=255;}}});
-    cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_CONSTANT,cv::Scalar(0));destination=fillOutside(destination,valid_mask_);
+    if(reuse_previous_frame_borders_){
+        if(!previous_render_.empty()&&previous_render_.size()==original_size_&&previous_render_.type()==keyframe.type())previous_render_.copyTo(destination);else keyframe.copyTo(destination);
+        cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_TRANSPARENT);
+    }else{
+        cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_CONSTANT,cv::Scalar(0));
+        destination=fillOutside(destination,valid_mask_);
+    }
+    previous_render_=destination;
 }
 
 } // namespace affinecodec
