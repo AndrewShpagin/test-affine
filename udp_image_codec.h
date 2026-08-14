@@ -30,6 +30,8 @@ struct LKDebugData {
 struct EncoderTiming {
     bool keyframe = false;
     bool predictor_used = false;
+    bool mosaic_keyframe = false;
+    std::array<std::size_t, 3> jpeg_layer_bytes{};
     double prep_ms = 0.0;
     double color_norm_ms = 0.0;
     double jpeg_ms = 0.0;

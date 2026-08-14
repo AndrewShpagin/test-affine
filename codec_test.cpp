@@ -112,6 +112,16 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
     std::cout << " other=" << other << " ms\n";
 }
 
+static std::string jpegSizeInfo(const EncoderTiming& t) {
+    if (!t.keyframe || t.jpeg_layer_bytes[0] == 0) return std::string();
+    if (t.mosaic_keyframe) {
+        return " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
+               cv::format("%.1f", t.jpeg_layer_bytes[1] / 1024.0) + "/" +
+               cv::format("%.1f", t.jpeg_layer_bytes[2] / 1024.0) + "k";
+    }
+    return " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "k";
+}
+
 static bool isImageFile(const fs::path& p) {
     std::string e = p.extension().string();
     std::transform(e.begin(), e.end(), e.begin(),
@@ -296,7 +306,8 @@ int main(int argc, char** argv) {
         const std::string decoded_info =
             std::string(was_keyframe ? "KEY  " : "PATCH  ") +
             std::to_string(frame_packets) + " pkt  " + std::to_string(frame_bytes) +
-            " B  E=" + cv::format("%.1f", enc_ms) + "ms D=" + cv::format("%.1f", dec_ms) + "ms";
+            " B" + jpegSizeInfo(enc_timing) +
+            " E=" + cv::format("%.1f", enc_ms) + "ms D=" + cv::format("%.1f", dec_ms) + "ms";
 
         cv::Mat left = addLabel(original, "ORIGINAL", original_info);
         cv::Mat right = addLabel(decoded, "DECODED", decoded_info);
@@ -327,6 +338,7 @@ int main(int argc, char** argv) {
                   << (was_keyframe ? "  KEY   " : "  PATCH ")
                   << std::setw(3) << frame_packets << " pkt  "
                   << std::setw(7) << frame_bytes << " B"
+                  << jpegSizeInfo(enc_timing)
                   << "  MAE=" << std::fixed << std::setprecision(2) << mae
                   << "  enc=" << enc_ms << " ms"
                   << "  dec=" << dec_ms << " ms\n";

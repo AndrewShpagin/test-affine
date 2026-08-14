@@ -20,6 +20,7 @@ double profileMs(const ProfileClock::time_point& start) {
 }
 
 constexpr bool kShowLKImage = true;
+constexpr bool kMosaicFillMissing = false;
 
 constexpr std::uint32_t kMagic = 0x31434641u;
 constexpr std::uint8_t kVersion = 2;
@@ -375,8 +376,6 @@ std::vector<cv::Point> mosaicDPositions(const cv::Size& size) {
     const std::size_t wanted = static_cast<std::size_t>(mw) * mh;
     positions.reserve(wanted);
 
-    // For square frames this is the exact 45-degree packing shown in the MOSAIC
-    // pattern: the W/2 x H/2 packed JPEG unfolds into the central diamond.
     if (size.width == size.height) {
         for (int py = 0; py < mh; ++py) {
             for (int px = 0; px < mw; ++px) {
@@ -388,8 +387,6 @@ std::vector<cv::Point> mosaicDPositions(const cv::Size& size) {
         return positions;
     }
 
-    // Rectangular fallback: choose exactly one quarter of all pixels from the
-    // complementary checkerboard parity, prioritizing the aspect-correct center.
     struct Candidate { long long score; cv::Point p; };
     std::vector<Candidate> candidates;
     candidates.reserve(static_cast<std::size_t>(size.width) * size.height / 2);
@@ -412,7 +409,6 @@ std::vector<cv::Point> mosaicDPositions(const cv::Size& size) {
     if (candidates.size() < wanted) return {};
     candidates.resize(wanted);
 
-    // Pack nearby diagonals together to keep the D JPEG reasonably coherent.
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         const int au = a.p.x + a.p.y, bu = b.p.x + b.p.y;
         if (au != bu) return au < bu;
@@ -630,6 +626,10 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
     for (const auto& jpeg : jpegs)
         if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
 
+    last_timing_.mosaic_keyframe = true;
+    for (std::size_t i = 0; i < jpegs.size(); ++i)
+        last_timing_.jpeg_layer_bytes[i] = jpegs[i].size();
+
     std::vector<std::vector<u_char>> packets;
     stage = ProfileClock::now();
     for (std::uint8_t layer_index = 0; layer_index < kMosaicLayerCount; ++layer_index) {
@@ -676,6 +676,7 @@ bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
         image, desired_jpeg_size, jpeg_bytes_per_pixel_, jpeg_model_channels_, jpeg, jpeg_size);
     last_timing_.jpeg_ms += profileMs(stage);
     if (!jpeg_ok) return false;
+    last_timing_.jpeg_layer_bytes[0] = jpeg.size();
 
     const std::size_t count_size = (jpeg.size() + kKeyframeChunkPayloadBytes - 1) / kKeyframeChunkPayloadBytes;
     if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) return false;
@@ -939,7 +940,7 @@ bool Decoder::rebuildMosaicKeyframe() {
     }
 
     if (cv::countNonZero(valid) == 0) return false;
-    cv::Mat reconstructed = fillOutside(assembled, valid);
+    cv::Mat reconstructed = kMosaicFillMissing ? fillOutside(assembled, valid) : assembled;
     if (reconstructed.empty()) return false;
 
     const bool new_keyframe = !have_keyframe_ || keyframe_id_ != pending_mosaic_.frame_id;
