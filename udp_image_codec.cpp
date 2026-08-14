@@ -3,6 +3,7 @@
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -28,6 +29,7 @@ constexpr std::uint8_t kPacketPatch = 2;
 constexpr int kFeatureGridX = 8;
 constexpr int kFeatureGridY = 8;
 constexpr int kFeaturesPerCell = 4;
+constexpr int kFeatureCandidateMultiplier = 4;
 constexpr int kMeshGridX = 6;
 constexpr int kMeshGridY = 6;
 const cv::Size kLkWindow(13, 13);
@@ -166,24 +168,37 @@ cv::Mat normalizeColorBrightness(const cv::Mat& image, double gain) {
 }
 
 std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray) {
+    constexpr int target_count = kFeatureGridX * kFeatureGridY * kFeaturesPerCell;
+    constexpr int candidate_count = target_count * kFeatureCandidateMultiplier;
+
+    // Run the expensive corner detector once over the whole image.  The global
+    // quality threshold deliberately allows smooth cells to stay partially or
+    // completely empty instead of manufacturing weak features per ROI.
+    std::vector<cv::Point2f> candidates;
+    candidates.reserve(candidate_count);
+    cv::goodFeaturesToTrack(gray, candidates, candidate_count,
+                            0.01, 7.0, cv::noArray(), 7, false, 0.04);
+
+    std::array<unsigned char, kFeatureGridX * kFeatureGridY> cell_counts{};
     std::vector<cv::Point2f> points;
-    points.reserve(kFeatureGridX * kFeatureGridY * kFeaturesPerCell);
-    for (int gy = 0; gy < kFeatureGridY; ++gy) {
-        const int y0 = gy * gray.rows / kFeatureGridY;
-        const int y1 = (gy + 1) * gray.rows / kFeatureGridY;
-        for (int gx = 0; gx < kFeatureGridX; ++gx) {
-            const int x0 = gx * gray.cols / kFeatureGridX;
-            const int x1 = (gx + 1) * gray.cols / kFeatureGridX;
-            const cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
-            if (roi.width < 7 || roi.height < 7) continue;
-            std::vector<cv::Point2f> local;
-            cv::goodFeaturesToTrack(gray(roi), local, kFeaturesPerCell,
-                                    0.01, 7.0, cv::noArray(), 7, false, 0.04);
-            for (cv::Point2f p : local) {
-                p.x += static_cast<float>(x0); p.y += static_cast<float>(y0);
-                points.push_back(p);
-            }
-        }
+    points.reserve(target_count);
+
+    // goodFeaturesToTrack gives us a globally filtered candidate pool. Bucket it
+    // spatially afterwards so textured regions cannot contribute more than the
+    // requested number of points to one 8x8 cell.
+    for (const cv::Point2f& p : candidates) {
+        const int gx = std::clamp(
+            static_cast<int>(p.x * kFeatureGridX / std::max(1, gray.cols)),
+            0, kFeatureGridX - 1);
+        const int gy = std::clamp(
+            static_cast<int>(p.y * kFeatureGridY / std::max(1, gray.rows)),
+            0, kFeatureGridY - 1);
+        const int cell = gy * kFeatureGridX + gx;
+        if (cell_counts[cell] >= kFeaturesPerCell) continue;
+
+        points.push_back(p);
+        ++cell_counts[cell];
+        if (static_cast<int>(points.size()) == target_count) break;
     }
     return points;
 }
