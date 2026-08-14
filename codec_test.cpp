@@ -331,8 +331,8 @@ int main(int argc, char** argv) {
         }
 
         char name[64];
-        std::snprintf(name, sizeof(name), "%04zu.jpg", i);
-        cv::imwrite((output_dir / name).string(), side, {cv::IMWRITE_JPEG_QUALITY, 95});
+        std::snprintf(name, sizeof(name), "%04zu.png", i);
+        cv::imwrite((output_dir / name).string(), side);
 
         std::cout << std::setw(4) << i
                   << (was_keyframe ? "  KEY   " : "  PATCH ")
