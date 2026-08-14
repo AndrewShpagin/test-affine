@@ -187,6 +187,45 @@ cv::Point2f applyAffine(const cv::Mat& affine, const cv::Point2f& p) {
         static_cast<float>(affine.at<double>(1,0)*p.x + affine.at<double>(1,1)*p.y + affine.at<double>(1,2)));
 }
 
+cv::Point2f samplePatchMesh(const PatchData& patch, const cv::Point2f& p) {
+    if (patch.grid_x < 2 || patch.grid_y < 2 || patch.original_size.width < 2 || patch.original_size.height < 2 ||
+        patch.mesh.size() != static_cast<std::size_t>(patch.grid_x) * patch.grid_y)
+        return cv::Point2f(0.0f, 0.0f);
+
+    const float gx = std::clamp(
+        p.x * static_cast<float>(patch.grid_x - 1) / static_cast<float>(patch.original_size.width - 1),
+        0.0f, static_cast<float>(patch.grid_x - 1));
+    const float gy = std::clamp(
+        p.y * static_cast<float>(patch.grid_y - 1) / static_cast<float>(patch.original_size.height - 1),
+        0.0f, static_cast<float>(patch.grid_y - 1));
+    const int x0 = static_cast<int>(std::floor(gx));
+    const int y0 = static_cast<int>(std::floor(gy));
+    const int x1 = std::min(x0 + 1, static_cast<int>(patch.grid_x) - 1);
+    const int y1 = std::min(y0 + 1, static_cast<int>(patch.grid_y) - 1);
+    const float tx = gx - x0;
+    const float ty = gy - y0;
+
+    const cv::Point2f& d00 = patch.mesh[y0 * patch.grid_x + x0];
+    const cv::Point2f& d10 = patch.mesh[y0 * patch.grid_x + x1];
+    const cv::Point2f& d01 = patch.mesh[y1 * patch.grid_x + x0];
+    const cv::Point2f& d11 = patch.mesh[y1 * patch.grid_x + x1];
+    const cv::Point2f d0 = d00 * (1.0f - tx) + d10 * tx;
+    const cv::Point2f d1 = d01 * (1.0f - tx) + d11 * tx;
+    return d0 * (1.0f - ty) + d1 * ty;
+}
+
+cv::Point2f predictPointFromPatch(const PatchData& patch, const cv::Point2f& p) {
+    cv::Point2f q(
+        patch.affine[0] * p.x + patch.affine[1] * p.y + patch.affine[2],
+        patch.affine[3] * p.x + patch.affine[4] * p.y + patch.affine[5]);
+    cv::Point2f predicted = q;
+    // Decoder defines the mesh in destination coordinates: x = affine(p) + mesh(x).
+    // Two cheap fixed-point iterations make the predictor consistent with that model.
+    for (int iter = 0; iter < 2; ++iter)
+        predicted = q + samplePatchMesh(patch, predicted);
+    return predicted;
+}
+
 int quantizeTo8(int value, int max_value) {
     value = std::max(8, value); value = (value / 8) * 8;
     if (max_value >= 8) value = std::min(value, (max_value / 8) * 8);
@@ -376,6 +415,11 @@ void Encoder::setReference(const cv::Mat& gray, std::uint32_t frame_id) {
     reference_pyramid_.clear();
     reference_max_level_ = cv::buildOpticalFlowPyramid(reference_gray_, reference_pyramid_,
         kLkWindow, kLkMaxLevel, true, cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, false);
+    current_pyramid_.clear();
+    lk_forward_.clear(); lk_back_.clear();
+    lk_status_forward_.clear(); lk_status_back_.clear();
+    lk_error_forward_.clear(); lk_error_back_.clear();
+    previous_patch_ = PatchData{}; have_previous_patch_ = false;
     keyframe_id_ = frame_id; frames_since_keyframe_ = 0; have_reference_ = true;
 }
 
@@ -407,18 +451,33 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
         kLkWindow, kLkMaxLevel, true, cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, false);
     const int max_level = std::min(reference_max_level_, current_max_level);
 
-    lk_forward_.clear(); lk_status_forward_.clear(); lk_error_forward_.clear();
+    lk_status_forward_.clear(); lk_error_forward_.clear();
+    int forward_flags = 0;
+    const bool can_predict = have_previous_patch_ &&
+        previous_patch_.keyframe_id == keyframe_id_ && previous_patch_.original_size == input_size_;
+    if (can_predict) {
+        lk_forward_.resize(reference_features_.size());
+        for (std::size_t i = 0; i < reference_features_.size(); ++i)
+            lk_forward_[i] = predictPointFromPatch(previous_patch_, reference_features_[i]);
+        forward_flags = cv::OPTFLOW_USE_INITIAL_FLOW;
+    } else {
+        lk_forward_.clear();
+    }
+
     cv::calcOpticalFlowPyrLK(reference_pyramid_, current_pyramid_, reference_features_, lk_forward_,
         lk_status_forward_, lk_error_forward_, kLkWindow, max_level,
-        cv::TermCriteria(cv::TermCriteria::COUNT|cv::TermCriteria::EPS,40,0.01),0,1e-4);
+        cv::TermCriteria(cv::TermCriteria::COUNT|cv::TermCriteria::EPS,40,0.01), forward_flags, 1e-4);
 
     std::vector<cv::Point2f> g0,g1; g0.reserve(reference_features_.size()); g1.reserve(reference_features_.size());
     for(std::size_t i=0;i<reference_features_.size();++i) if(i<lk_status_forward_.size()&&lk_status_forward_[i]&&i<lk_error_forward_.size()&&lk_error_forward_[i]<kLkForwardErrorMax){g0.push_back(reference_features_[i]);g1.push_back(lk_forward_[i]);}
     if(g0.size()<4) return false;
 
-    lk_back_.clear(); lk_status_back_.clear(); lk_error_back_.clear();
+    // For the backward consistency check we already know the expected destination in the
+    // reference image exactly: g0. Use it as the initial flow rather than searching from g1.
+    lk_back_ = g0; lk_status_back_.clear(); lk_error_back_.clear();
     cv::calcOpticalFlowPyrLK(current_pyramid_, reference_pyramid_, g1, lk_back_, lk_status_back_, lk_error_back_,
-        kLkWindow,max_level,cv::TermCriteria(cv::TermCriteria::COUNT|cv::TermCriteria::EPS,40,0.01));
+        kLkWindow,max_level,cv::TermCriteria(cv::TermCriteria::COUNT|cv::TermCriteria::EPS,40,0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW,1e-4);
     std::vector<cv::Point2f> p0,p1; p0.reserve(g0.size()); p1.reserve(g0.size());
     for(std::size_t i=0;i<g0.size();++i){if(i>=lk_status_back_.size()||!lk_status_back_[i])continue;if(cv::norm(lk_back_[i]-g0[i])>kLkBackwardErrorMax)continue;p0.push_back(g0[i]);p1.push_back(g1[i]);}
     if(p0.size()<4) return false;
@@ -482,6 +541,8 @@ void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once
     std::vector<u_char> packet = serializePatch(patch);
     if (packet.size() <= kMaxUdpPacketBytes) {
         output_queue_.push_back(std::move(packet));
+        previous_patch_ = patch;
+        have_previous_patch_ = true;
         ++frames_since_keyframe_;
     } else {
         emit_normalized_keyframe();
