@@ -22,6 +22,7 @@ using affinecodec::u_char;
 using Clock = std::chrono::steady_clock;
 
 constexpr bool kReusePreviousFrameBorders = true;
+constexpr bool kMosaicKeyframes = true;
 
 static double ms(const Clock::time_point& a, const Clock::time_point& b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -195,12 +196,14 @@ int main(int argc, char** argv) {
               << "Output folder: " << output_dir << '\n'
               << "Target JPEG bytes: " << jpeg_bytes << '\n'
               << "Keyframe period: " << key_period << '\n'
+              << "MOSAIC keyframes: " << (kMosaicKeyframes ? "yes" : "no") << '\n'
               << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
               << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
               << "Number of images: " << files.size() << "\n\n";
 
     Encoder encoder;
     Decoder decoder;
+    encoder.setMosaicKeyframes(kMosaicKeyframes);
     decoder.setReusePreviousFrameBorders(kReusePreviousFrameBorders);
     std::vector<u_char> current_jpeg;
     std::size_t total_bytes = 0, total_packets = 0, timed_frames = 0;
