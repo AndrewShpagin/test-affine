@@ -30,6 +30,7 @@ constexpr int kFeatureGridX = 8;
 constexpr int kFeatureGridY = 8;
 constexpr int kFeaturesPerCell = 4;
 constexpr int kFeatureCandidateMultiplier = 4;
+constexpr int kFeatureDetectorMaxSide = 256;
 constexpr int kMeshGridX = 6;
 constexpr int kMeshGridY = 6;
 const cv::Size kLkWindow(13, 13);
@@ -171,22 +172,32 @@ std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray) {
     constexpr int target_count = kFeatureGridX * kFeatureGridY * kFeaturesPerCell;
     constexpr int candidate_count = target_count * kFeatureCandidateMultiplier;
 
-    // Run the expensive corner detector once over the whole image.  The global
-    // quality threshold deliberately allows smooth cells to stay partially or
-    // completely empty instead of manufacturing weak features per ROI.
+    // Keep detector work bounded as input resolution grows. Repeated pyrDown also
+    // removes fine high-frequency detail, biasing selection toward stable coarse
+    // landscape features. Coordinates are mapped back to the full-resolution LK image.
+    cv::Mat detector = gray;
+    int detector_scale = 1;
+    while (std::max(detector.cols, detector.rows) >= kFeatureDetectorMaxSide) {
+        cv::Mat smaller;
+        cv::pyrDown(detector, smaller);
+        detector = std::move(smaller);
+        detector_scale *= 2;
+    }
+
     std::vector<cv::Point2f> candidates;
     candidates.reserve(candidate_count);
-    cv::goodFeaturesToTrack(gray, candidates, candidate_count,
-                            0.01, 7.0, cv::noArray(), 7, false, 0.04);
+    const double min_distance = std::max(2.0, 7.0 / static_cast<double>(detector_scale));
+    cv::goodFeaturesToTrack(detector, candidates, candidate_count,
+                            0.01, min_distance, cv::noArray(), 7, false, 0.04);
 
     std::array<unsigned char, kFeatureGridX * kFeatureGridY> cell_counts{};
     std::vector<cv::Point2f> points;
     points.reserve(target_count);
 
-    // goodFeaturesToTrack gives us a globally filtered candidate pool. Bucket it
-    // spatially afterwards so textured regions cannot contribute more than the
-    // requested number of points to one 8x8 cell.
-    for (const cv::Point2f& p : candidates) {
+    for (cv::Point2f p : candidates) {
+        p.x = std::clamp(p.x * detector_scale, 0.0f, static_cast<float>(gray.cols - 1));
+        p.y = std::clamp(p.y * detector_scale, 0.0f, static_cast<float>(gray.rows - 1));
+
         const int gx = std::clamp(
             static_cast<int>(p.x * kFeatureGridX / std::max(1, gray.cols)),
             0, kFeatureGridX - 1);
