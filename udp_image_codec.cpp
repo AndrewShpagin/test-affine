@@ -33,6 +33,8 @@ constexpr int kFeatureCandidateMultiplier = 4;
 constexpr int kFeatureDetectorMaxSide = 256;
 constexpr int kJpegQuality = 85;
 constexpr double kJpegTargetFill = 0.95;
+constexpr double kJpegSizeTolerance = 0.20;
+constexpr int kJpegMaxEncodePasses = 3;
 constexpr double kJpegModelAlpha = 1.0;
 constexpr double kJpegInitialGrayBytesPerPixel = 0.16;
 constexpr double kJpegInitialColorBytesPerPixel = 0.22;
@@ -252,7 +254,7 @@ cv::Point2f samplePatchMesh(const PatchData& patch, const cv::Point2f& p) {
     const cv::Point2f& d01 = patch.mesh[y1 * patch.grid_x + x0];
     const cv::Point2f& d11 = patch.mesh[y1 * patch.grid_x + x1];
     const cv::Point2f d0 = d00 * (1.0f - tx) + d10 * tx;
-    const cv::Point2f d1 = d01 * (1.0f - tx) + d11 * tx;
+    const cv::Point2f d1 = d01 * (1.0f - ty) + d11 * ty;
     return d0 * (1.0f - ty) + d1 * ty;
 }
 
@@ -285,9 +287,9 @@ bool encodeJpegAtSize(const cv::Mat& source, const cv::Size& size,
     return cv::imencode(".jpg", small, jpeg, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality});
 }
 
-bool encodeJpegSinglePass(const cv::Mat& image, int requested_jpeg_bytes,
-                          double& bytes_per_pixel_model, int& model_channels,
-                          std::vector<u_char>& jpeg, cv::Size& encoded_size) {
+bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
+                       double& bytes_per_pixel_model, int& model_channels,
+                       std::vector<u_char>& jpeg, cv::Size& encoded_size) {
     const cv::Mat source = jpegInput8(image);
     if (source.empty()) return false;
 
@@ -297,30 +299,66 @@ bool encodeJpegSinglePass(const cv::Mat& image, int requested_jpeg_bytes,
         bytes_per_pixel_model = 0.0;
     }
 
+    const double requested_bytes = static_cast<double>(std::max(1, requested_jpeg_bytes));
+    const double lower_bytes = requested_bytes * (1.0 - kJpegSizeTolerance);
+    const double upper_bytes = requested_bytes * (1.0 + kJpegSizeTolerance);
+    const double target_bytes = std::max(1.0, requested_bytes * kJpegTargetFill);
+
     const double initial_bpp = channels == 1 ?
         kJpegInitialGrayBytesPerPixel : kJpegInitialColorBytesPerPixel;
     const double predicted_bpp = std::max(kJpegMinBytesPerPixel,
         bytes_per_pixel_model > 0.0 ? bytes_per_pixel_model : initial_bpp);
-    const double target_bytes = std::max(1.0,
-        static_cast<double>(std::max(1, requested_jpeg_bytes)) * kJpegTargetFill);
     const double target_pixels = target_bytes / predicted_bpp;
-    const double scale = std::sqrt(target_pixels / std::max(1.0, static_cast<double>(source.total())));
-    encoded_size = scaledSize8(source.size(), scale);
+    const double initial_scale = std::sqrt(
+        target_pixels / std::max(1.0, static_cast<double>(source.total())));
 
-    // Deliberately one JPEG encode only. desired_jpeg_size is a target, not a hard
-    // transport limit: keyframes are chunked afterwards into <=1300-byte packets.
-    if (!encodeJpegAtSize(source, encoded_size, jpeg)) return false;
-    if (jpeg.empty() || jpeg.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+    cv::Size current_size = scaledSize8(source.size(), initial_scale);
+    std::vector<u_char> current;
+    bool first_pass_within_tolerance = false;
+    bool final_within_tolerance = false;
 
-    const double encoded_pixels = std::max(1.0,
-        static_cast<double>(encoded_size.width) * encoded_size.height);
-    const double observed_bpp = static_cast<double>(jpeg.size()) / encoded_pixels;
-    if (bytes_per_pixel_model <= 0.0) {
-        bytes_per_pixel_model = observed_bpp;
-    } else {
-        bytes_per_pixel_model =
-            (1.0 - kJpegModelAlpha) * bytes_per_pixel_model +
-            kJpegModelAlpha * observed_bpp;
+    for (int pass = 0; pass < kJpegMaxEncodePasses; ++pass) {
+        current.clear();
+        if (!encodeJpegAtSize(source, current_size, current)) return false;
+        if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+
+        const double current_bytes = static_cast<double>(current.size());
+        const bool within_tolerance = current_bytes >= lower_bytes && current_bytes <= upper_bytes;
+        if (pass == 0) first_pass_within_tolerance = within_tolerance;
+        final_within_tolerance = within_tolerance;
+
+        if (within_tolerance || pass + 1 >= kJpegMaxEncodePasses) break;
+
+        const double current_scale = std::min(
+            static_cast<double>(current_size.width) / source.cols,
+            static_cast<double>(current_size.height) / source.rows);
+        const double corrected_scale = current_scale * std::sqrt(target_bytes / current_bytes);
+        const cv::Size next_size = scaledSize8(source.size(), corrected_scale);
+
+        // A very low-entropy frame (nearly white/black) can remain below the lower
+        // bound even at full source resolution. Likewise 8x8 is the absolute floor.
+        // In either case another encode cannot improve the size by changing resolution.
+        if (next_size == current_size) break;
+        current_size = next_size;
+    }
+
+    jpeg = std::move(current);
+    encoded_size = current_size;
+
+    // Do not let a pathological frame poison the predictor. Normal frames update the
+    // model immediately (alpha=1 today). A corrected frame may update it only if the
+    // correction actually brought the JPEG back into the accepted size band.
+    if (first_pass_within_tolerance || final_within_tolerance) {
+        const double encoded_pixels = std::max(1.0,
+            static_cast<double>(encoded_size.width) * encoded_size.height);
+        const double observed_bpp = static_cast<double>(jpeg.size()) / encoded_pixels;
+        if (bytes_per_pixel_model <= 0.0) {
+            bytes_per_pixel_model = observed_bpp;
+        } else {
+            bytes_per_pixel_model =
+                (1.0 - kJpegModelAlpha) * bytes_per_pixel_model +
+                kJpegModelAlpha * observed_bpp;
+        }
     }
     return true;
 }
@@ -455,7 +493,7 @@ bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
     std::vector<u_char> jpeg; cv::Size jpeg_size;
 
     auto stage = ProfileClock::now();
-    const bool jpeg_ok = encodeJpegSinglePass(
+    const bool jpeg_ok = encodeJpegBounded(
         image, desired_jpeg_size, jpeg_bytes_per_pixel_, jpeg_model_channels_, jpeg, jpeg_size);
     last_timing_.jpeg_ms += profileMs(stage);
     if (!jpeg_ok) return false;
