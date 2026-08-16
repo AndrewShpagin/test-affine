@@ -36,6 +36,7 @@ struct EncoderTiming {
     bool keyframe = false;
     bool predictor_used = false;
     bool mosaic_keyframe = false;
+    bool strips_keyframe = false;
     KeyframeCodec keyframe_codec = KeyframeCodec::Jpeg;
     std::array<std::size_t, 3> jpeg_layer_bytes{};
     cv::Size jpeg_size;
@@ -66,13 +67,22 @@ public:
     bool getNextChunk(std::vector<u_char>& data);
     bool getLastLKDebug(LKDebugData& debug) const;
     const EncoderTiming& lastTiming() const { return last_timing_; }
-    void setMosaicKeyframes(bool enabled) { mosaic_keyframes_ = enabled; }
+    void setMosaicKeyframes(bool enabled) {
+        mosaic_keyframes_ = enabled;
+        if (enabled) strips_keyframes_ = false;
+    }
     bool mosaicKeyframes() const { return mosaic_keyframes_; }
+    void setStripsKeyframes(bool enabled) {
+        strips_keyframes_ = enabled;
+        if (enabled) mosaic_keyframes_ = false;
+    }
+    bool stripsKeyframes() const { return strips_keyframes_; }
     void setKeyframeCodec(KeyframeCodec codec) { keyframe_codec_ = codec; }
     KeyframeCodec keyframeCodec() const { return keyframe_codec_; }
 private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
+    bool emitStripsKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch);
     void setReference(const cv::Mat& gray, std::uint32_t frame_id);
     cv::Size input_size_;
@@ -93,8 +103,11 @@ private:
     int jpeg_model_channels_ = 0;
     double mosaic_jpeg_bytes_per_pixel_ = 0.0;
     int mosaic_jpeg_model_channels_ = 0;
+    double strips_jpeg_bytes_per_pixel_ = 0.0;
+    int strips_jpeg_model_channels_ = 0;
     KeyframeCodec keyframe_codec_ = KeyframeCodec::Jpeg;
     bool mosaic_keyframes_ = false;
+    bool strips_keyframes_ = false;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
     int frames_since_keyframe_ = 0;
