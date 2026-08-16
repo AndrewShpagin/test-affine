@@ -123,7 +123,7 @@ static void saveDiag(const fs::path& path,const cv::Mat& a,const cv::Mat& b,cons
 int main(int argc,char** argv){
     if(argc>5){
         std::cerr<<"Usage: mesh_test [image-folder] [output-folder] [grid-x] [grid-y]\n"
-                 <<"Defaults: local-data/frames -> output/mesh, grid 4x4\n";
+                 <<"Defaults:         -> output/mesh, grid 4x4\n";
         return 2;
     }
     fs::path in=argc>1?fs::path(argv[1]):fs::path("local-data/frames");

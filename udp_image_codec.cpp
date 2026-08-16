@@ -20,7 +20,7 @@ double profileMs(const ProfileClock::time_point& start) {
 }
 
 constexpr bool kShowLKImage = true;
-constexpr bool kMosaicFillMissing = false;
+constexpr bool kMosaicFillMissing = true;
 
 constexpr std::uint32_t kMagic = 0x31434641u;
 constexpr std::uint8_t kVersion = 2;
