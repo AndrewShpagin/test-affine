@@ -24,7 +24,9 @@ using Clock = std::chrono::steady_clock;
 
 constexpr bool kReusePreviousFrameBorders = true;
 constexpr bool kMosaicKeyframes = true;
-constexpr KeyframeCodec kDefaultKeyframeCodec = KeyframeCodec::Jpeg;
+constexpr bool kUseJpeg2000 = false;
+constexpr KeyframeCodec kDefaultKeyframeCodec =
+    kUseJpeg2000 ? KeyframeCodec::Jpeg2000 : KeyframeCodec::Jpeg;
 
 static double ms(const Clock::time_point& a, const Clock::time_point& b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
