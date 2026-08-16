@@ -193,7 +193,8 @@ int main(int argc, char** argv) {
     }
 
     const fs::path input_dir = argc > 1 ? fs::path(argv[1]) : fs::path("local-data/frames");
-    const fs::path output_dir = argc > 2 ? fs::path(argv[2]) : fs::path("output/codec");
+    const fs::path output_root = argc > 2 ? fs::path(argv[2]) : fs::path("output/codec");
+    const fs::path output_dir = output_root / (kMosaicKeyframes ? "mosaic" : "classic");
     const int jpeg_bytes = argc > 3 ? std::stoi(argv[3]) : 40000;
     const int key_period = argc > 4 ? std::stoi(argv[4]) : 5;
 
