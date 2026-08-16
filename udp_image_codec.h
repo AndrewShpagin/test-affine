@@ -11,6 +11,11 @@ namespace affinecodec {
 using u_char = unsigned char;
 constexpr std::size_t kMaxUdpPacketBytes = 1300;
 
+enum class KeyframeCodec : std::uint8_t {
+    Jpeg = 0,
+    Jpeg2000 = 1,
+};
+
 struct PatchData {
     std::uint32_t frame_id = 0;
     std::uint32_t keyframe_id = 0;
@@ -31,9 +36,11 @@ struct EncoderTiming {
     bool keyframe = false;
     bool predictor_used = false;
     bool mosaic_keyframe = false;
+    KeyframeCodec keyframe_codec = KeyframeCodec::Jpeg;
     std::array<std::size_t, 3> jpeg_layer_bytes{};
     cv::Size jpeg_size;
     int jpeg_quality = 0;
+    int jpeg2000_compression_x1000 = 0;
     double prep_ms = 0.0;
     double color_norm_ms = 0.0;
     double jpeg_ms = 0.0;
@@ -61,6 +68,8 @@ public:
     const EncoderTiming& lastTiming() const { return last_timing_; }
     void setMosaicKeyframes(bool enabled) { mosaic_keyframes_ = enabled; }
     bool mosaicKeyframes() const { return mosaic_keyframes_; }
+    void setKeyframeCodec(KeyframeCodec codec) { keyframe_codec_ = codec; }
+    KeyframeCodec keyframeCodec() const { return keyframe_codec_; }
 private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
@@ -84,6 +93,7 @@ private:
     int jpeg_model_channels_ = 0;
     double mosaic_jpeg_bytes_per_pixel_ = 0.0;
     int mosaic_jpeg_model_channels_ = 0;
+    KeyframeCodec keyframe_codec_ = KeyframeCodec::Jpeg;
     bool mosaic_keyframes_ = false;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
@@ -103,6 +113,7 @@ public:
     bool reusePreviousFrameBorders() const { return reuse_previous_frame_borders_; }
     cv::Size originalSize() const { return original_size_; }
     std::uint32_t keyframeId() const { return keyframe_id_; }
+    double lastKeyframeImageDecodeMs() const { return last_keyframe_image_decode_ms_; }
 private:
     struct KeyframeAssembly {
         bool active = false;
@@ -131,6 +142,7 @@ private:
         cv::Size original_size;
         std::uint8_t layer_count = 0;
         bool end_received = false;
+        double image_decode_ms = 0.0;
         std::array<MosaicLayerAssembly, 3> layers;
     };
     cv::Mat getDecodedKeyframe(const std::vector<u_char>& jpeg_data);
@@ -153,5 +165,6 @@ private:
     cv::Mat valid_mask_;
     cv::Mat previous_render_;
     bool reuse_previous_frame_borders_ = false;
+    double last_keyframe_image_decode_ms_ = 0.0;
 };
 } // namespace affinecodec

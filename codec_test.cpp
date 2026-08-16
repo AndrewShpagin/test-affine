@@ -16,6 +16,7 @@ namespace fs = std::filesystem;
 using affinecodec::Decoder;
 using affinecodec::Encoder;
 using affinecodec::EncoderTiming;
+using affinecodec::KeyframeCodec;
 using affinecodec::LKDebugData;
 using affinecodec::PatchData;
 using affinecodec::u_char;
@@ -23,6 +24,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr bool kReusePreviousFrameBorders = true;
 constexpr bool kMosaicKeyframes = true;
+constexpr KeyframeCodec kDefaultKeyframeCodec = KeyframeCodec::Jpeg;
 
 static double ms(const Clock::time_point& a, const Clock::time_point& b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -85,7 +87,7 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
     if (t.keyframe) {
         std::cout << " prep=" << t.prep_ms
                   << " color=" << t.color_norm_ms
-                  << " jpeg=" << t.jpeg_ms
+                  << " codec=" << t.jpeg_ms
                   << " chunk=" << t.chunk_ms
                   << " feat=" << t.features_ms
                   << "(copy=" << t.feature_copy_ms
@@ -112,17 +114,38 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
     std::cout << " other=" << other << " ms\n";
 }
 
-static std::string jpegSizeInfo(const EncoderTiming& t) {
-    if (!t.keyframe || t.jpeg_layer_bytes[0] == 0) return std::string();
-    std::string info;
-    if (t.mosaic_keyframe) {
-        info = " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
-               cv::format("%.1f", t.jpeg_layer_bytes[1] / 1024.0) + "/" +
-               cv::format("%.1f", t.jpeg_layer_bytes[2] / 1024.0) + "k";
-    } else {
-        info = " J=" + cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "k";
+static const char* keyframeCodecName(KeyframeCodec codec) {
+    return codec == KeyframeCodec::Jpeg2000 ? "JPEG2000" : "JPEG";
+}
+
+static bool parseKeyframeCodec(std::string value, KeyframeCodec& codec) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "jpeg" || value == "jpg") {
+        codec = KeyframeCodec::Jpeg;
+        return true;
     }
-    if (t.jpeg_quality > 0)
+    if (value == "jpeg2000" || value == "jp2") {
+        codec = KeyframeCodec::Jpeg2000;
+        return true;
+    }
+    return false;
+}
+
+static std::string codecSizeInfo(const EncoderTiming& t) {
+    if (!t.keyframe || t.jpeg_layer_bytes[0] == 0) return std::string();
+    const bool jp2 = t.keyframe_codec == KeyframeCodec::Jpeg2000;
+    std::string info = jp2 ? " JP2=" : " J=";
+    if (t.mosaic_keyframe) {
+        info += cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
+                cv::format("%.1f", t.jpeg_layer_bytes[1] / 1024.0) + "/" +
+                cv::format("%.1f", t.jpeg_layer_bytes[2] / 1024.0) + "k";
+    } else {
+        info += cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "k";
+    }
+    if (jp2 && t.jpeg2000_compression_x1000 > 0)
+        info += " C=" + std::to_string(t.jpeg2000_compression_x1000);
+    if (!jp2 && t.jpeg_quality > 0)
         info += " Q=" + std::to_string(t.jpeg_quality);
     if (t.jpeg_size.width > 0 && t.jpeg_size.height > 0)
         info += " " + std::to_string(t.jpeg_size.width) + "x" + std::to_string(t.jpeg_size.height);
@@ -187,20 +210,32 @@ static cv::Mat makeLkPanel(const LKDebugData& debug) {
 }
 
 int main(int argc, char** argv) {
-    if (argc > 5) {
-        std::cerr << "Usage: codec_test [image-folder] [output-folder] [jpeg-bytes] [key-period]\n";
+    if (argc > 6) {
+        std::cerr << "Usage: codec_test [image-folder] [output-folder] [keyframe-bytes] [key-period] [jpeg|jp2]\n";
         return 2;
     }
 
     const fs::path input_dir = argc > 1 ? fs::path(argv[1]) : fs::path("local-data/frames");
     const fs::path output_root = argc > 2 ? fs::path(argv[2]) : fs::path("output/codec");
-    const fs::path output_dir = output_root / (kMosaicKeyframes ? "mosaic" : "classic");
-    const int jpeg_bytes = argc > 3 ? std::stoi(argv[3]) : 40000;
+    const int keyframe_bytes = argc > 3 ? std::stoi(argv[3]) : 40000;
     const int key_period = argc > 4 ? std::stoi(argv[4]) : 5;
+    KeyframeCodec keyframe_codec = kDefaultKeyframeCodec;
+    if (argc > 5 && !parseKeyframeCodec(argv[5], keyframe_codec)) {
+        std::cerr << "Unknown keyframe codec: " << argv[5] << " (use jpeg or jp2)\n";
+        return 2;
+    }
+
+    std::string output_mode = kMosaicKeyframes ? "mosaic" : "classic";
+    if (keyframe_codec == KeyframeCodec::Jpeg2000) output_mode += "-jp2";
+    const fs::path output_dir = output_root / output_mode;
 
     if (!fs::exists(input_dir)) {
         std::cerr << "Input folder does not exist: " << input_dir << '\n';
         return 1;
+    }
+    if (keyframe_codec == KeyframeCodec::Jpeg2000 && !cv::haveImageWriter(".jp2")) {
+        std::cerr << "JPEG2000 writer is not available in this OpenCV build\n";
+        return 4;
     }
 
     const std::vector<fs::path> files = listImages(input_dir);
@@ -212,8 +247,9 @@ int main(int argc, char** argv) {
 
     std::cout << "Input folder: " << input_dir << '\n'
               << "Output folder: " << output_dir << '\n'
-              << "Target JPEG bytes: " << jpeg_bytes << '\n'
+              << "Target keyframe bytes: " << keyframe_bytes << '\n'
               << "Keyframe period: " << key_period << '\n'
+              << "Keyframe codec: " << keyframeCodecName(keyframe_codec) << '\n'
               << "MOSAIC keyframes: " << (kMosaicKeyframes ? "yes" : "no") << '\n'
               << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
               << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
@@ -222,13 +258,14 @@ int main(int argc, char** argv) {
     Encoder encoder;
     Decoder decoder;
     encoder.setMosaicKeyframes(kMosaicKeyframes);
+    encoder.setKeyframeCodec(keyframe_codec);
     decoder.setReusePreviousFrameBorders(kReusePreviousFrameBorders);
     std::vector<u_char> current_jpeg;
     std::size_t total_bytes = 0, total_packets = 0, timed_frames = 0;
     std::size_t key_frames = 0, patch_frames = 0;
     std::size_t predictor_patch_frames = 0;
     double total_enc_ms = 0.0, total_dec_ms = 0.0;
-    double key_enc_ms = 0.0, key_dec_ms = 0.0;
+    double key_enc_ms = 0.0, key_dec_ms = 0.0, key_codec_decode_ms = 0.0;
     double patch_enc_ms = 0.0, patch_dec_ms = 0.0;
     EncoderTiming key_timing_sum;
     EncoderTiming patch_timing_sum;
@@ -238,7 +275,7 @@ int main(int argc, char** argv) {
         if (original.empty()) continue;
 
         const auto enc_start = Clock::now();
-        encoder.pushImage(original, jpeg_bytes, key_period);
+        encoder.pushImage(original, keyframe_bytes, key_period);
         const double enc_ms = ms(enc_start, Clock::now());
         const EncoderTiming enc_timing = encoder.lastTiming();
 
@@ -250,6 +287,7 @@ int main(int argc, char** argv) {
         bool was_keyframe = false;
         std::size_t frame_bytes = 0, frame_packets = 0;
         double dec_ms = 0.0;
+        double frame_codec_decode_ms = 0.0;
 
         std::vector<u_char> chunk;
         while (encoder.getNextChunk(chunk)) {
@@ -270,6 +308,7 @@ int main(int argc, char** argv) {
             if (decoder.updateKeyframe(new_jpeg)) {
                 current_jpeg = std::move(new_jpeg);
                 decoder.render(decoded, {}, current_jpeg);
+                frame_codec_decode_ms = decoder.lastKeyframeImageDecodeMs();
                 produced_frame = !decoded.empty();
                 was_keyframe = true;
             }
@@ -298,6 +337,7 @@ int main(int argc, char** argv) {
 
         if (was_keyframe) {
             ++key_frames; key_enc_ms += enc_ms; key_dec_ms += dec_ms;
+            key_codec_decode_ms += frame_codec_decode_ms;
             addEncoderTiming(key_timing_sum, enc_timing);
         } else {
             ++patch_frames; patch_enc_ms += enc_ms; patch_dec_ms += dec_ms;
@@ -311,11 +351,13 @@ int main(int argc, char** argv) {
         const double mae = colorMae(original, decoded);
         const std::string original_info =
             "frame " + std::to_string(i) + "  " + files[i].filename().string();
-        const std::string decoded_info =
+        std::string decoded_info =
             std::string(was_keyframe ? "KEY  " : "PATCH  ") +
             std::to_string(frame_packets) + " pkt  " + std::to_string(frame_bytes) +
-            " B" + jpegSizeInfo(enc_timing) +
+            " B" + codecSizeInfo(enc_timing) +
             " E=" + cv::format("%.1f", enc_ms) + "ms D=" + cv::format("%.1f", dec_ms) + "ms";
+        if (was_keyframe)
+            decoded_info += " CD=" + cv::format("%.1f", frame_codec_decode_ms) + "ms";
 
         cv::Mat left = addLabel(original, "ORIGINAL", original_info);
         cv::Mat right = addLabel(decoded, "DECODED", decoded_info);
@@ -346,10 +388,12 @@ int main(int argc, char** argv) {
                   << (was_keyframe ? "  KEY   " : "  PATCH ")
                   << std::setw(3) << frame_packets << " pkt  "
                   << std::setw(7) << frame_bytes << " B"
-                  << jpegSizeInfo(enc_timing)
+                  << codecSizeInfo(enc_timing)
                   << "  MAE=" << std::fixed << std::setprecision(2) << mae
                   << "  enc=" << enc_ms << " ms"
-                  << "  dec=" << dec_ms << " ms\n";
+                  << "  dec=" << dec_ms << " ms";
+        if (was_keyframe) std::cout << "  codec-dec=" << frame_codec_decode_ms << " ms";
+        std::cout << '\n';
         printEncoderTiming(enc_timing, enc_ms);
     }
 
@@ -366,6 +410,7 @@ int main(int argc, char** argv) {
         const double avg_enc = key_enc_ms / key_frames;
         std::cout << "Keyframe average: encode=" << avg_enc
                   << " ms  decode=" << key_dec_ms / key_frames
+                  << " ms  codec-decode=" << key_codec_decode_ms / key_frames
                   << " ms  (" << key_frames << " frames)\n";
         const EncoderTiming avg = divideEncoderTiming(key_timing_sum, static_cast<double>(key_frames), true);
         printEncoderTiming(avg, avg_enc, "  KEY avg:   ");
