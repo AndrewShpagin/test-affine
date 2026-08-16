@@ -23,8 +23,11 @@ using affinecodec::u_char;
 using Clock = std::chrono::steady_clock;
 
 constexpr bool kReusePreviousFrameBorders = true;
-constexpr bool kMosaicKeyframes = true;
+constexpr bool kMosaicKeyframes = false;
+constexpr bool kStripsKeyframes = true;
 constexpr bool kUseJpeg2000 = false;
+static_assert(!(kMosaicKeyframes && kStripsKeyframes),
+              "MOSAIC and STRIPS keyframes are mutually exclusive");
 constexpr KeyframeCodec kDefaultKeyframeCodec =
     kUseJpeg2000 ? KeyframeCodec::Jpeg2000 : KeyframeCodec::Jpeg;
 
@@ -138,7 +141,10 @@ static std::string codecSizeInfo(const EncoderTiming& t) {
     if (!t.keyframe || t.jpeg_layer_bytes[0] == 0) return std::string();
     const bool jp2 = t.keyframe_codec == KeyframeCodec::Jpeg2000;
     std::string info = jp2 ? " JP2=" : " J=";
-    if (t.mosaic_keyframe) {
+    if (t.strips_keyframe) {
+        info += cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
+                cv::format("%.1f", t.jpeg_layer_bytes[1] / 1024.0) + "k";
+    } else if (t.mosaic_keyframe) {
         info += cv::format("%.1f", t.jpeg_layer_bytes[0] / 1024.0) + "/" +
                 cv::format("%.1f", t.jpeg_layer_bytes[1] / 1024.0) + "/" +
                 cv::format("%.1f", t.jpeg_layer_bytes[2] / 1024.0) + "k";
@@ -227,7 +233,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::string output_mode = kMosaicKeyframes ? "mosaic" : "classic";
+    std::string output_mode = kStripsKeyframes ? "strips" :
+                              (kMosaicKeyframes ? "mosaic" : "classic");
     if (keyframe_codec == KeyframeCodec::Jpeg2000) output_mode += "-jp2";
     const fs::path output_dir = output_root / output_mode;
 
@@ -253,6 +260,7 @@ int main(int argc, char** argv) {
               << "Keyframe period: " << key_period << '\n'
               << "Keyframe codec: " << keyframeCodecName(keyframe_codec) << '\n'
               << "MOSAIC keyframes: " << (kMosaicKeyframes ? "yes" : "no") << '\n'
+              << "STRIPS keyframes: " << (kStripsKeyframes ? "yes" : "no") << '\n'
               << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
               << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
               << "Number of images: " << files.size() << "\n\n";
@@ -260,6 +268,7 @@ int main(int argc, char** argv) {
     Encoder encoder;
     Decoder decoder;
     encoder.setMosaicKeyframes(kMosaicKeyframes);
+    encoder.setStripsKeyframes(kStripsKeyframes);
     encoder.setKeyframeCodec(keyframe_codec);
     decoder.setReusePreviousFrameBorders(kReusePreviousFrameBorders);
     std::vector<u_char> current_jpeg;
