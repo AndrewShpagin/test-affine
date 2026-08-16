@@ -381,45 +381,42 @@ bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
 }
 
 bool encodeJpeg2000Bounded(const cv::Mat& image, int requested_bytes,
+                           double& compression_rate_state, int& model_channels,
                            std::vector<u_char>& encoded, cv::Size& encoded_size,
                            int& compression_x1000) {
     const cv::Mat source = jpegInput8(image);
     if (source.empty()) return false;
 
+    const int channels = source.channels();
+    if (model_channels != channels) {
+        model_channels = channels;
+        compression_rate_state = 0.0;
+    }
+
     encoded_size = source.size();
     const double requested = static_cast<double>(std::max(1, requested_bytes));
-    const double lower_bytes = requested * (1.0 - kJpegSizeTolerance);
-    const double upper_bytes = requested * (1.0 + kJpegSizeTolerance);
     const double target_bytes = std::max(1.0, requested * kJpegTargetFill);
     const double raw_bytes = std::max(1.0,
         static_cast<double>(source.total()) * source.elemSize());
 
-    int current_rate = std::clamp(
-        static_cast<int>(std::lround(1000.0 * target_bytes / raw_bytes)),
+    const int current_rate = compression_rate_state > 0.0
+        ? std::clamp(static_cast<int>(std::lround(compression_rate_state)),
+                     kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000)
+        : std::clamp(static_cast<int>(std::lround(1000.0 * target_bytes / raw_bytes)),
+                     kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000);
+
+    if (!encodeJpeg2000AtRate(source, current_rate, encoded)) return false;
+    if (encoded.empty() || encoded.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+
+    const double current_bytes = static_cast<double>(encoded.size());
+    const double correction = std::clamp(target_bytes / current_bytes, 0.5, 2.0);
+    const int next_rate = std::clamp(
+        static_cast<int>(std::lround(current_rate * correction)),
         kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000);
-    std::vector<u_char> current;
 
-    for (int pass = 0; pass < kJpegMaxEncodePasses; ++pass) {
-        current.clear();
-        if (!encodeJpeg2000AtRate(source, current_rate, current)) return false;
-        if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
-
-        const double current_bytes = static_cast<double>(current.size());
-        if ((current_bytes >= lower_bytes && current_bytes <= upper_bytes) ||
-            pass + 1 >= kJpegMaxEncodePasses) break;
-
-        int next_rate = std::clamp(
-            static_cast<int>(std::lround(current_rate * target_bytes / current_bytes)),
-            kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000);
-        if (current_bytes > upper_bytes && next_rate >= current_rate)
-            next_rate = std::max(kJpeg2000MinCompressionX1000, current_rate - 1);
-        if (current_bytes < lower_bytes && next_rate <= current_rate)
-            next_rate = std::min(kJpeg2000MaxCompressionX1000, current_rate + 1);
-        if (next_rate == current_rate) break;
-        current_rate = next_rate;
-    }
-
-    encoded = std::move(current);
+    // Use exactly one JPEG2000 encode for this image. The measured size only
+    // updates the rate predictor for the next keyframe.
+    compression_rate_state = static_cast<double>(next_rate);
     compression_x1000 = current_rate;
     return true;
 }
@@ -446,7 +443,7 @@ bool encodeKeyframeBounded(KeyframeCodec codec, const cv::Mat& image,
             bytes_per_pixel_model, model_channels, encoded, encoded_size);
     }
     return encodeJpeg2000Bounded(image, requested_bytes,
-        encoded, encoded_size, codec_parameter);
+        bytes_per_pixel_model, model_channels, encoded, encoded_size, codec_parameter);
 }
 
 bool mosaicEligible(const cv::Size& size) {
@@ -1140,7 +1137,7 @@ void Decoder::pushData(const std::vector<u_char>& data){
             layer.bytes.resize(jpeg_bytes);layer.received.assign(chunk_count,0);
         }else if(layer.jpeg_size!=cv::Size(jw,jh)||layer.jpeg_bytes!=jpeg_bytes||layer.chunk_count!=chunk_count)return;
         if(!layer.received[chunk_index]){
-            std::copy(data.begin()+h.header_bytes,data.end(),layer.bytes.begin()+chunk_offset);
+            std::copy(data.begin()+h.header_bytes,data.end(),pending_mosaic_.layers[layer_index].bytes.begin()+chunk_offset);
             layer.received[chunk_index]=1;++layer.received_count;
         }
         if(!layer.complete&&layer.received_count==layer.chunk_count){
