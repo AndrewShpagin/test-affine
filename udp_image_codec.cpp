@@ -36,6 +36,8 @@ constexpr int kFeaturesPerCell = 4;
 constexpr int kFeatureCandidateMultiplier = 4;
 constexpr int kFeatureDetectorMaxSide = 256;
 constexpr int kJpegQuality = 85;
+constexpr int kJpeg2000MinCompressionX1000 = 1;
+constexpr int kJpeg2000MaxCompressionX1000 = 1000;
 constexpr double kJpegTargetFill = 0.95;
 constexpr double kJpegSizeTolerance = 0.20;
 constexpr int kJpegMaxEncodePasses = 3;
@@ -294,6 +296,21 @@ bool encodeJpegAtSize(const cv::Mat& source, const cv::Size& size,
     return cv::imencode(".jpg", small, jpeg, {cv::IMWRITE_JPEG_QUALITY, kJpegQuality});
 }
 
+bool encodeJpeg2000AtRate(const cv::Mat& source, int compression_x1000,
+                          std::vector<u_char>& encoded) {
+    const cv::Mat input = jpegInput8(source);
+    if (input.empty()) return false;
+    compression_x1000 = std::clamp(compression_x1000,
+        kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000);
+    try {
+        return cv::imencode(".jp2", input, encoded,
+            {cv::IMWRITE_JPEG2000_COMPRESSION_X1000, compression_x1000});
+    } catch (const cv::Exception&) {
+        encoded.clear();
+        return false;
+    }
+}
+
 bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
                        double& bytes_per_pixel_model, int& model_channels,
                        std::vector<u_char>& jpeg, cv::Size& encoded_size) {
@@ -361,6 +378,75 @@ bool encodeJpegBounded(const cv::Mat& image, int requested_jpeg_bytes,
         }
     }
     return true;
+}
+
+bool encodeJpeg2000Bounded(const cv::Mat& image, int requested_bytes,
+                           std::vector<u_char>& encoded, cv::Size& encoded_size,
+                           int& compression_x1000) {
+    const cv::Mat source = jpegInput8(image);
+    if (source.empty()) return false;
+
+    encoded_size = source.size();
+    const double requested = static_cast<double>(std::max(1, requested_bytes));
+    const double lower_bytes = requested * (1.0 - kJpegSizeTolerance);
+    const double upper_bytes = requested * (1.0 + kJpegSizeTolerance);
+    const double target_bytes = std::max(1.0, requested * kJpegTargetFill);
+    const double raw_bytes = std::max(1.0,
+        static_cast<double>(source.total()) * source.elemSize());
+
+    int current_rate = std::clamp(
+        static_cast<int>(std::lround(1000.0 * target_bytes / raw_bytes)),
+        kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000);
+    std::vector<u_char> current;
+
+    for (int pass = 0; pass < kJpegMaxEncodePasses; ++pass) {
+        current.clear();
+        if (!encodeJpeg2000AtRate(source, current_rate, current)) return false;
+        if (current.empty() || current.size() > std::numeric_limits<std::uint32_t>::max()) return false;
+
+        const double current_bytes = static_cast<double>(current.size());
+        if ((current_bytes >= lower_bytes && current_bytes <= upper_bytes) ||
+            pass + 1 >= kJpegMaxEncodePasses) break;
+
+        int next_rate = std::clamp(
+            static_cast<int>(std::lround(current_rate * target_bytes / current_bytes)),
+            kJpeg2000MinCompressionX1000, kJpeg2000MaxCompressionX1000);
+        if (current_bytes > upper_bytes && next_rate >= current_rate)
+            next_rate = std::max(kJpeg2000MinCompressionX1000, current_rate - 1);
+        if (current_bytes < lower_bytes && next_rate <= current_rate)
+            next_rate = std::min(kJpeg2000MaxCompressionX1000, current_rate + 1);
+        if (next_rate == current_rate) break;
+        current_rate = next_rate;
+    }
+
+    encoded = std::move(current);
+    compression_x1000 = current_rate;
+    return true;
+}
+
+bool encodeKeyframeAtSettings(KeyframeCodec codec, const cv::Mat& source,
+                              const cv::Size& size, int codec_parameter,
+                              std::vector<u_char>& encoded) {
+    if (codec == KeyframeCodec::Jpeg)
+        return encodeJpegAtSize(source, size, encoded);
+
+    cv::Mat small;
+    if (source.size() == size) small = source;
+    else cv::resize(source, small, size, 0.0, 0.0, cv::INTER_AREA);
+    return encodeJpeg2000AtRate(small, codec_parameter, encoded);
+}
+
+bool encodeKeyframeBounded(KeyframeCodec codec, const cv::Mat& image,
+                           int requested_bytes, double& bytes_per_pixel_model,
+                           int& model_channels, std::vector<u_char>& encoded,
+                           cv::Size& encoded_size, int& codec_parameter) {
+    if (codec == KeyframeCodec::Jpeg) {
+        codec_parameter = kJpegQuality;
+        return encodeJpegBounded(image, requested_bytes,
+            bytes_per_pixel_model, model_channels, encoded, encoded_size);
+    }
+    return encodeJpeg2000Bounded(image, requested_bytes,
+        encoded, encoded_size, codec_parameter);
 }
 
 bool mosaicEligible(const cv::Size& size) {
@@ -605,19 +691,21 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
     if (!buildMosaicLayers(image, layers)) return false;
 
     last_timing_.keyframe = true;
+    last_timing_.keyframe_codec = keyframe_codec_;
     std::array<std::vector<u_char>, 3> jpegs;
     cv::Size jpeg_size;
+    int codec_parameter = 0;
     const int layer_target = std::max(1, desired_jpeg_size / static_cast<int>(kMosaicLayerCount));
 
     auto stage = ProfileClock::now();
-    if (!encodeJpegBounded(layers[0], layer_target,
-                           mosaic_jpeg_bytes_per_pixel_, mosaic_jpeg_model_channels_,
-                           jpegs[0], jpeg_size)) {
+    if (!encodeKeyframeBounded(keyframe_codec_, layers[0], layer_target,
+                               mosaic_jpeg_bytes_per_pixel_, mosaic_jpeg_model_channels_,
+                               jpegs[0], jpeg_size, codec_parameter)) {
         last_timing_.jpeg_ms += profileMs(stage);
         return false;
     }
-    if (!encodeJpegAtSize(layers[1], jpeg_size, jpegs[1]) ||
-        !encodeJpegAtSize(layers[2], jpeg_size, jpegs[2])) {
+    if (!encodeKeyframeAtSettings(keyframe_codec_, layers[1], jpeg_size, codec_parameter, jpegs[1]) ||
+        !encodeKeyframeAtSettings(keyframe_codec_, layers[2], jpeg_size, codec_parameter, jpegs[2])) {
         last_timing_.jpeg_ms += profileMs(stage);
         return false;
     }
@@ -628,7 +716,9 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
 
     last_timing_.mosaic_keyframe = true;
     last_timing_.jpeg_size = jpeg_size;
-    last_timing_.jpeg_quality = kJpegQuality;
+    last_timing_.jpeg_quality = keyframe_codec_ == KeyframeCodec::Jpeg ? kJpegQuality : 0;
+    last_timing_.jpeg2000_compression_x1000 =
+        keyframe_codec_ == KeyframeCodec::Jpeg2000 ? codec_parameter : 0;
     for (std::size_t i = 0; i < jpegs.size(); ++i)
         last_timing_.jpeg_layer_bytes[i] = jpegs[i].size();
 
@@ -671,16 +761,21 @@ bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
     }
 
     last_timing_.keyframe = true;
+    last_timing_.keyframe_codec = keyframe_codec_;
     std::vector<u_char> jpeg; cv::Size jpeg_size;
+    int codec_parameter = 0;
 
     auto stage = ProfileClock::now();
-    const bool jpeg_ok = encodeJpegBounded(
-        image, desired_jpeg_size, jpeg_bytes_per_pixel_, jpeg_model_channels_, jpeg, jpeg_size);
+    const bool jpeg_ok = encodeKeyframeBounded(
+        keyframe_codec_, image, desired_jpeg_size,
+        jpeg_bytes_per_pixel_, jpeg_model_channels_, jpeg, jpeg_size, codec_parameter);
     last_timing_.jpeg_ms += profileMs(stage);
     if (!jpeg_ok) return false;
     last_timing_.jpeg_layer_bytes[0] = jpeg.size();
     last_timing_.jpeg_size = jpeg_size;
-    last_timing_.jpeg_quality = kJpegQuality;
+    last_timing_.jpeg_quality = keyframe_codec_ == KeyframeCodec::Jpeg ? kJpegQuality : 0;
+    last_timing_.jpeg2000_compression_x1000 =
+        keyframe_codec_ == KeyframeCodec::Jpeg2000 ? codec_parameter : 0;
 
     const std::size_t count_size = (jpeg.size() + kKeyframeChunkPayloadBytes - 1) / kKeyframeChunkPayloadBytes;
     if (count_size == 0 || count_size > std::numeric_limits<std::uint16_t>::max()) return false;
@@ -781,6 +876,7 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
 
 void Encoder::pushImage(cv::Mat& image, int desired_jpeg_size, int keyframe_once_in_N) {
     last_timing_ = EncoderTiming{};
+    last_timing_.keyframe_codec = keyframe_codec_;
     if (image.empty()) return;
     if (image.cols > std::numeric_limits<std::uint16_t>::max() ||
         image.rows > std::numeric_limits<std::uint16_t>::max()) return;
@@ -888,7 +984,9 @@ bool Decoder::decodeMosaicLayer(std::uint8_t layer_index) {
     if (layer.bytes.empty() || layer.received_count != layer.chunk_count) return false;
 
     cv::Mat encoded(1, static_cast<int>(layer.bytes.size()), CV_8U, layer.bytes.data());
+    const auto decode_start = ProfileClock::now();
     cv::Mat decoded = cv::imdecode(encoded, cv::IMREAD_UNCHANGED);
+    pending_mosaic_.image_decode_ms += profileMs(decode_start);
     if (decoded.empty() || decoded.size() != layer.jpeg_size) return false;
     layer.decoded = decoded;
     layer.complete = true;
@@ -962,6 +1060,7 @@ bool Decoder::rebuildMosaicKeyframe() {
     have_keyframe_ = true;
     current_jpeg_.clear();
     decoded_keyframe_ = reconstructed;
+    last_keyframe_image_decode_ms_ = pending_mosaic_.image_decode_ms;
     keyframe_changed_ = true;
     previous_render_.release();
 
@@ -1006,7 +1105,7 @@ void Decoder::pushData(const std::vector<u_char>& data){
         }
         if(pending_keyframe_.received_count==pending_keyframe_.chunk_count){
             current_jpeg_=std::move(pending_keyframe_.bytes);original_size_=pending_keyframe_.original_size;keyframe_id_=pending_keyframe_.frame_id;
-            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();previous_render_.release();patch_queue_.clear();
+            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();previous_render_.release();patch_queue_.clear();last_keyframe_image_decode_ms_=0.0;
             while(!pending_patch_queue_.empty()){patch_queue_.push_back(std::move(pending_patch_queue_.front()));pending_patch_queue_.pop_front();}
             pending_keyframe_=KeyframeAssembly{};pending_mosaic_=MosaicAssembly{};
         }
@@ -1089,7 +1188,10 @@ cv::Mat Decoder::getDecodedKeyframe(const std::vector<u_char>& jpeg_data){
     if(!have_keyframe_||original_size_.width<=0||original_size_.height<=0)return cv::Mat();
     if(!decoded_keyframe_.empty())return decoded_keyframe_;
     const std::vector<u_char>& bytes=jpeg_data.empty()?current_jpeg_:jpeg_data;if(bytes.empty())return cv::Mat();
-    cv::Mat encoded(1,static_cast<int>(bytes.size()),CV_8U,const_cast<u_char*>(bytes.data()));cv::Mat decoded=cv::imdecode(encoded,cv::IMREAD_UNCHANGED);
+    cv::Mat encoded(1,static_cast<int>(bytes.size()),CV_8U,const_cast<u_char*>(bytes.data()));
+    const auto decode_start=ProfileClock::now();
+    cv::Mat decoded=cv::imdecode(encoded,cv::IMREAD_UNCHANGED);
+    last_keyframe_image_decode_ms_=profileMs(decode_start);
     if(decoded.empty())return cv::Mat();if(decoded.size()!=original_size_)cv::resize(decoded,decoded,original_size_,0,0,cv::INTER_LINEAR);decoded_keyframe_=decoded;return decoded_keyframe_;
 }
 
