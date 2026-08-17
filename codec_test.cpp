@@ -26,6 +26,7 @@ constexpr bool kReusePreviousFrameBorders = true;
 constexpr bool kMosaicKeyframes = false;
 constexpr bool kStripsKeyframes = true;
 constexpr bool kUseJpeg2000 = false;
+constexpr bool kUseHomographyTransform = true;
 constexpr bool kUseMeshTransform = false;
 static_assert(!(kMosaicKeyframes && kStripsKeyframes),
               "MOSAIC and STRIPS keyframes are mutually exclusive");
@@ -40,7 +41,7 @@ static double profiledEncoderMs(const EncoderTiming& t) {
     return t.prep_ms + t.color_norm_ms + t.jpeg_ms + t.chunk_ms +
            t.features_ms + t.ref_pyramid_ms + t.cur_pyramid_ms +
            t.predictor_ms + t.lk_forward_ms + t.lk_backward_ms +
-           t.affine_ms + t.mesh_ms + t.serialize_ms;
+           t.affine_ms + t.homography_ms + t.mesh_ms + t.serialize_ms;
 }
 
 static void addEncoderTiming(EncoderTiming& sum, const EncoderTiming& t) {
@@ -59,6 +60,7 @@ static void addEncoderTiming(EncoderTiming& sum, const EncoderTiming& t) {
     sum.lk_forward_ms += t.lk_forward_ms;
     sum.lk_backward_ms += t.lk_backward_ms;
     sum.affine_ms += t.affine_ms;
+    sum.homography_ms += t.homography_ms;
     sum.mesh_ms += t.mesh_ms;
     sum.serialize_ms += t.serialize_ms;
 }
@@ -82,6 +84,7 @@ static EncoderTiming divideEncoderTiming(const EncoderTiming& sum, double n, boo
     t.lk_forward_ms = sum.lk_forward_ms / n;
     t.lk_backward_ms = sum.lk_backward_ms / n;
     t.affine_ms = sum.affine_ms / n;
+    t.homography_ms = sum.homography_ms / n;
     t.mesh_ms = sum.mesh_ms / n;
     t.serialize_ms = sum.serialize_ms / n;
     return t;
@@ -102,7 +105,8 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
                   << " bucket=" << t.feature_bucket_ms << ")"
                   << " refPyr=" << t.ref_pyramid_ms;
         const double fallback_patch = t.cur_pyramid_ms + t.predictor_ms + t.lk_forward_ms +
-                                      t.lk_backward_ms + t.affine_ms + t.mesh_ms + t.serialize_ms;
+                                      t.lk_backward_ms + t.affine_ms + t.homography_ms +
+                                      t.mesh_ms + t.serialize_ms;
         if (fallback_patch > 0.01)
             std::cout << " fallbackPatch=" << fallback_patch;
     } else {
@@ -112,6 +116,7 @@ static void printEncoderTiming(const EncoderTiming& t, double total_ms,
                   << " LKf=" << t.lk_forward_ms
                   << " LKb=" << t.lk_backward_ms
                   << " affine=" << t.affine_ms
+                  << " H=" << t.homography_ms
                   << " mesh=" << t.mesh_ms
                   << " ser=" << t.serialize_ms;
         if (t.predictor_used) std::cout << " predictor=yes";
@@ -262,6 +267,7 @@ int main(int argc, char** argv) {
               << "Keyframe codec: " << keyframeCodecName(keyframe_codec) << '\n'
               << "MOSAIC keyframes: " << (kMosaicKeyframes ? "yes" : "no") << '\n'
               << "STRIPS keyframes: " << (kStripsKeyframes ? "yes" : "no") << '\n'
+              << "Homography transform: " << (kUseHomographyTransform ? "yes" : "no") << '\n'
               << "Mesh transform: " << (kUseMeshTransform ? "yes" : "no") << '\n'
               << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
               << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
@@ -272,6 +278,7 @@ int main(int argc, char** argv) {
     encoder.setMosaicKeyframes(kMosaicKeyframes);
     encoder.setStripsKeyframes(kStripsKeyframes);
     encoder.setKeyframeCodec(keyframe_codec);
+    encoder.setHomographyTransform(kUseHomographyTransform);
     decoder.setReusePreviousFrameBorders(kReusePreviousFrameBorders);
     std::vector<u_char> current_jpeg;
     std::size_t total_bytes = 0, total_packets = 0, timed_frames = 0;
