@@ -26,6 +26,7 @@ constexpr bool kReusePreviousFrameBorders = true;
 constexpr bool kMosaicKeyframes = false;
 constexpr bool kStripsKeyframes = true;
 constexpr bool kUseJpeg2000 = false;
+constexpr bool kUseMeshTransform = false;
 static_assert(!(kMosaicKeyframes && kStripsKeyframes),
               "MOSAIC and STRIPS keyframes are mutually exclusive");
 constexpr KeyframeCodec kDefaultKeyframeCodec =
@@ -261,6 +262,7 @@ int main(int argc, char** argv) {
               << "Keyframe codec: " << keyframeCodecName(keyframe_codec) << '\n'
               << "MOSAIC keyframes: " << (kMosaicKeyframes ? "yes" : "no") << '\n'
               << "STRIPS keyframes: " << (kStripsKeyframes ? "yes" : "no") << '\n'
+              << "Mesh transform: " << (kUseMeshTransform ? "yes" : "no") << '\n'
               << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
               << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
               << "Number of images: " << files.size() << "\n\n";
@@ -326,6 +328,8 @@ int main(int argc, char** argv) {
 
             std::vector<PatchData> patch;
             while (decoder.getNextPatch(patch)) {
+                if (!kUseMeshTransform && !patch.empty())
+                    std::fill(patch.back().mesh.begin(), patch.back().mesh.end(), cv::Point2f(0.0f, 0.0f));
                 decoder.render(decoded, patch, current_jpeg);
                 produced_frame = !decoded.empty();
                 was_keyframe = false;
