@@ -23,6 +23,8 @@ struct PatchData {
     std::uint8_t grid_x = 0;
     std::uint8_t grid_y = 0;
     std::array<float, 6> affine{};
+    bool homography = false;
+    std::array<float, 2> perspective{};
     std::vector<cv::Point2f> mesh;
 };
 
@@ -57,6 +59,7 @@ struct EncoderTiming {
     double lk_forward_ms = 0.0;
     double lk_backward_ms = 0.0;
     double affine_ms = 0.0;
+    double homography_ms = 0.0;
     double mesh_ms = 0.0;
     double serialize_ms = 0.0;
 };
@@ -79,6 +82,8 @@ public:
     bool stripsKeyframes() const { return strips_keyframes_; }
     void setKeyframeCodec(KeyframeCodec codec) { keyframe_codec_ = codec; }
     KeyframeCodec keyframeCodec() const { return keyframe_codec_; }
+    void setHomographyTransform(bool enabled) { homography_transform_ = enabled; }
+    bool homographyTransform() const { return homography_transform_; }
 private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
@@ -108,6 +113,7 @@ private:
     KeyframeCodec keyframe_codec_ = KeyframeCodec::Jpeg;
     bool mosaic_keyframes_ = false;
     bool strips_keyframes_ = false;
+    bool homography_transform_ = false;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
     int frames_since_keyframe_ = 0;
