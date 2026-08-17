@@ -192,6 +192,55 @@ static double colorMae(const cv::Mat& a, const cv::Mat& b) {
     return sum / a.channels();
 }
 
+static cv::Point2f applyPatchBaseTransform(const PatchData& patch, const cv::Point2f& p) {
+    const float nx = patch.affine[0] * p.x + patch.affine[1] * p.y + patch.affine[2];
+    const float ny = patch.affine[3] * p.x + patch.affine[4] * p.y + patch.affine[5];
+    if (!patch.homography) return cv::Point2f(nx, ny);
+    const float d = patch.perspective[0] * p.x + patch.perspective[1] * p.y + 1.0f;
+    if (std::abs(d) < 1e-6f) return cv::Point2f(nx, ny);
+    return cv::Point2f(nx / d, ny / d);
+}
+
+static cv::Point2f samplePatchMesh(const PatchData& patch, const cv::Point2f& p) {
+    if (patch.grid_x < 2 || patch.grid_y < 2 ||
+        patch.original_size.width < 2 || patch.original_size.height < 2 ||
+        patch.mesh.size() != static_cast<std::size_t>(patch.grid_x) * patch.grid_y)
+        return cv::Point2f(0.0f, 0.0f);
+
+    const float gx = std::clamp(
+        p.x * static_cast<float>(patch.grid_x - 1) / static_cast<float>(patch.original_size.width - 1),
+        0.0f, static_cast<float>(patch.grid_x - 1));
+    const float gy = std::clamp(
+        p.y * static_cast<float>(patch.grid_y - 1) / static_cast<float>(patch.original_size.height - 1),
+        0.0f, static_cast<float>(patch.grid_y - 1));
+    const int x0 = static_cast<int>(gx);
+    const int y0 = static_cast<int>(gy);
+    const int x1 = std::min(x0 + 1, static_cast<int>(patch.grid_x) - 1);
+    const int y1 = std::min(y0 + 1, static_cast<int>(patch.grid_y) - 1);
+    const float tx = gx - x0;
+    const float ty = gy - y0;
+
+    const cv::Point2f& d00 = patch.mesh[y0 * patch.grid_x + x0];
+    const cv::Point2f& d10 = patch.mesh[y0 * patch.grid_x + x1];
+    const cv::Point2f& d01 = patch.mesh[y1 * patch.grid_x + x0];
+    const cv::Point2f& d11 = patch.mesh[y1 * patch.grid_x + x1];
+    const cv::Point2f d0 = d00 * (1.0f - tx) + d10 * tx;
+    const cv::Point2f d1 = d01 * (1.0f - tx) + d11 * tx;
+    return d0 * (1.0f - ty) + d1 * ty;
+}
+
+static cv::Point2f applyPatchDebugTransform(const PatchData& patch,
+                                             const cv::Point2f& p,
+                                             bool use_mesh_transform) {
+    const cv::Point2f q = applyPatchBaseTransform(patch, p);
+    if (!use_mesh_transform) return q;
+
+    cv::Point2f predicted = q;
+    for (int iter = 0; iter < 2; ++iter)
+        predicted = q + samplePatchMesh(patch, predicted);
+    return predicted;
+}
+
 static cv::Mat addLabel(const cv::Mat& image, const std::string& title,
                         const std::string& info) {
     cv::Mat out = image.clone();
@@ -205,13 +254,25 @@ static cv::Mat addLabel(const cv::Mat& image, const std::string& title,
     return out;
 }
 
-static cv::Mat makeLkPanel(const LKDebugData& debug) {
+static cv::Mat makeLkPanel(const LKDebugData& debug,
+                           const PatchData* transform_patch,
+                           bool use_mesh_transform) {
     cv::Mat out;
     if (debug.image.empty()) return out;
     if (debug.image.channels() == 1) cv::cvtColor(debug.image, out, cv::COLOR_GRAY2BGR);
     else out = debug.image.clone();
 
     const std::size_t count = std::min(debug.from.size(), debug.to.size());
+
+    // Draw model predictions first so yellow/red LK points stay visible on top.
+    if (transform_patch) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const cv::Point2f predicted =
+                applyPatchDebugTransform(*transform_patch, debug.from[i], use_mesh_transform);
+            cv::circle(out, predicted, 3, cv::Scalar(0, 165, 255), cv::FILLED, cv::LINE_AA);
+        }
+    }
+
     for (std::size_t i = 0; i < count; ++i) {
         const cv::Point2f a = debug.from[i];
         const cv::Point2f b = debug.to[i];
@@ -308,6 +369,8 @@ int main(int argc, char** argv) {
         std::size_t frame_bytes = 0, frame_packets = 0;
         double dec_ms = 0.0;
         double frame_codec_decode_ms = 0.0;
+        PatchData frame_transform_patch;
+        bool have_frame_transform_patch = false;
 
         std::vector<u_char> chunk;
         while (encoder.getNextChunk(chunk)) {
@@ -335,6 +398,10 @@ int main(int argc, char** argv) {
 
             std::vector<PatchData> patch;
             while (decoder.getNextPatch(patch)) {
+                if (!patch.empty()) {
+                    frame_transform_patch = patch.back();
+                    have_frame_transform_patch = true;
+                }
                 if (!kUseMeshTransform && !patch.empty())
                     std::fill(patch.back().mesh.begin(), patch.back().mesh.end(), cv::Point2f(0.0f, 0.0f));
                 decoder.render(decoded, patch, current_jpeg);
@@ -386,7 +453,9 @@ int main(int argc, char** argv) {
         cv::Mat side;
 
         if (have_lk_debug && !lk_debug.image.empty()) {
-            cv::Mat lk = makeLkPanel(lk_debug);
+            const PatchData* transform_patch =
+                have_frame_transform_patch ? &frame_transform_patch : nullptr;
+            cv::Mat lk = makeLkPanel(lk_debug, transform_patch, kUseMeshTransform);
             if (lk.size() != original.size()) cv::resize(lk, lk, original.size(), 0.0, 0.0, cv::INTER_NEAREST);
             cv::Scalar lk_mean, lk_stddev;
             cv::meanStdDev(lk_debug.image, lk_mean, lk_stddev);
