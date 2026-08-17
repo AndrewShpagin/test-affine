@@ -176,6 +176,21 @@ static std::vector<fs::path> listImages(const fs::path& dir) {
     return files;
 }
 
+static std::size_t removeImages(const fs::path& dir) {
+    std::size_t removed = 0;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (!e.is_regular_file() || !isImageFile(e.path())) continue;
+        std::error_code ec;
+        if (fs::remove(e.path(), ec)) {
+            ++removed;
+        } else if (ec) {
+            std::cerr << "WARNING: cannot remove old debug image "
+                      << e.path() << ": " << ec.message() << '\n';
+        }
+    }
+    return removed;
+}
+
 static double colorMae(const cv::Mat& a, const cv::Mat& b) {
     if (a.empty() || b.empty() || a.size() != b.size() || a.type() != b.type()) return 0.0;
     cv::Mat diff;
@@ -253,9 +268,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     fs::create_directories(output_dir);
+    if (fs::equivalent(input_dir, output_dir)) {
+        std::cerr << "Refusing to clear output images because output folder equals input folder: "
+                  << output_dir << '\n';
+        return 5;
+    }
+    const std::size_t removed_output_images = removeImages(output_dir);
 
     std::cout << "Input folder: " << input_dir << '\n'
               << "Output folder: " << output_dir << '\n'
+              << "Removed previous debug images: " << removed_output_images << '\n'
               << "Target keyframe bytes: " << keyframe_bytes << '\n'
               << "Keyframe period: " << key_period << '\n'
               << "Keyframe codec: " << keyframeCodecName(keyframe_codec) << '\n'
