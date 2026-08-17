@@ -54,7 +54,8 @@ const cv::Size kLkWindow(13, 13);
 constexpr int kLkMaxLevel = 3;
 constexpr float kLkForwardErrorMax = 35.0f;
 constexpr float kLkBackwardErrorMax = 1.5f;
-constexpr float kResidualMax = 10.0f;
+constexpr double kAffineHuberPixels = 3.0;
+constexpr int kAffineIterations = 5;
 constexpr double kHomographyHuberPixels = 3.0;
 constexpr double kHomographyMaxDenominatorVariation = 0.08;
 constexpr int kHomographyIterations = 5;
@@ -240,10 +241,88 @@ std::vector<cv::Point2f> selectGridFeatures(const cv::Mat& gray, EncoderTiming& 
     return points;
 }
 
-cv::Point2f applyAffine(const cv::Mat& affine, const cv::Point2f& p) {
-    return cv::Point2f(
-        static_cast<float>(affine.at<double>(0,0)*p.x + affine.at<double>(0,1)*p.y + affine.at<double>(0,2)),
-        static_cast<float>(affine.at<double>(1,0)*p.x + affine.at<double>(1,1)*p.y + affine.at<double>(1,2)));
+double huberWeight(double error_pixels, double delta_pixels) {
+    if (error_pixels <= delta_pixels || error_pixels <= 1e-12) return 1.0;
+    return delta_pixels / error_pixels;
+}
+
+bool solveWeightedAffineNormalized(const std::vector<cv::Point2f>& p0,
+                                   const std::vector<cv::Point2f>& p1,
+                                   const std::vector<double>& weights,
+                                   double cx, double cy, double scale,
+                                   std::array<double, 6>& a) {
+    if (p0.size() != p1.size() || p0.size() < 3 || weights.size() != p0.size()) return false;
+
+    cv::Mat ata = cv::Mat::zeros(3, 3, CV_64F);
+    cv::Mat atbu = cv::Mat::zeros(3, 1, CV_64F);
+    cv::Mat atbv = cv::Mat::zeros(3, 1, CV_64F);
+
+    for (std::size_t i = 0; i < p0.size(); ++i) {
+        const double w = std::max(1e-6, weights[i]);
+        const double x = (p0[i].x - cx) / scale;
+        const double y = (p0[i].y - cy) / scale;
+        const double u = (p1[i].x - cx) / scale;
+        const double v = (p1[i].y - cy) / scale;
+        const double r[3] = {x, y, 1.0};
+
+        for (int row = 0; row < 3; ++row) {
+            atbu.at<double>(row, 0) += w * r[row] * u;
+            atbv.at<double>(row, 0) += w * r[row] * v;
+            for (int col = 0; col < 3; ++col)
+                ata.at<double>(row, col) += w * r[row] * r[col];
+        }
+    }
+    for (int k = 0; k < 3; ++k) ata.at<double>(k, k) += 1e-9;
+
+    cv::Mat xu, xv;
+    bool ok_u = cv::solve(ata, atbu, xu, cv::DECOMP_CHOLESKY);
+    bool ok_v = cv::solve(ata, atbv, xv, cv::DECOMP_CHOLESKY);
+    if (!ok_u) ok_u = cv::solve(ata, atbu, xu, cv::DECOMP_SVD);
+    if (!ok_v) ok_v = cv::solve(ata, atbv, xv, cv::DECOMP_SVD);
+    if (!ok_u || !ok_v) return false;
+
+    a = {xu.at<double>(0,0), xu.at<double>(1,0), xu.at<double>(2,0),
+         xv.at<double>(0,0), xv.at<double>(1,0), xv.at<double>(2,0)};
+    for (double v : a) if (!std::isfinite(v)) return false;
+    return true;
+}
+
+bool fitRobustFullAffine(const std::vector<cv::Point2f>& p0,
+                         const std::vector<cv::Point2f>& p1,
+                         const cv::Size& size,
+                         cv::Mat& affine) {
+    if (p0.size() != p1.size() || p0.size() < 3) return false;
+
+    const double scale = std::max(1.0, static_cast<double>(std::max(size.width, size.height)));
+    const double cx = 0.5 * std::max(0, size.width - 1);
+    const double cy = 0.5 * std::max(0, size.height - 1);
+    std::vector<double> weights(p0.size(), 1.0);
+    std::array<double, 6> a{};
+
+    for (int iter = 0; iter < kAffineIterations; ++iter) {
+        if (!solveWeightedAffineNormalized(p0, p1, weights, cx, cy, scale, a)) return false;
+        double max_weight_change = 0.0;
+        for (std::size_t i = 0; i < p0.size(); ++i) {
+            const double x = (p0[i].x - cx) / scale;
+            const double y = (p0[i].y - cy) / scale;
+            const double u = a[0] * x + a[1] * y + a[2];
+            const double v = a[3] * x + a[4] * y + a[5];
+            const double uo = (p1[i].x - cx) / scale;
+            const double vo = (p1[i].y - cy) / scale;
+            const double dx = (uo - u) * scale;
+            const double dy = (vo - v) * scale;
+            const double next_weight = huberWeight(std::sqrt(dx * dx + dy * dy), kAffineHuberPixels);
+            max_weight_change = std::max(max_weight_change, std::abs(next_weight - weights[i]));
+            weights[i] = next_weight;
+        }
+        if (max_weight_change < 1e-3) break;
+    }
+    if (!solveWeightedAffineNormalized(p0, p1, weights, cx, cy, scale, a)) return false;
+
+    const double tx = cx - a[0] * cx - a[1] * cy + scale * a[2];
+    const double ty = cy - a[3] * cx - a[4] * cy + scale * a[5];
+    affine = (cv::Mat_<double>(2,3) << a[0], a[1], tx, a[3], a[4], ty);
+    return cv::checkRange(affine);
 }
 
 cv::Point2f applyPatchBaseTransform(const PatchData& patch, const cv::Point2f& p) {
@@ -258,12 +337,10 @@ cv::Point2f applyPatchBaseTransform(const PatchData& patch, const cv::Point2f& p
 double homographyError(const std::array<double, 8>& h,
                        const std::vector<cv::Point2f>& p0,
                        const std::vector<cv::Point2f>& p1,
-                       const unsigned char* inliers,
                        double cx, double cy, double scale) {
-    double sse = 0.0;
+    double cost = 0.0;
     std::size_t count = 0;
     for (std::size_t i = 0; i < p0.size(); ++i) {
-        if (inliers && !inliers[i]) continue;
         const double x = (p0[i].x - cx) / scale;
         const double y = (p0[i].y - cy) / scale;
         const double uo = (p1[i].x - cx) / scale;
@@ -274,10 +351,13 @@ double homographyError(const std::array<double, 8>& h,
         const double v = (h[3] * x + h[4] * y + h[5]) / d;
         const double dx = (uo - u) * scale;
         const double dy = (vo - v) * scale;
-        sse += dx * dx + dy * dy;
+        const double e = std::sqrt(dx * dx + dy * dy);
+        cost += e <= kHomographyHuberPixels
+            ? 0.5 * e * e
+            : kHomographyHuberPixels * (e - 0.5 * kHomographyHuberPixels);
         ++count;
     }
-    return count ? sse / static_cast<double>(count) : std::numeric_limits<double>::infinity();
+    return count ? cost / static_cast<double>(count) : std::numeric_limits<double>::infinity();
 }
 
 void clampHomographyPerspective(std::array<double, 8>& h, const cv::Size& size,
@@ -294,17 +374,11 @@ void clampHomographyPerspective(std::array<double, 8>& h, const cv::Size& size,
 
 bool refineHomographyFromAffine(const std::vector<cv::Point2f>& p0,
                                 const std::vector<cv::Point2f>& p1,
-                                const cv::Mat& inliers,
                                 const cv::Mat& affine,
                                 const cv::Size& size,
                                 std::array<float, 6>& numerator,
                                 std::array<float, 2>& perspective) {
     if (p0.size() != p1.size() || p0.size() < 8 || affine.empty()) return false;
-    const unsigned char* ip = inliers.empty() ? nullptr : inliers.ptr<unsigned char>();
-    std::size_t inlier_count = 0;
-    for (std::size_t i = 0; i < p0.size(); ++i)
-        if (!ip || ip[i]) ++inlier_count;
-    if (inlier_count < 8) return false;
 
     const double scale = std::max(1.0, static_cast<double>(std::max(size.width, size.height)));
     const double cx = 0.5 * std::max(0, size.width - 1);
@@ -318,7 +392,7 @@ bool refineHomographyFromAffine(const std::vector<cv::Point2f>& p0,
         0.0, 0.0
     };
     std::array<double, 8> h = initial;
-    double best_error = homographyError(h, p0, p1, ip, cx, cy, scale);
+    double best_error = homographyError(h, p0, p1, cx, cy, scale);
     const double initial_error = best_error;
     if (!std::isfinite(best_error)) return false;
 
@@ -330,7 +404,6 @@ bool refineHomographyFromAffine(const std::vector<cv::Point2f>& p0,
         int used = 0;
 
         for (std::size_t i = 0; i < p0.size(); ++i) {
-            if (ip && !ip[i]) continue;
             const double x = (p0[i].x - cx) / scale;
             const double y = (p0[i].y - cy) / scale;
             const double uo = (p1[i].x - cx) / scale;
@@ -343,8 +416,7 @@ bool refineHomographyFromAffine(const std::vector<cv::Point2f>& p0,
             const double ru = uo - u;
             const double rv = vo - v;
             const double err_px = scale * std::sqrt(ru * ru + rv * rv);
-            const double weight = err_px <= kHomographyHuberPixels || err_px <= 1e-12
-                ? 1.0 : kHomographyHuberPixels / err_px;
+            const double weight = huberWeight(err_px, kHomographyHuberPixels);
 
             const double ju[8] = {
                 x * inv_d, y * inv_d, inv_d, 0.0, 0.0, 0.0,
@@ -380,7 +452,7 @@ bool refineHomographyFromAffine(const std::vector<cv::Point2f>& p0,
             for (int k = 0; k < 8; ++k)
                 candidate[k] += step * delta.at<double>(k, 0);
             clampHomographyPerspective(candidate, size, scale);
-            const double error = homographyError(candidate, p0, p1, ip, cx, cy, scale);
+            const double error = homographyError(candidate, p0, p1, cx, cy, scale);
             if (std::isfinite(error) && error < best_error) {
                 h = candidate;
                 best_error = error;
@@ -1146,12 +1218,11 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
     if(p0.size()<4) return false;
 
     stage = ProfileClock::now();
-    cv::Mat inliers; cv::Mat affine=cv::estimateAffinePartial2D(p0,p1,inliers,cv::RANSAC,2.0,3000,0.995,10);
-    if(affine.empty()) {
+    cv::Mat affine;
+    if(!fitRobustFullAffine(p0,p1,input_size_,affine)) {
         last_timing_.affine_ms += profileMs(stage);
         return false;
     }
-    if(affine.type()!=CV_64F) affine.convertTo(affine,CV_64F);
     last_timing_.affine_ms += profileMs(stage);
 
     patch.frame_id=frame_id; patch.keyframe_id=keyframe_id_; patch.original_size=input_size_; patch.grid_x=kMeshGridX; patch.grid_y=kMeshGridY;
@@ -1164,7 +1235,7 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
         stage = ProfileClock::now();
         std::array<float, 6> numerator;
         std::array<float, 2> perspective;
-        if (refineHomographyFromAffine(p0, p1, inliers, affine, input_size_, numerator, perspective)) {
+        if (refineHomographyFromAffine(p0, p1, affine, input_size_, numerator, perspective)) {
             patch.affine = numerator;
             patch.perspective = perspective;
             patch.homography = true;
@@ -1174,8 +1245,7 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
 
     stage = ProfileClock::now();
     std::vector<cv::Point2f> q,residual; q.reserve(p0.size()); residual.reserve(p0.size());
-    const unsigned char* ip=inliers.empty()?nullptr:inliers.ptr<unsigned char>();
-    for(std::size_t i=0;i<p0.size();++i){if(ip&&!ip[i])continue;const cv::Point2f qi=applyPatchBaseTransform(patch,p0[i]);const cv::Point2f ri=p1[i]-qi;if(cv::norm(ri)<kResidualMax){q.push_back(qi);residual.push_back(ri);}}
+    for(std::size_t i=0;i<p0.size();++i){const cv::Point2f qi=applyPatchBaseTransform(patch,p0[i]);const cv::Point2f ri=p1[i]-qi;q.push_back(qi);residual.push_back(ri);}
     const double sigma=std::max(16.0,0.20*std::max(input_size_.width,input_size_.height)); const double inv2s2=1.0/(2.0*sigma*sigma);
     for(int iy=0;iy<kMeshGridY;++iy){const float y=static_cast<float>(iy)*(input_size_.height-1)/(kMeshGridY-1);
         for(int ix=0;ix<kMeshGridX;++ix){const float x=static_cast<float>(ix)*(input_size_.width-1)/(kMeshGridX-1);cv::Point2d sum(0,0);double sw=0;
