@@ -30,6 +30,8 @@ constexpr std::uint8_t kPacketMosaicKeyframeChunk = 3;
 constexpr std::uint8_t kPacketMosaicKeyframeEnd = 4;
 constexpr std::uint8_t kStripsLayerCount = 2;
 constexpr std::uint8_t kMosaicLayerCount = 3;
+constexpr std::uint16_t kPatchFlagHomography = 1u << 0;
+constexpr std::uint16_t kPatchKnownFlags = kPatchFlagHomography;
 
 constexpr int kFeatureGridX = 8;
 constexpr int kFeatureGridY = 8;
@@ -53,6 +55,9 @@ constexpr int kLkMaxLevel = 3;
 constexpr float kLkForwardErrorMax = 35.0f;
 constexpr float kLkBackwardErrorMax = 1.5f;
 constexpr float kResidualMax = 10.0f;
+constexpr double kHomographyHuberPixels = 3.0;
+constexpr double kHomographyMaxDenominatorVariation = 0.08;
+constexpr int kHomographyIterations = 5;
 constexpr double kTargetBrightness = 128.0;
 constexpr double kTargetLkStdDev = 64.0;
 constexpr std::size_t kCommonHeaderBytes = 20;
@@ -241,6 +246,190 @@ cv::Point2f applyAffine(const cv::Mat& affine, const cv::Point2f& p) {
         static_cast<float>(affine.at<double>(1,0)*p.x + affine.at<double>(1,1)*p.y + affine.at<double>(1,2)));
 }
 
+cv::Point2f applyPatchBaseTransform(const PatchData& patch, const cv::Point2f& p) {
+    const float nx = patch.affine[0] * p.x + patch.affine[1] * p.y + patch.affine[2];
+    const float ny = patch.affine[3] * p.x + patch.affine[4] * p.y + patch.affine[5];
+    if (!patch.homography) return cv::Point2f(nx, ny);
+    const float d = patch.perspective[0] * p.x + patch.perspective[1] * p.y + 1.0f;
+    if (std::abs(d) < 1e-6f) return cv::Point2f(nx, ny);
+    return cv::Point2f(nx / d, ny / d);
+}
+
+double homographyError(const std::array<double, 8>& h,
+                       const std::vector<cv::Point2f>& p0,
+                       const std::vector<cv::Point2f>& p1,
+                       const unsigned char* inliers,
+                       double cx, double cy, double scale) {
+    double sse = 0.0;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < p0.size(); ++i) {
+        if (inliers && !inliers[i]) continue;
+        const double x = (p0[i].x - cx) / scale;
+        const double y = (p0[i].y - cy) / scale;
+        const double uo = (p1[i].x - cx) / scale;
+        const double vo = (p1[i].y - cy) / scale;
+        const double d = h[6] * x + h[7] * y + 1.0;
+        if (std::abs(d) < 0.25) return std::numeric_limits<double>::infinity();
+        const double u = (h[0] * x + h[1] * y + h[2]) / d;
+        const double v = (h[3] * x + h[4] * y + h[5]) / d;
+        const double dx = (uo - u) * scale;
+        const double dy = (vo - v) * scale;
+        sse += dx * dx + dy * dy;
+        ++count;
+    }
+    return count ? sse / static_cast<double>(count) : std::numeric_limits<double>::infinity();
+}
+
+void clampHomographyPerspective(std::array<double, 8>& h, const cv::Size& size,
+                                double scale) {
+    const double ex = 0.5 * std::max(0, size.width - 1) / scale;
+    const double ey = 0.5 * std::max(0, size.height - 1) / scale;
+    const double variation = std::abs(h[6]) * ex + std::abs(h[7]) * ey;
+    if (variation > kHomographyMaxDenominatorVariation && variation > 0.0) {
+        const double f = kHomographyMaxDenominatorVariation / variation;
+        h[6] *= f;
+        h[7] *= f;
+    }
+}
+
+bool refineHomographyFromAffine(const std::vector<cv::Point2f>& p0,
+                                const std::vector<cv::Point2f>& p1,
+                                const cv::Mat& inliers,
+                                const cv::Mat& affine,
+                                const cv::Size& size,
+                                std::array<float, 6>& numerator,
+                                std::array<float, 2>& perspective) {
+    if (p0.size() != p1.size() || p0.size() < 8 || affine.empty()) return false;
+    const unsigned char* ip = inliers.empty() ? nullptr : inliers.ptr<unsigned char>();
+    std::size_t inlier_count = 0;
+    for (std::size_t i = 0; i < p0.size(); ++i)
+        if (!ip || ip[i]) ++inlier_count;
+    if (inlier_count < 8) return false;
+
+    const double scale = std::max(1.0, static_cast<double>(std::max(size.width, size.height)));
+    const double cx = 0.5 * std::max(0, size.width - 1);
+    const double cy = 0.5 * std::max(0, size.height - 1);
+
+    std::array<double, 8> initial{
+        affine.at<double>(0,0), affine.at<double>(0,1),
+        (affine.at<double>(0,0) * cx + affine.at<double>(0,1) * cy + affine.at<double>(0,2) - cx) / scale,
+        affine.at<double>(1,0), affine.at<double>(1,1),
+        (affine.at<double>(1,0) * cx + affine.at<double>(1,1) * cy + affine.at<double>(1,2) - cy) / scale,
+        0.0, 0.0
+    };
+    std::array<double, 8> h = initial;
+    double best_error = homographyError(h, p0, p1, ip, cx, cy, scale);
+    const double initial_error = best_error;
+    if (!std::isfinite(best_error)) return false;
+
+    const std::array<double, 8> prior_weight{0.25, 0.25, 0.10, 0.25, 0.25, 0.10, 4.0, 4.0};
+
+    for (int iter = 0; iter < kHomographyIterations; ++iter) {
+        cv::Mat ata = cv::Mat::zeros(8, 8, CV_64F);
+        cv::Mat atb = cv::Mat::zeros(8, 1, CV_64F);
+        int used = 0;
+
+        for (std::size_t i = 0; i < p0.size(); ++i) {
+            if (ip && !ip[i]) continue;
+            const double x = (p0[i].x - cx) / scale;
+            const double y = (p0[i].y - cy) / scale;
+            const double uo = (p1[i].x - cx) / scale;
+            const double vo = (p1[i].y - cy) / scale;
+            const double d = h[6] * x + h[7] * y + 1.0;
+            if (std::abs(d) < 0.25) continue;
+            const double inv_d = 1.0 / d;
+            const double u = (h[0] * x + h[1] * y + h[2]) * inv_d;
+            const double v = (h[3] * x + h[4] * y + h[5]) * inv_d;
+            const double ru = uo - u;
+            const double rv = vo - v;
+            const double err_px = scale * std::sqrt(ru * ru + rv * rv);
+            const double weight = err_px <= kHomographyHuberPixels || err_px <= 1e-12
+                ? 1.0 : kHomographyHuberPixels / err_px;
+
+            const double ju[8] = {
+                x * inv_d, y * inv_d, inv_d, 0.0, 0.0, 0.0,
+                -u * x * inv_d, -u * y * inv_d
+            };
+            const double jv[8] = {
+                0.0, 0.0, 0.0, x * inv_d, y * inv_d, inv_d,
+                -v * x * inv_d, -v * y * inv_d
+            };
+
+            for (int r = 0; r < 8; ++r) {
+                atb.at<double>(r, 0) += weight * (ju[r] * ru + jv[r] * rv);
+                for (int c = 0; c < 8; ++c)
+                    ata.at<double>(r, c) += weight * (ju[r] * ju[c] + jv[r] * jv[c]);
+            }
+            ++used;
+        }
+        if (used < 8) break;
+
+        for (int k = 0; k < 8; ++k) {
+            ata.at<double>(k, k) += prior_weight[k] + 1e-6;
+            atb.at<double>(k, 0) += prior_weight[k] * (initial[k] - h[k]);
+        }
+
+        cv::Mat delta;
+        if (!cv::solve(ata, atb, delta, cv::DECOMP_CHOLESKY) &&
+            !cv::solve(ata, atb, delta, cv::DECOMP_SVD)) break;
+
+        bool accepted = false;
+        double accepted_step = 0.0;
+        for (double step : {1.0, 0.5, 0.25, 0.125}) {
+            std::array<double, 8> candidate = h;
+            for (int k = 0; k < 8; ++k)
+                candidate[k] += step * delta.at<double>(k, 0);
+            clampHomographyPerspective(candidate, size, scale);
+            const double error = homographyError(candidate, p0, p1, ip, cx, cy, scale);
+            if (std::isfinite(error) && error < best_error) {
+                h = candidate;
+                best_error = error;
+                accepted = true;
+                accepted_step = step;
+                break;
+            }
+        }
+        if (!accepted) break;
+
+        double max_update = 0.0;
+        for (int k = 0; k < 8; ++k)
+            max_update = std::max(max_update, std::abs(accepted_step * delta.at<double>(k, 0)));
+        if (max_update < 1e-7) break;
+    }
+
+    if (!(best_error < initial_error * 0.999)) return false;
+
+    const cv::Matx33d normal_to_pixel(
+        scale, 0.0, cx,
+        0.0, scale, cy,
+        0.0, 0.0, 1.0);
+    const cv::Matx33d pixel_to_normal(
+        1.0 / scale, 0.0, -cx / scale,
+        0.0, 1.0 / scale, -cy / scale,
+        0.0, 0.0, 1.0);
+    const cv::Matx33d hn(
+        h[0], h[1], h[2],
+        h[3], h[4], h[5],
+        h[6], h[7], 1.0);
+    cv::Matx33d hp = normal_to_pixel * hn * pixel_to_normal;
+    if (!std::isfinite(hp(2,2)) || std::abs(hp(2,2)) < 1e-9) return false;
+    hp *= 1.0 / hp(2,2);
+
+    for (double x : {0.0, static_cast<double>(std::max(0, size.width - 1))}) {
+        for (double y : {0.0, static_cast<double>(std::max(0, size.height - 1))}) {
+            const double d = hp(2,0) * x + hp(2,1) * y + 1.0;
+            if (!std::isfinite(d) || d < 0.5) return false;
+        }
+    }
+
+    numerator = {
+        static_cast<float>(hp(0,0)), static_cast<float>(hp(0,1)), static_cast<float>(hp(0,2)),
+        static_cast<float>(hp(1,0)), static_cast<float>(hp(1,1)), static_cast<float>(hp(1,2))
+    };
+    perspective = {static_cast<float>(hp(2,0)), static_cast<float>(hp(2,1))};
+    return true;
+}
+
 cv::Point2f samplePatchMesh(const PatchData& patch, const cv::Point2f& p) {
     if (patch.grid_x < 2 || patch.grid_y < 2 || patch.original_size.width < 2 || patch.original_size.height < 2 ||
         patch.mesh.size() != static_cast<std::size_t>(patch.grid_x) * patch.grid_y)
@@ -269,9 +458,7 @@ cv::Point2f samplePatchMesh(const PatchData& patch, const cv::Point2f& p) {
 }
 
 cv::Point2f predictPointFromPatch(const PatchData& patch, const cv::Point2f& p) {
-    cv::Point2f q(
-        patch.affine[0] * p.x + patch.affine[1] * p.y + patch.affine[2],
-        patch.affine[3] * p.x + patch.affine[4] * p.y + patch.affine[5]);
+    const cv::Point2f q = applyPatchBaseTransform(patch, p);
     cv::Point2f predicted = q;
     for (int iter = 0; iter < 2; ++iter)
         predicted = q + samplePatchMesh(patch, predicted);
@@ -608,24 +795,35 @@ std::vector<u_char> serializeMosaicKeyframeEnd(std::uint32_t frame_id, const cv:
 
 std::vector<u_char> serializePatch(const PatchData& patch) {
     const std::size_t mesh_bytes = patch.mesh.size() * 2 * sizeof(float);
-    const std::size_t header_bytes = kCommonHeaderBytes + 4 + 6 * sizeof(float) + mesh_bytes;
+    const std::size_t perspective_bytes = patch.homography ? 2 * sizeof(float) : 0;
+    const std::size_t header_bytes = kCommonHeaderBytes + 4 + 6 * sizeof(float) + perspective_bytes + mesh_bytes;
     std::vector<u_char> packet; packet.reserve(header_bytes);
     appendCommonHeader(packet, kPacketPatch, static_cast<std::uint16_t>(header_bytes),
                        patch.frame_id, patch.keyframe_id, patch.original_size);
-    appendU8(packet, patch.grid_x); appendU8(packet, patch.grid_y); appendU16(packet, 0);
+    const std::uint16_t flags = patch.homography ? kPatchFlagHomography : 0;
+    appendU8(packet, patch.grid_x); appendU8(packet, patch.grid_y); appendU16(packet, flags);
     for (float v : patch.affine) appendFloat(packet, v);
+    if (patch.homography)
+        for (float v : patch.perspective) appendFloat(packet, v);
     for (const cv::Point2f& p : patch.mesh) { appendFloat(packet, p.x); appendFloat(packet, p.y); }
     return packet;
 }
 
 bool parsePatch(const std::vector<u_char>& data, const CommonHeader& h, std::size_t pos, PatchData& p) {
-    std::uint8_t gx = 0, gy = 0; std::uint16_t reserved = 0;
-    if (!readU8(data, pos, gx) || !readU8(data, pos, gy) || !readU16(data, pos, reserved) || gx == 0 || gy == 0) return false;
+    std::uint8_t gx = 0, gy = 0; std::uint16_t flags = 0;
+    if (!readU8(data, pos, gx) || !readU8(data, pos, gy) || !readU16(data, pos, flags) || gx == 0 || gy == 0) return false;
+    if ((flags & ~kPatchKnownFlags) != 0) return false;
+    const bool homography = (flags & kPatchFlagHomography) != 0;
     const std::size_t mesh_count = static_cast<std::size_t>(gx) * gy;
-    const std::size_t expected = kCommonHeaderBytes + 4 + 6 * sizeof(float) + mesh_count * 2 * sizeof(float);
+    const std::size_t perspective_bytes = homography ? 2 * sizeof(float) : 0;
+    const std::size_t expected = kCommonHeaderBytes + 4 + 6 * sizeof(float) + perspective_bytes + mesh_count * 2 * sizeof(float);
     if (h.header_bytes != expected || expected != data.size()) return false;
     p.frame_id = h.frame_id; p.keyframe_id = h.keyframe_id; p.original_size = h.original_size; p.grid_x = gx; p.grid_y = gy;
+    p.homography = homography;
     for (float& v : p.affine) if (!readFloat(data, pos, v)) return false;
+    p.perspective = {0.0f, 0.0f};
+    if (homography)
+        for (float& v : p.perspective) if (!readFloat(data, pos, v)) return false;
     p.mesh.resize(mesh_count);
     for (cv::Point2f& v : p.mesh) if (!readFloat(data, pos, v.x) || !readFloat(data, pos, v.y)) return false;
     return true;
@@ -956,14 +1154,28 @@ bool Encoder::estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id,
     if(affine.type()!=CV_64F) affine.convertTo(affine,CV_64F);
     last_timing_.affine_ms += profileMs(stage);
 
-    stage = ProfileClock::now();
     patch.frame_id=frame_id; patch.keyframe_id=keyframe_id_; patch.original_size=input_size_; patch.grid_x=kMeshGridX; patch.grid_y=kMeshGridY;
     patch.mesh.assign(kMeshGridX*kMeshGridY,cv::Point2f(0,0));
     patch.affine={static_cast<float>(affine.at<double>(0,0)),static_cast<float>(affine.at<double>(0,1)),static_cast<float>(affine.at<double>(0,2)),static_cast<float>(affine.at<double>(1,0)),static_cast<float>(affine.at<double>(1,1)),static_cast<float>(affine.at<double>(1,2))};
+    patch.homography=false;
+    patch.perspective={0.0f,0.0f};
 
+    if (homography_transform_) {
+        stage = ProfileClock::now();
+        std::array<float, 6> numerator;
+        std::array<float, 2> perspective;
+        if (refineHomographyFromAffine(p0, p1, inliers, affine, input_size_, numerator, perspective)) {
+            patch.affine = numerator;
+            patch.perspective = perspective;
+            patch.homography = true;
+        }
+        last_timing_.homography_ms += profileMs(stage);
+    }
+
+    stage = ProfileClock::now();
     std::vector<cv::Point2f> q,residual; q.reserve(p0.size()); residual.reserve(p0.size());
     const unsigned char* ip=inliers.empty()?nullptr:inliers.ptr<unsigned char>();
-    for(std::size_t i=0;i<p0.size();++i){if(ip&&!ip[i])continue;const cv::Point2f qi=applyAffine(affine,p0[i]);const cv::Point2f ri=p1[i]-qi;if(cv::norm(ri)<kResidualMax){q.push_back(qi);residual.push_back(ri);}}
+    for(std::size_t i=0;i<p0.size();++i){if(ip&&!ip[i])continue;const cv::Point2f qi=applyPatchBaseTransform(patch,p0[i]);const cv::Point2f ri=p1[i]-qi;if(cv::norm(ri)<kResidualMax){q.push_back(qi);residual.push_back(ri);}}
     const double sigma=std::max(16.0,0.20*std::max(input_size_.width,input_size_.height)); const double inv2s2=1.0/(2.0*sigma*sigma);
     for(int iy=0;iy<kMeshGridY;++iy){const float y=static_cast<float>(iy)*(input_size_.height-1)/(kMeshGridY-1);
         for(int ix=0;ix<kMeshGridX;++ix){const float x=static_cast<float>(ix)*(input_size_.width-1)/(kMeshGridX-1);cv::Point2d sum(0,0);double sw=0;
@@ -1326,12 +1538,24 @@ void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,co
     const PatchData&p=patch.back();if(p.keyframe_id!=keyframe_id_||p.original_size!=original_size_||p.grid_x==0||p.grid_y==0||p.mesh.size()!=static_cast<std::size_t>(p.grid_x)*p.grid_y){destination.release();return;}
     cv::Mat grid(p.grid_y,p.grid_x,CV_32FC2);for(int y=0;y<p.grid_y;++y){cv::Vec2f*row=grid.ptr<cv::Vec2f>(y);for(int x=0;x<p.grid_x;++x){const cv::Point2f v=p.mesh[y*p.grid_x+x];row[x]=cv::Vec2f(v.x,v.y);}}
     cv::resize(grid,dense_mesh_,original_size_,0,0,cv::INTER_CUBIC);
-    const float a00=p.affine[0],a01=p.affine[1],a02=p.affine[2],a10=p.affine[3],a11=p.affine[4],a12=p.affine[5],det=a00*a11-a01*a10;if(std::abs(det)<1e-9f){destination.release();return;}
-    const float i00=a11/det,i01=-a01/det,i10=-a10/det,i11=a00/det,i02=-(i00*a02+i01*a12),i12=-(i10*a02+i11*a12);
+
+    const float a00=p.affine[0],a01=p.affine[1],a02=p.affine[2],a10=p.affine[3],a11=p.affine[4],a12=p.affine[5];
     const float source_scale_x=(original_size_.width>1&&keyframe.cols>1)?static_cast<float>(keyframe.cols-1)/static_cast<float>(original_size_.width-1):1.0f;
     const float source_scale_y=(original_size_.height>1&&keyframe.rows>1)?static_cast<float>(keyframe.rows-1)/static_cast<float>(original_size_.height-1):1.0f;
     map_x_.create(original_size_,CV_32F);map_y_.create(original_size_,CV_32F);valid_mask_.create(original_size_,CV_8U);valid_mask_.setTo(cv::Scalar(0));
-    cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],sx=i00*tx+i01*ty+i02,sy=i10*tx+i11*ty+i12;const float kx=sx*source_scale_x,ky=sy*source_scale_y;mx[x]=kx;my[x]=ky;if(kx>=0&&kx<keyframe.cols-1&&ky>=0&&ky<keyframe.rows-1)vm[x]=255;}}});
+
+    if (p.homography) {
+        const cv::Matx33f h(a00,a01,a02,a10,a11,a12,p.perspective[0],p.perspective[1],1.0f);
+        bool invertible=false;
+        const cv::Matx33f inv=h.inv(cv::DECOMP_LU,&invertible);
+        if(!invertible){destination.release();return;}
+        cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],d=inv(2,0)*tx+inv(2,1)*ty+inv(2,2);if(std::abs(d)<1e-8f){mx[x]=-1.0f;my[x]=-1.0f;continue;}const float sx=(inv(0,0)*tx+inv(0,1)*ty+inv(0,2))/d,sy=(inv(1,0)*tx+inv(1,1)*ty+inv(1,2))/d;const float kx=sx*source_scale_x,ky=sy*source_scale_y;mx[x]=kx;my[x]=ky;if(kx>=0&&kx<keyframe.cols-1&&ky>=0&&ky<keyframe.rows-1)vm[x]=255;}}});
+    } else {
+        const float det=a00*a11-a01*a10;if(std::abs(det)<1e-9f){destination.release();return;}
+        const float i00=a11/det,i01=-a01/det,i10=-a10/det,i11=a00/det,i02=-(i00*a02+i01*a12),i12=-(i10*a02+i11*a12);
+        cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],sx=i00*tx+i01*ty+i02,sy=i10*tx+i11*ty+i12;const float kx=sx*source_scale_x,ky=sy*source_scale_y;mx[x]=kx;my[x]=ky;if(kx>=0&&kx<keyframe.cols-1&&ky>=0&&ky<keyframe.rows-1)vm[x]=255;}}});
+    }
+
     if(reuse_previous_frame_borders_){
         if(!previous_render_.empty()&&previous_render_.size()==original_size_&&previous_render_.type()==keyframe.type())previous_render_.copyTo(destination);
         else if(keyframe.size()==original_size_)keyframe.copyTo(destination);
