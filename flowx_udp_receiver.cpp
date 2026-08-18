@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 
@@ -194,7 +195,7 @@ UdpReceiveResult UdpReceiver::receive(std::vector<u_char>& datagram,
         return UdpReceiveResult::Ignored;
     }
 
-    datagram.assign(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(size));
+    datagram.assign(buffer.data(), buffer.data() + size);
     return UdpReceiveResult::Datagram;
 }
 
