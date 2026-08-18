@@ -23,6 +23,7 @@ void RawFrameStore::publishCurrentLocked() {
     if (!have_current_ || current_.datagrams.empty()) return;
     current_.sequence = next_sequence_++;
     latest_ = std::make_shared<const RawFrameBundle>(std::move(current_));
+    if (latest_->keyframe) latest_keyframe_ = latest_;
     current_ = RawFrameBundle{};
     have_current_ = false;
 }
@@ -42,10 +43,9 @@ void RawFrameStore::push(const std::vector<u_char>& datagram,
         }
 
         if (metadata.stream_id != current_.stream_id) {
-            // A sender/session change invalidates the old partially accumulated
-            // bundle. Start clean on the new stream rather than exposing stale data.
             current_ = RawFrameBundle{};
             have_current_ = false;
+            latest_keyframe_.reset();
             startBundleLocked(datagram, metadata);
             return;
         }
@@ -55,11 +55,7 @@ void RawFrameStore::push(const std::vector<u_char>& datagram,
             return;
         }
 
-        if (!frameIdNewer(metadata.frame_id, current_.frame_id)) {
-            // Late UDP from an older frame is irrelevant to a low-latency browser
-            // client and must not reopen an already published frame bundle.
-            return;
-        }
+        if (!frameIdNewer(metadata.frame_id, current_.frame_id)) return;
 
         publishCurrentLocked();
         notify = true;
@@ -71,6 +67,11 @@ void RawFrameStore::push(const std::vector<u_char>& datagram,
 std::shared_ptr<const RawFrameBundle> RawFrameStore::latest() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return latest_;
+}
+
+std::shared_ptr<const RawFrameBundle> RawFrameStore::latestKeyframe() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return latest_keyframe_;
 }
 
 bool RawFrameStore::waitForNext(std::uint64_t after_sequence,
