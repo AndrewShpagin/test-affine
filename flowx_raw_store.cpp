@@ -45,21 +45,20 @@ void RawFrameStore::push(const std::vector<u_char>& datagram,
         if (metadata.stream_id != current_.stream_id) {
             current_ = RawFrameBundle{};
             have_current_ = false;
+            latest_.reset();
             latest_keyframe_.reset();
             startBundleLocked(datagram, metadata);
-            return;
-        }
-
-        if (metadata.frame_id == current_.frame_id) {
+            notify = true;
+        } else if (metadata.frame_id == current_.frame_id) {
             current_.datagrams.push_back(datagram);
             return;
+        } else if (!frameIdNewer(metadata.frame_id, current_.frame_id)) {
+            return;
+        } else {
+            publishCurrentLocked();
+            notify = true;
+            startBundleLocked(datagram, metadata);
         }
-
-        if (!frameIdNewer(metadata.frame_id, current_.frame_id)) return;
-
-        publishCurrentLocked();
-        notify = true;
-        startBundleLocked(datagram, metadata);
     }
     if (notify) changed_.notify_all();
 }
