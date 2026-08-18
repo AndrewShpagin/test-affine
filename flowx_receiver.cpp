@@ -1,6 +1,8 @@
 #include "flowx_config.h"
 #include "flowx_frame_store.h"
+#include "flowx_http_server.h"
 #include "flowx_protocol.h"
+#include "flowx_receiver_status.h"
 #include "flowx_udp_receiver.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -152,13 +154,42 @@ int main(int argc, char** argv) {
         std::uint64_t decoded_keyframes = 0;
         std::uint64_t decoded_patches = 0;
 
+        const std::uint64_t started_timestamp_us = systemTimestampUs();
+        flowx::ReceiverStatusStore status_store;
+        auto publishStatus = [&] {
+            flowx::ReceiverStatus status;
+            status.started_timestamp_us = started_timestamp_us;
+            status.active_stream_id = active_stream_id;
+            status.received_datagrams = received_datagrams;
+            status.received_bytes = received_bytes;
+            status.invalid_datagrams = invalid_datagrams;
+            status.ignored_datagrams = ignored_datagrams;
+            status.ignored_other_stream = ignored_other_stream;
+            status.stale_frames = stale_frames;
+            status.stream_resets = stream_resets;
+            status.decoded_frames = decoded_frames;
+            status.decoded_keyframes = decoded_keyframes;
+            status.decoded_patches = decoded_patches;
+            status_store.publish(status);
+        };
+        publishStatus();
+
+        flowx::HttpServer http_server;
+        if (!http_server.start(cfg.http, frame_store, status_store, error))
+            throw std::runtime_error("HTTP server start failed: " + error);
+
         std::cout << "FlowX receiver\n"
                   << "  config: " << config_file << '\n'
                   << "  UDP listen: " << cfg.udp.bind << ':' << cfg.udp.port << '\n'
+                  << "  HTTP listen: " << cfg.http.bind << ':' << cfg.http.port << '\n'
+                  << "  frame:  " << cfg.http.frame_endpoint << '\n'
+                  << "  stream: " << cfg.http.stream_endpoint
+                  << " @ " << cfg.http.stream_fps << " fps\n"
+                  << "  status: " << cfg.http.status_endpoint << '\n'
+                  << "  HTTP JPEG quality: " << cfg.http.jpeg_quality << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n"
-                  << "  decoder border reuse: yes\n"
-                  << "  HTTP output: not enabled in this PR\n";
+                  << "  decoder border reuse: yes\n";
         if (!dump_last_file.empty())
             std::cout << "  debug dump on exit: " << dump_last_file << '\n';
 
@@ -180,6 +211,7 @@ int main(int argc, char** argv) {
             }
             if (receive_result == flowx::UdpReceiveResult::Ignored) {
                 ++ignored_datagrams;
+                publishStatus();
                 continue;
             }
 
@@ -190,6 +222,7 @@ int main(int argc, char** argv) {
             flowx::FlowXPacket packet;
             if (!flowx::unwrapCodecPacket(datagram, packet, &error)) {
                 ++invalid_datagrams;
+                publishStatus();
                 continue;
             }
 
@@ -200,6 +233,7 @@ int main(int argc, char** argv) {
                 // happen to see are patches, wait until its keyframe arrives.
                 if (metadata.frame_id != metadata.keyframe_id) {
                     ++ignored_other_stream;
+                    publishStatus();
                     continue;
                 }
                 active_stream_id = metadata.stream_id;
@@ -208,10 +242,12 @@ int main(int argc, char** argv) {
             } else if (metadata.stream_id != active_stream_id) {
                 if (retired_streams.count(metadata.stream_id)) {
                     ++ignored_other_stream;
+                    publishStatus();
                     continue;
                 }
                 if (metadata.frame_id != metadata.keyframe_id) {
                     ++ignored_other_stream;
+                    publishStatus();
                     continue;
                 }
 
@@ -288,6 +324,8 @@ int main(int argc, char** argv) {
                 ++decoded_patches;
             }
 
+            publishStatus();
+
             const auto now = std::chrono::steady_clock::now();
             if (now >= next_report) {
                 const auto latest = frame_store.latest();
@@ -309,6 +347,9 @@ int main(int argc, char** argv) {
                 next_report = now + std::chrono::seconds(2);
             }
         }
+
+        publishStatus();
+        http_server.stop();
 
         if (!dump_last_file.empty()) {
             const auto latest = frame_store.latest();
