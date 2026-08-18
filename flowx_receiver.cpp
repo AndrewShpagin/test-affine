@@ -34,6 +34,10 @@ std::uint64_t systemTimestampUs() {
         std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
+bool frameIdNewer(std::uint32_t a, std::uint32_t b) {
+    return static_cast<std::int32_t>(a - b) > 0;
+}
+
 struct FrameArrival {
     std::uint64_t capture_timestamp_us = 0;
     std::uint64_t receive_timestamp_us = 0;
@@ -87,12 +91,17 @@ int main(int argc, char** argv) {
         constexpr std::size_t kMaxRememberedFrames = 1024;
         constexpr std::size_t kMaxRetiredStreams = 8;
 
+        bool have_published_frame = false;
+        std::uint32_t last_published_frame_id = 0;
+
         auto clearDecoderState = [&] {
             decoder = std::make_unique<flowx::Decoder>();
             decoder->setReusePreviousFrameBorders(true);
             current_jpeg.clear();
             frame_arrivals.clear();
             frame_arrival_order.clear();
+            have_published_frame = false;
+            last_published_frame_id = 0;
         };
 
         auto retireStream = [&](std::uint32_t stream_id) {
@@ -137,6 +146,7 @@ int main(int argc, char** argv) {
         std::uint64_t invalid_datagrams = 0;
         std::uint64_t ignored_datagrams = 0;
         std::uint64_t ignored_other_stream = 0;
+        std::uint64_t stale_frames = 0;
         std::uint64_t stream_resets = 0;
         std::uint64_t decoded_frames = 0;
         std::uint64_t decoded_keyframes = 0;
@@ -235,6 +245,8 @@ int main(int argc, char** argv) {
                     published.receive_timestamp_us = arrival.receive_timestamp_us;
                     published.keyframe = true;
                     frame_store.publish(std::move(image), published);
+                    last_published_frame_id = frame_id;
+                    have_published_frame = true;
                     ++decoded_frames;
                     ++decoded_keyframes;
                 }
@@ -244,13 +256,23 @@ int main(int argc, char** argv) {
             while (decoder->getNextPatch(patch)) {
                 if (patch.empty()) continue;
 
-                cv::Mat image;
-                decoder->render(image, patch, current_jpeg);
-                if (image.empty()) continue;
-
                 const flowx::PatchData& last = patch.back();
                 const FrameArrival arrival = takeArrival(
                     last.frame_id, metadata, receive_timestamp_us);
+
+                // Patch packets are independently keyframe-relative. If UDP
+                // reorders them, rendering an older patch after a newer one would
+                // move the visible stream backwards and would also poison the
+                // decoder's previous-frame border reuse. Keep only forward motion.
+                if (have_published_frame &&
+                    !frameIdNewer(last.frame_id, last_published_frame_id)) {
+                    ++stale_frames;
+                    continue;
+                }
+
+                cv::Mat image;
+                decoder->render(image, patch, current_jpeg);
+                if (image.empty()) continue;
 
                 flowx::FrameMetadata published;
                 published.stream_id = active_stream_id;
@@ -260,6 +282,8 @@ int main(int argc, char** argv) {
                 published.receive_timestamp_us = arrival.receive_timestamp_us;
                 published.keyframe = false;
                 frame_store.publish(std::move(image), published);
+                last_published_frame_id = last.frame_id;
+                have_published_frame = true;
                 ++decoded_frames;
                 ++decoded_patches;
             }
@@ -272,6 +296,7 @@ int main(int argc, char** argv) {
                           << " invalid=" << invalid_datagrams
                           << " ignored=" << ignored_datagrams
                           << " other-stream=" << ignored_other_stream
+                          << " stale=" << stale_frames
                           << " resets=" << stream_resets
                           << " decoded=" << decoded_frames
                           << " (key=" << decoded_keyframes
@@ -310,6 +335,7 @@ int main(int argc, char** argv) {
                   << " decoded=" << decoded_frames
                   << " invalid=" << invalid_datagrams
                   << " ignored=" << (ignored_datagrams + ignored_other_stream)
+                  << " stale=" << stale_frames
                   << '\n';
         return fatal_error ? 1 : 0;
     } catch (const std::exception& e) {
