@@ -62,7 +62,7 @@ void main(){
   vec2 dst=vec2(gl_FragCoord.x-0.5,uOutSize.y-gl_FragCoord.y-0.5);
   vec2 scale=(uKeySize-vec2(1.0))/max(uOutSize-vec2(1.0),vec2(1.0));
   vec2 s=dst*scale;
-  vec2 uv=vec2((s.x+0.5)/uKeySize.x,1.0-(s.y+0.5)/uKeySize.y);
+  vec2 uv=vec2((s.x+0.5)/uKeySize.x,(s.y+0.5)/uKeySize.y);
   color=texture(uKey,uv);
 }`;
 const stripsFs = `#version 300 es
@@ -120,7 +120,7 @@ void main(){
   if(ok){
     vec2 scale=(uKeySize-vec2(1.0))/max(uOutSize-vec2(1.0),vec2(1.0));
     vec2 s=src*scale;
-    vec2 uv=vec2((s.x+0.5)/uKeySize.x,1.0-(s.y+0.5)/uKeySize.y);
+    vec2 uv=vec2((s.x+0.5)/uKeySize.x,(s.y+0.5)/uKeySize.y);
     color=texture(uKey,uv);
   }else{
     vec2 uv=vec2((dst.x+0.5)/uOutSize.x,1.0-(dst.y+0.5)/uOutSize.y);
@@ -142,7 +142,9 @@ function alloc(w,h){
 }
 function draw(){ gl.drawArrays(gl.TRIANGLES,0,3); }
 function display(){ gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,outW,outH); gl.useProgram(copyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(copyProg,'uTex'),0); gl.uniform2f(gl.getUniformLocation(copyProg,'uSize'),outW,outH); draw(); }
-function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); }
+// Keep browser-decoded JPEG rows in image-space order: texture row 0 is image y=0 (top).
+// This avoids relying on UNPACK_FLIP_Y_WEBGL behavior for ImageBitmap uploads.
+function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); }
 function renderKey(frameId){
   current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); display();
   keyFrameId=frameId; stats.keys++; stats.renders++; $('frame').textContent=frameId; putStats();
