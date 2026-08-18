@@ -14,7 +14,7 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}header{p
 </head>
 <body>
 <header>
-  <strong>FlowX browser decoder</strong>
+  <strong>FlowX browser decoder (JPEG keyframes)</strong>
   <span id="state">connecting…</span>
   <span>stream <code id="stream">-</code></span>
   <span>frame <code id="frame">-</code></span>
@@ -99,7 +99,7 @@ async function processCodec(codec) {
   if(type===3) {
     if(hb!==44 || codec.byteLength<44) throw new Error('bad layered key header');
     const li=u[20], lc=u[21];
-    if(lc!==2) return; // PR #44 deliberately supports STRIPS only; MOSAIC is not needed here.
+    if(lc!==2) return;
     if(!key || key.frameId!==frame || key.kind!=='strips') resetKey(frame,ow,oh,'strips',lc);
     const jw=u16(v,24), jh=u16(v,26), ci=u16(v,28), cc=u16(v,30), total=u32(v,32), off=u32(v,36), n=u16(v,40);
     if(hb+n!==codec.byteLength) throw new Error('bad layered chunk length');
