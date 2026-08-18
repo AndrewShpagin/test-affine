@@ -27,6 +27,7 @@ class RawFrameStore {
 public:
     void push(const std::vector<u_char>& datagram, const PacketMetadata& metadata);
     std::shared_ptr<const RawFrameBundle> latest() const;
+    std::shared_ptr<const RawFrameBundle> latestKeyframe() const;
 
     bool waitForNext(std::uint64_t after_sequence,
                      std::shared_ptr<const RawFrameBundle>& bundle,
@@ -45,6 +46,7 @@ private:
     RawFrameBundle current_;
     bool have_current_ = false;
     std::shared_ptr<const RawFrameBundle> latest_;
+    std::shared_ptr<const RawFrameBundle> latest_keyframe_;
     std::uint64_t next_sequence_ = 1;
     bool closed_ = false;
 };
