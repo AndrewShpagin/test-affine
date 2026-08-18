@@ -15,7 +15,7 @@ target_link_libraries(mesh_test PRIVATE ${OpenCV_LIBS})
 add_executable(keyframe_test keyframe_test.cpp)
 target_link_libraries(keyframe_test PRIVATE ${OpenCV_LIBS})
 
-add_library(udp_image_codec udp_image_codec.cpp)
+add_library(udp_image_codec udp_image_codec.cpp motion_refine.cpp)
 target_include_directories(udp_image_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(udp_image_codec PUBLIC ${OpenCV_LIBS})
 

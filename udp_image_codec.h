@@ -34,6 +34,15 @@ struct LKDebugData {
     std::vector<cv::Point2f> to;
 };
 
+// Internal motion helper. The non-const point vectors are intentionally filtered
+// in-place so the following residual-mesh fit uses the same accepted correspondences.
+bool refineHomographyFromAffine(std::vector<cv::Point2f>& p0,
+                                std::vector<cv::Point2f>& p1,
+                                const cv::Mat& affine,
+                                const cv::Size& size,
+                                std::array<float, 6>& numerator,
+                                std::array<float, 2>& perspective);
+
 struct EncoderTiming {
     bool keyframe = false;
     bool predictor_used = false;
