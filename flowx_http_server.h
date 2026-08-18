@@ -2,6 +2,7 @@
 
 #include "flowx_config.h"
 #include "flowx_frame_store.h"
+#include "flowx_raw_store.h"
 #include "flowx_receiver_status.h"
 
 #include <memory>
@@ -22,6 +23,7 @@ public:
 
     bool start(const HttpConfig& config,
                const FrameStore& frames,
+               const RawFrameStore& raw_frames,
                const ReceiverStatusStore& status,
                std::string& error);
     void stop();
