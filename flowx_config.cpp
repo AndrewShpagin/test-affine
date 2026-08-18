@@ -59,6 +59,13 @@ void requirePositive(int value, const char* name) {
         throw std::runtime_error(std::string(name) + " must be > 0");
 }
 
+void requireRange(int value, int min_value, int max_value, const char* name) {
+    if (value < min_value || value > max_value)
+        throw std::runtime_error(std::string(name) + " must be in [" +
+                                 std::to_string(min_value) + ", " +
+                                 std::to_string(max_value) + "]");
+}
+
 SourceType parseSourceType(const std::string& value) {
     const std::string type = lower(value);
     if (type == "camera") return SourceType::Camera;
@@ -113,8 +120,12 @@ CodecConfig parseCodec(const json& j) {
     cfg.strips = j.value("strips", cfg.strips);
     cfg.homography = j.value("homography", cfg.homography);
     cfg.mesh = j.value("mesh", cfg.mesh);
+    cfg.mesh_grid_x = j.value("mesh_grid_x", cfg.mesh_grid_x);
+    cfg.mesh_grid_y = j.value("mesh_grid_y", cfg.mesh_grid_y);
     requirePositive(cfg.keyframe_bytes, "codec.keyframe_bytes");
     requirePositive(cfg.keyframe_period, "codec.keyframe_period");
+    requireRange(cfg.mesh_grid_x, 2, 8, "codec.mesh_grid_x");
+    requireRange(cfg.mesh_grid_y, 2, 8, "codec.mesh_grid_y");
     return cfg;
 }
 
