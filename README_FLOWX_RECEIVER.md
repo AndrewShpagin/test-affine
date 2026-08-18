@@ -24,6 +24,7 @@ The MJPEG output is capped by `http.stream_fps`; if the decoder runs faster, the
 The browser decoder now renders both JPEG keyframes and patch frames directly:
 
 - classic JPEG keyframes and the current two-layer STRIPS JPEG keyframes are decoded with the browser-native JPEG decoder;
+- STRIPS interleaving is assembled entirely in WebGL2: the two decoded JPEG layers are uploaded as textures and a tiny shader writes even/odd columns into the assembled keyframe texture, with no per-column Canvas2D `drawImage()` loop;
 - patch affine/homography parameters are parsed directly from AFC1;
 - the 6x6 residual mesh is evaluated in a WebGL2 fragment shader using the same cubic kernel coefficient used by OpenCV `INTER_CUBIC`;
 - the shader subtracts the dense mesh, applies the inverse affine/homography, and samples the keyframe texture;
