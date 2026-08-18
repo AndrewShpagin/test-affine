@@ -2,6 +2,7 @@
 #include "flowx_frame_store.h"
 #include "flowx_http_server.h"
 #include "flowx_protocol.h"
+#include "flowx_raw_store.h"
 #include "flowx_receiver_status.h"
 #include "flowx_udp_receiver.h"
 
@@ -83,6 +84,7 @@ int main(int argc, char** argv) {
         decoder->setReusePreviousFrameBorders(true);
         std::vector<flowx::u_char> current_jpeg;
         flowx::FrameStore frame_store;
+        flowx::RawFrameStore raw_frame_store;
 
         std::uint32_t active_stream_id = 0;
         std::unordered_set<std::uint32_t> retired_streams;
@@ -175,7 +177,7 @@ int main(int argc, char** argv) {
         publishStatus();
 
         flowx::HttpServer http_server;
-        if (!http_server.start(cfg.http, frame_store, status_store, error))
+        if (!http_server.start(cfg.http, frame_store, raw_frame_store, status_store, error))
             throw std::runtime_error("HTTP server start failed: " + error);
 
         std::cout << "FlowX receiver\n"
@@ -186,6 +188,7 @@ int main(int argc, char** argv) {
                   << "  stream: " << cfg.http.stream_endpoint
                   << " @ " << cfg.http.stream_fps << " fps\n"
                   << "  status: " << cfg.http.status_endpoint << '\n'
+                  << "  browser: /flowx.html  raw: /flowx.bin\n"
                   << "  HTTP JPEG quality: " << cfg.http.jpeg_quality << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n"
@@ -229,8 +232,6 @@ int main(int argc, char** argv) {
             const flowx::PacketMetadata& metadata = packet.metadata;
 
             if (active_stream_id == 0) {
-                // A new sender starts from a keyframe. If the first packets we
-                // happen to see are patches, wait until its keyframe arrives.
                 if (metadata.frame_id != metadata.keyframe_id) {
                     ++ignored_other_stream;
                     publishStatus();
@@ -258,6 +259,11 @@ int main(int argc, char** argv) {
                 std::cout << "FlowX stream changed, decoder reset: "
                           << active_stream_id << '\n';
             }
+
+            // Publish the exact validated FlowX datagram to the browser transport.
+            // RawFrameStore groups all datagrams of one frame into an atomic bundle,
+            // so a slow HTTP client skips old frames rather than half a keyframe.
+            raw_frame_store.push(datagram, metadata);
 
             rememberArrival(metadata, receive_timestamp_us);
             decoder->pushData(packet.codec_packet);
@@ -296,10 +302,6 @@ int main(int argc, char** argv) {
                 const FrameArrival arrival = takeArrival(
                     last.frame_id, metadata, receive_timestamp_us);
 
-                // Patch packets are independently keyframe-relative. If UDP
-                // reorders them, rendering an older patch after a newer one would
-                // move the visible stream backwards and would also poison the
-                // decoder's previous-frame border reuse. Keep only forward motion.
                 if (have_published_frame &&
                     !frameIdNewer(last.frame_id, last_published_frame_id)) {
                     ++stale_frames;
@@ -349,6 +351,7 @@ int main(int argc, char** argv) {
         }
 
         publishStatus();
+        raw_frame_store.close();
         http_server.stop();
 
         if (!dump_last_file.empty()) {
