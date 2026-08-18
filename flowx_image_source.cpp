@@ -5,6 +5,7 @@
 #include <opencv2/videoio.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <memory>
