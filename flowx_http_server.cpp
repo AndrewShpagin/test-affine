@@ -1,5 +1,6 @@
 #include "flowx_http_server.h"
 
+#include "flowx_browser_assets.h"
 #include "flowx_protocol.h"
 
 #include <httplib.h>
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -23,6 +25,12 @@ using Clock = std::chrono::steady_clock;
 using json = nlohmann::json;
 
 constexpr const char* kMjpegBoundary = "flowxframe";
+constexpr const char* kBrowserPageEndpoint = "/flowx.html";
+constexpr const char* kBrowserScriptEndpoint = "/flowx.js";
+constexpr const char* kBrowserStreamEndpoint = "/flowx.bin";
+constexpr std::uint32_t kBrowserRecordMagic = 0x31425846u; // little-endian "FXB1"
+constexpr std::uint16_t kBrowserRecordVersion = 1;
+constexpr std::uint16_t kBrowserRecordHeaderBytes = 28;
 
 std::uint64_t systemTimestampUs() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -40,11 +48,53 @@ void addNoCacheHeaders(httplib::Response& res) {
     res.set_header("Access-Control-Allow-Origin", "*");
 }
 
+void appendU16(std::vector<u_char>& out, std::uint16_t value) {
+    out.push_back(static_cast<u_char>(value & 0xffu));
+    out.push_back(static_cast<u_char>((value >> 8) & 0xffu));
+}
+
+void appendU32(std::vector<u_char>& out, std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8)
+        out.push_back(static_cast<u_char>((value >> shift) & 0xffu));
+}
+
+bool serializeBrowserRecord(const RawFrameBundle& bundle, std::vector<u_char>& out) {
+    if (bundle.datagrams.empty() ||
+        bundle.datagrams.size() > std::numeric_limits<std::uint16_t>::max())
+        return false;
+
+    std::size_t total = kBrowserRecordHeaderBytes;
+    for (const auto& datagram : bundle.datagrams) {
+        if (datagram.empty() || datagram.size() > std::numeric_limits<std::uint16_t>::max())
+            return false;
+        total += 2 + datagram.size();
+    }
+    if (total > std::numeric_limits<std::uint32_t>::max()) return false;
+
+    out.clear();
+    out.reserve(total);
+    appendU32(out, kBrowserRecordMagic);
+    appendU16(out, kBrowserRecordVersion);
+    appendU16(out, kBrowserRecordHeaderBytes);
+    appendU32(out, static_cast<std::uint32_t>(total));
+    appendU32(out, bundle.stream_id);
+    appendU32(out, bundle.frame_id);
+    appendU32(out, bundle.keyframe_id);
+    appendU16(out, static_cast<std::uint16_t>(bundle.datagrams.size()));
+    appendU16(out, bundle.keyframe ? 1u : 0u);
+    for (const auto& datagram : bundle.datagrams) {
+        appendU16(out, static_cast<std::uint16_t>(datagram.size()));
+        out.insert(out.end(), datagram.begin(), datagram.end());
+    }
+    return out.size() == total;
+}
+
 } // namespace
 
 struct HttpServer::Impl {
     HttpConfig config;
     const FrameStore* frames = nullptr;
+    const RawFrameStore* raw_frames = nullptr;
     const ReceiverStatusStore* status = nullptr;
 
     httplib::Server server;
@@ -57,6 +107,8 @@ struct HttpServer::Impl {
     std::shared_ptr<const std::vector<unsigned char>> cached_jpeg;
     std::atomic<std::uint64_t> jpeg_encodes{0};
     std::atomic<std::uint64_t> jpeg_encode_failures{0};
+    std::atomic<std::uint64_t> browser_records{0};
+    std::atomic<std::uint64_t> browser_bytes{0};
 
     bool getJpeg(const std::shared_ptr<const PublishedFrame>& frame,
                  std::shared_ptr<const std::vector<unsigned char>>& jpeg) {
@@ -69,9 +121,7 @@ struct HttpServer::Impl {
         }
 
         std::vector<unsigned char> encoded;
-        const std::vector<int> params{
-            cv::IMWRITE_JPEG_QUALITY, config.jpeg_quality
-        };
+        const std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, config.jpeg_quality};
         if (!cv::imencode(".jpg", frame->image, encoded, params) || encoded.empty()) {
             jpeg_encode_failures.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -97,55 +147,42 @@ struct HttpServer::Impl {
             : 0.0;
 
         root["udp"] = {
-            {"datagrams", s.received_datagrams},
-            {"bytes", s.received_bytes},
-            {"invalid", s.invalid_datagrams},
-            {"ignored", s.ignored_datagrams},
-            {"other_stream", s.ignored_other_stream},
-            {"stale_frames", s.stale_frames},
+            {"datagrams", s.received_datagrams}, {"bytes", s.received_bytes},
+            {"invalid", s.invalid_datagrams}, {"ignored", s.ignored_datagrams},
+            {"other_stream", s.ignored_other_stream}, {"stale_frames", s.stale_frames},
             {"stream_resets", s.stream_resets}
         };
-
         root["decode"] = {
-            {"frames", s.decoded_frames},
-            {"keyframes", s.decoded_keyframes},
+            {"frames", s.decoded_frames}, {"keyframes", s.decoded_keyframes},
             {"patches", s.decoded_patches}
         };
-
         root["http"] = {
-            {"jpeg_quality", config.jpeg_quality},
-            {"stream_fps", config.stream_fps},
+            {"jpeg_quality", config.jpeg_quality}, {"stream_fps", config.stream_fps},
             {"jpeg_encodes", jpeg_encodes.load(std::memory_order_relaxed)},
             {"jpeg_encode_failures", jpeg_encode_failures.load(std::memory_order_relaxed)},
-            {"frame_endpoint", config.frame_endpoint},
-            {"stream_endpoint", config.stream_endpoint},
-            {"status_endpoint", config.status_endpoint}
+            {"frame_endpoint", config.frame_endpoint}, {"stream_endpoint", config.stream_endpoint},
+            {"status_endpoint", config.status_endpoint},
+            {"browser_page", kBrowserPageEndpoint}, {"browser_stream", kBrowserStreamEndpoint},
+            {"browser_records", browser_records.load(std::memory_order_relaxed)},
+            {"browser_bytes", browser_bytes.load(std::memory_order_relaxed)}
         };
 
         if (!latest) {
             root["frame"] = nullptr;
         } else {
             json frame = {
-                {"sequence", latest->metadata.sequence},
-                {"stream_id", latest->metadata.stream_id},
-                {"frame_id", latest->metadata.frame_id},
-                {"keyframe_id", latest->metadata.keyframe_id},
-                {"keyframe", latest->metadata.keyframe},
-                {"width", latest->image.cols},
-                {"height", latest->image.rows},
-                {"capture_timestamp_us", latest->metadata.capture_timestamp_us},
+                {"sequence", latest->metadata.sequence}, {"stream_id", latest->metadata.stream_id},
+                {"frame_id", latest->metadata.frame_id}, {"keyframe_id", latest->metadata.keyframe_id},
+                {"keyframe", latest->metadata.keyframe}, {"width", latest->image.cols},
+                {"height", latest->image.rows}, {"capture_timestamp_us", latest->metadata.capture_timestamp_us},
                 {"receive_timestamp_us", latest->metadata.receive_timestamp_us}
             };
-            if (latest->metadata.receive_timestamp_us > 0 &&
-                now_us >= latest->metadata.receive_timestamp_us) {
-                frame["receive_age_ms"] =
-                    static_cast<double>(now_us - latest->metadata.receive_timestamp_us) / 1000.0;
-            } else {
-                frame["receive_age_ms"] = nullptr;
-            }
+            frame["receive_age_ms"] = latest->metadata.receive_timestamp_us > 0 &&
+                now_us >= latest->metadata.receive_timestamp_us
+                ? json(static_cast<double>(now_us - latest->metadata.receive_timestamp_us) / 1000.0)
+                : json(nullptr);
             root["frame"] = std::move(frame);
         }
-
         return root.dump(2);
     }
 
@@ -153,19 +190,9 @@ struct HttpServer::Impl {
         server.Get(config.frame_endpoint, [this](const httplib::Request&, httplib::Response& res) {
             addNoCacheHeaders(res);
             const auto frame = frames->latest();
-            if (!frame) {
-                res.status = 503;
-                res.set_content("No decoded frame available yet\n", "text/plain");
-                return;
-            }
-
+            if (!frame) { res.status = 503; res.set_content("No decoded frame available yet\n", "text/plain"); return; }
             std::shared_ptr<const std::vector<unsigned char>> jpeg;
-            if (!getJpeg(frame, jpeg)) {
-                res.status = 500;
-                res.set_content("JPEG encoding failed\n", "text/plain");
-                return;
-            }
-
+            if (!getJpeg(frame, jpeg)) { res.status = 500; res.set_content("JPEG encoding failed\n", "text/plain"); return; }
             res.set_header("Content-Type", "image/jpeg");
             res.set_header("X-FlowX-Stream-Id", std::to_string(frame->metadata.stream_id));
             res.set_header("X-FlowX-Frame-Id", std::to_string(frame->metadata.frame_id));
@@ -177,25 +204,50 @@ struct HttpServer::Impl {
             res.set_content(statusJson(), "application/json");
         });
 
+        server.Get(kBrowserPageEndpoint, [](const httplib::Request&, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            res.set_content(std::string(browserHtml()), "text/html; charset=utf-8");
+        });
+        server.Get(kBrowserScriptEndpoint, [](const httplib::Request&, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            res.set_content(std::string(browserJs()), "application/javascript; charset=utf-8");
+        });
+
+        server.Get(kBrowserStreamEndpoint, [this](const httplib::Request&, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            struct State { std::uint64_t last_sequence = 0; };
+            auto state = std::make_shared<State>();
+            res.set_chunked_content_provider(
+                "application/octet-stream",
+                [this, state](std::size_t, httplib::DataSink& sink) {
+                    if (stopping.load(std::memory_order_relaxed)) return false;
+                    std::shared_ptr<const RawFrameBundle> bundle;
+                    if (!raw_frames->waitForNext(state->last_sequence, bundle,
+                                                 std::chrono::milliseconds(500)))
+                        return !stopping.load(std::memory_order_relaxed);
+                    if (!bundle || bundle->sequence <= state->last_sequence) return true;
+                    std::vector<u_char> record;
+                    if (!serializeBrowserRecord(*bundle, record)) return true;
+                    if (!sink.write(reinterpret_cast<const char*>(record.data()), record.size())) return false;
+                    state->last_sequence = bundle->sequence;
+                    browser_records.fetch_add(1, std::memory_order_relaxed);
+                    browser_bytes.fetch_add(record.size(), std::memory_order_relaxed);
+                    return true;
+                });
+        });
+
         server.Get(config.stream_endpoint, [this](const httplib::Request&, httplib::Response& res) {
             addNoCacheHeaders(res);
-
-            struct StreamState {
-                std::uint64_t last_sequence = 0;
-                Clock::time_point next_due{};
-            };
+            struct StreamState { std::uint64_t last_sequence = 0; Clock::time_point next_due{}; };
             auto state = std::make_shared<StreamState>();
             const auto frame_period = std::chrono::duration_cast<Clock::duration>(
                 std::chrono::duration<double>(1.0 / config.stream_fps));
-
-            const std::string content_type =
-                std::string("multipart/x-mixed-replace; boundary=") + kMjpegBoundary;
+            const std::string content_type = std::string("multipart/x-mixed-replace; boundary=") + kMjpegBoundary;
 
             res.set_chunked_content_provider(
                 content_type,
                 [this, state, frame_period](std::size_t, httplib::DataSink& sink) {
                     if (stopping.load(std::memory_order_relaxed)) return false;
-
                     const auto now = Clock::now();
                     if (state->next_due != Clock::time_point{} && now < state->next_due)
                         std::this_thread::sleep_until(state->next_due);
@@ -204,15 +256,13 @@ struct HttpServer::Impl {
                     std::shared_ptr<const PublishedFrame> frame = frames->latest();
                     if (!frame || frame->metadata.sequence <= state->last_sequence) {
                         frame.reset();
-                        frames->waitForNext(state->last_sequence, frame,
-                                            std::chrono::milliseconds(500));
+                        frames->waitForNext(state->last_sequence, frame, std::chrono::milliseconds(500));
                     }
                     if (!frame) return !stopping.load(std::memory_order_relaxed);
                     if (frame->metadata.sequence <= state->last_sequence) return true;
 
                     std::shared_ptr<const std::vector<unsigned char>> jpeg;
                     if (!getJpeg(frame, jpeg)) return true;
-
                     std::ostringstream header;
                     header << "--" << kMjpegBoundary << "\r\n"
                            << "Content-Type: image/jpeg\r\n"
@@ -220,12 +270,9 @@ struct HttpServer::Impl {
                            << "X-FlowX-Stream-Id: " << frame->metadata.stream_id << "\r\n"
                            << "X-FlowX-Frame-Id: " << frame->metadata.frame_id << "\r\n\r\n";
                     const std::string head = header.str();
-
                     if (!sink.write(head.data(), head.size())) return false;
-                    if (!sink.write(reinterpret_cast<const char*>(jpeg->data()), jpeg->size()))
-                        return false;
+                    if (!sink.write(reinterpret_cast<const char*>(jpeg->data()), jpeg->size())) return false;
                     if (!sink.write("\r\n", 2)) return false;
-
                     state->last_sequence = frame->metadata.sequence;
                     state->next_due = Clock::now() + frame_period;
                     return true;
@@ -241,40 +288,36 @@ HttpServer& HttpServer::operator=(HttpServer&&) noexcept = default;
 
 bool HttpServer::start(const HttpConfig& config,
                        const FrameStore& frames,
+                       const RawFrameStore& raw_frames,
                        const ReceiverStatusStore& status,
                        std::string& error) {
     error.clear();
     if (!impl_) impl_ = std::make_unique<Impl>();
-    if (impl_->running.load(std::memory_order_relaxed)) {
-        error = "HTTP server is already running";
-        return false;
-    }
+    if (impl_->running.load(std::memory_order_relaxed)) { error = "HTTP server is already running"; return false; }
 
-    if (!validEndpoint(config.frame_endpoint) ||
-        !validEndpoint(config.stream_endpoint) ||
+    if (!validEndpoint(config.frame_endpoint) || !validEndpoint(config.stream_endpoint) ||
         !validEndpoint(config.status_endpoint)) {
-        error = "HTTP endpoint paths must begin with '/'";
-        return false;
+        error = "HTTP endpoint paths must begin with '/'"; return false;
     }
-    if (config.frame_endpoint == config.stream_endpoint ||
-        config.frame_endpoint == config.status_endpoint ||
-        config.stream_endpoint == config.status_endpoint) {
-        error = "HTTP endpoint paths must be unique";
-        return false;
-    }
+    const std::vector<std::string> endpoints{
+        config.frame_endpoint, config.stream_endpoint, config.status_endpoint,
+        kBrowserPageEndpoint, kBrowserScriptEndpoint, kBrowserStreamEndpoint
+    };
+    for (std::size_t i = 0; i < endpoints.size(); ++i)
+        for (std::size_t j = i + 1; j < endpoints.size(); ++j)
+            if (endpoints[i] == endpoints[j]) { error = "HTTP endpoint paths must be unique"; return false; }
 
     impl_->config = config;
     impl_->frames = &frames;
+    impl_->raw_frames = &raw_frames;
     impl_->status = &status;
     impl_->stopping.store(false, std::memory_order_relaxed);
     impl_->registerRoutes();
 
     if (!impl_->server.bind_to_port(config.bind, config.port)) {
-        error = "cannot bind HTTP server to " + config.bind + ":" +
-                std::to_string(config.port);
+        error = "cannot bind HTTP server to " + config.bind + ":" + std::to_string(config.port);
         return false;
     }
-
     impl_->running.store(true, std::memory_order_relaxed);
     impl_->server_thread = std::thread([this] {
         impl_->server.listen_after_bind();
