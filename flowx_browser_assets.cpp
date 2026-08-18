@@ -65,6 +65,17 @@ void main(){
   vec2 uv=vec2((s.x+0.5)/uKeySize.x,1.0-(s.y+0.5)/uKeySize.y);
   color=texture(uKey,uv);
 }`;
+const stripsFs = `#version 300 es
+precision highp float;
+uniform sampler2D uEven;
+uniform sampler2D uOdd;
+out vec4 color;
+void main(){
+  ivec2 dst=ivec2(gl_FragCoord.xy);
+  ivec2 src=ivec2(dst.x >> 1,dst.y);
+  if((dst.x & 1)==0) color=texelFetch(uEven,src,0);
+  else color=texelFetch(uOdd,src,0);
+}`;
 const copyFs = `#version 300 es
 precision highp float;
 uniform sampler2D uTex;
@@ -118,10 +129,10 @@ void main(){
 }`;
 function sh(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
 function prog(fs){ const p=gl.createProgram(); gl.attachShader(p,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(p); if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
-const keyProg=prog(keyFs), copyProg=prog(copyFs), patchProg=prog(patchFs);
+const keyProg=prog(keyFs), stripsProg=prog(stripsFs), copyProg=prog(copyFs), patchProg=prog(patchFs);
 const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
 function tex(){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
-const keyTex=tex(), frameTex=[tex(),tex()], fbo=[gl.createFramebuffer(),gl.createFramebuffer()];
+const keyTex=tex(), stripTex=[tex(),tex()], keyFbo=gl.createFramebuffer(), frameTex=[tex(),tex()], fbo=[gl.createFramebuffer(),gl.createFramebuffer()];
 let outW=0,outH=0,keyW=0,keyH=0,current=0,keyFrameId=null,streamId=0,key=null;
 function alloc(w,h){
   if(outW===w&&outH===h) return;
@@ -131,11 +142,22 @@ function alloc(w,h){
 }
 function draw(){ gl.drawArrays(gl.TRIANGLES,0,3); }
 function display(){ gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,outW,outH); gl.useProgram(copyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(copyProg,'uTex'),0); gl.uniform2f(gl.getUniformLocation(copyProg,'uSize'),outW,outH); draw(); }
-function uploadKey(source,ow,oh,frameId){
-  alloc(ow,oh); keyW=source.width; keyH=source.height;
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); }
+function renderKey(frameId){
   current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); display();
   keyFrameId=frameId; stats.keys++; stats.renders++; $('frame').textContent=frameId; putStats();
+}
+function uploadKey(source,ow,oh,frameId){ alloc(ow,oh); keyW=source.width; keyH=source.height; uploadBitmap(keyTex,source); renderKey(frameId); }
+function uploadStrips(even,odd,ow,oh,frameId){
+  if(even.width!==odd.width||even.height!==odd.height) throw new Error('strip size mismatch');
+  alloc(ow,oh); keyW=even.width*2; keyH=even.height;
+  uploadBitmap(stripTex[0],even); uploadBitmap(stripTex[1],odd);
+  gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,keyFbo); gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,keyTex,0); if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE) throw new Error('key framebuffer incomplete');
+  gl.viewport(0,0,keyW,keyH); gl.useProgram(stripsProg);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,stripTex[0]); gl.uniform1i(gl.getUniformLocation(stripsProg,'uEven'),0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,stripTex[1]); gl.uniform1i(gl.getUniformLocation(stripsProg,'uOdd'),1);
+  draw(); renderKey(frameId);
 }
 function invH(a,p){
   const m00=a[0],m01=a[1],m02=a[2],m10=a[3],m11=a[4],m12=a[5],m20=p[0],m21=p[1],m22=1;
@@ -169,7 +191,7 @@ function addChunk(layer,index,offset,payload){ if(index>=layer.count||layer.got[
 function complete(l){ return l&&l.gotCount===l.count; }
 async function bitmap(bytes){ return await createImageBitmap(new Blob([bytes],{type:'image/jpeg'})); }
 async function showClassic(){ const l=key.layers.get(0); if(!complete(l)) return; const k=key,b=await bitmap(l.bytes); uploadKey(b,k.width,k.height,k.frameId); b.close(); key=null; }
-async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(a.bytes),bitmap(b.bytes)]); if(ia.width!==ib.width||ia.height!==ib.height) throw new Error('strip size mismatch'); const off=document.createElement('canvas'); off.width=ia.width*2; off.height=ia.height; const oc=off.getContext('2d',{alpha:false}); for(let x=0;x<ia.width;x++){ oc.drawImage(ia,x,0,1,ia.height,2*x,0,1,ia.height); oc.drawImage(ib,x,0,1,ib.height,2*x+1,0,1,ib.height); } uploadKey(off,k.width,k.height,k.frameId); ia.close(); ib.close(); key=null; }
+async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(a.bytes),bitmap(b.bytes)]); uploadStrips(ia,ib,k.width,k.height,k.frameId); ia.close(); ib.close(); key=null; }
 async function processCodec(codec){
   const u=new Uint8Array(codec.buffer,codec.byteOffset,codec.byteLength),v=new DataView(codec.buffer,codec.byteOffset,codec.byteLength); if(codec.byteLength<20||ascii4(u,0)!=='AFC1'||u[4]!==2) throw new Error('bad AFC1 packet');
   const type=u[5],hb=u16(v,6),frame=u32(v,8),kf=u32(v,12),ow=u16(v,16),oh=u16(v,18);
