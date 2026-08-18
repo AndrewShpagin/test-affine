@@ -34,6 +34,8 @@ struct CodecConfig {
     bool strips = true;
     bool homography = true;
     bool mesh = true;
+    int mesh_grid_x = 6;
+    int mesh_grid_y = 6;
 };
 
 struct UdpTargetConfig {

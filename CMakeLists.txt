@@ -47,11 +47,13 @@ target_link_libraries(flowx_common
         flowx_codec
         nlohmann_json::nlohmann_json)
 
-# Sender-side runtime: image acquisition and FlowX UDP transmission. HTTP image
-# acquisition intentionally uses cpp-httplib; raw sockets are used only for UDP.
+# Sender-side runtime: image acquisition, product-level patch shaping, and FlowX
+# UDP transmission. HTTP image acquisition intentionally uses cpp-httplib; raw
+# sockets are used only for UDP.
 add_library(flowx_sender_runtime
     flowx_image_source.cpp
-    flowx_net.cpp)
+    flowx_net.cpp
+    flowx_patch_rewrite.cpp)
 target_include_directories(flowx_sender_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_sender_runtime
     PUBLIC

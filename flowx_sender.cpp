@@ -2,6 +2,7 @@
 #include "flowx_image_source.h"
 #include "flowx_latest_frame.h"
 #include "flowx_net.h"
+#include "flowx_patch_rewrite.h"
 #include "flowx_protocol.h"
 
 #include <opencv2/imgcodecs.hpp>
@@ -9,8 +10,10 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <exception>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -24,18 +27,61 @@ void signalHandler(int) {
     g_stop.store(true, std::memory_order_relaxed);
 }
 
+struct CommandLine {
+    std::string config_file = "config/flowx_sender.json";
+    double loss_percent = 0.0;
+    std::uint32_t loss_seed = 1;
+};
+
+void printUsage() {
+    std::cerr << "Usage: flowx_sender [config.json] [--loss-percent PCT] [--loss-seed N]\n";
+}
+
+CommandLine parseCommandLine(int argc, char** argv) {
+    CommandLine result;
+    bool have_config = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--loss-percent" || arg == "--loss") {
+            if (++i >= argc) throw std::runtime_error(arg + " requires a value");
+            result.loss_percent = std::stod(argv[i]);
+            if (result.loss_percent < 0.0 || result.loss_percent > 100.0)
+                throw std::runtime_error("loss percent must be in [0, 100]");
+            continue;
+        }
+        if (arg == "--loss-seed") {
+            if (++i >= argc) throw std::runtime_error("--loss-seed requires a value");
+            const unsigned long long value = std::stoull(argv[i]);
+            if (value > 0xffffffffull)
+                throw std::runtime_error("loss seed must fit uint32");
+            result.loss_seed = static_cast<std::uint32_t>(value);
+            continue;
+        }
+        if (!arg.empty() && arg.front() == '-')
+            throw std::runtime_error("unknown option: " + arg);
+        if (have_config)
+            throw std::runtime_error("only one config file may be specified");
+        result.config_file = arg;
+        have_config = true;
+    }
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc > 2) {
-        std::cerr << "Usage: flowx_sender [config.json]\n";
+    CommandLine command_line;
+    try {
+        command_line = parseCommandLine(argc, argv);
+    } catch (const std::exception& e) {
+        printUsage();
+        std::cerr << "flowx_sender: " << e.what() << '\n';
         return 2;
     }
 
-    const std::string config_file = argc > 1 ? argv[1] : "config/flowx_sender.json";
-
     try {
-        const flowx::SenderConfig cfg = flowx::loadSenderConfig(config_file);
+        const flowx::SenderConfig cfg = flowx::loadSenderConfig(command_line.config_file);
         const std::uint32_t stream_id = flowx::generateStreamId();
 
         if (cfg.codec.keyframe_codec == flowx::KeyframeCodec::Jpeg2000 &&
@@ -59,23 +105,30 @@ int main(int argc, char** argv) {
         encoder.setKeyframeCodec(cfg.codec.keyframe_codec);
         encoder.setHomographyTransform(cfg.codec.homography);
 
+        std::mt19937 loss_rng(command_line.loss_seed);
+        std::bernoulli_distribution lose_packet(command_line.loss_percent / 100.0);
+
         std::cout << "FlowX sender\n"
-                  << "  config: " << config_file << '\n'
+                  << "  config: " << command_line.config_file << '\n'
                   << "  stream id: " << stream_id << '\n'
                   << "  source: " << source->name() << " @ " << cfg.source.fps << " fps\n"
                   << "  codec: " << flowx::keyframeCodecName(cfg.codec.keyframe_codec)
                   << ", key=" << cfg.codec.keyframe_bytes << " B/"
                   << cfg.codec.keyframe_period << " frames"
                   << ", strips=" << (cfg.codec.strips ? "yes" : "no")
-                  << ", H=" << (cfg.codec.homography ? "yes" : "no")
-                  << ", mesh=" << (cfg.codec.mesh ? "yes" : "no") << '\n'
+                  << ", H=" << (cfg.codec.homography ? "yes" : "no");
+        if (cfg.codec.mesh)
+            std::cout << ", mesh=" << cfg.codec.mesh_grid_x << 'x' << cfg.codec.mesh_grid_y;
+        else
+            std::cout << ", mesh=off";
+        std::cout << '\n'
                   << "  UDP target: " << cfg.udp.host << ':' << cfg.udp.port << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n";
-
-        if (!cfg.codec.mesh)
-            std::cerr << "WARNING: codec.mesh=false is not wired into the product encoder yet; "
-                         "mesh remains enabled.\n";
+        if (command_line.loss_percent > 0.0) {
+            std::cout << "  simulated UDP loss: " << command_line.loss_percent
+                      << "%  seed=" << command_line.loss_seed << '\n';
+        }
 
         std::signal(SIGINT, signalHandler);
         std::signal(SIGTERM, signalHandler);
@@ -119,6 +172,8 @@ int main(int argc, char** argv) {
         std::uint64_t encoded_frames = 0;
         std::uint64_t sent_packets = 0;
         std::uint64_t sent_bytes = 0;
+        std::uint64_t simulated_lost_packets = 0;
+        std::uint64_t simulated_lost_bytes = 0;
         std::uint64_t failed_packets = 0;
         std::uint64_t failed_bytes = 0;
         std::string last_udp_error;
@@ -141,6 +196,17 @@ int main(int argc, char** argv) {
 
             std::vector<flowx::u_char> codec_packet;
             while (encoder.getNextChunk(codec_packet)) {
+                if (!flowx::reshapePatchMesh(codec_packet,
+                                             cfg.codec.mesh,
+                                             cfg.codec.mesh_grid_x,
+                                             cfg.codec.mesh_grid_y,
+                                             &error)) {
+                    std::cerr << "FlowX patch rewrite failed: " << error << '\n';
+                    fatal_error = true;
+                    g_stop.store(true, std::memory_order_relaxed);
+                    break;
+                }
+
                 std::vector<flowx::u_char> datagram;
                 if (!flowx::wrapCodecPacket(codec_packet, stream_id,
                                             frame.capture_timestamp_us,
@@ -149,6 +215,15 @@ int main(int argc, char** argv) {
                     fatal_error = true;
                     g_stop.store(true, std::memory_order_relaxed);
                     break;
+                }
+
+                // Drop after the FlowX v3 envelope has been built, immediately before
+                // the socket send. This simulates loss of complete UDP datagrams and
+                // therefore exercises the same recovery path as real network loss.
+                if (command_line.loss_percent > 0.0 && lose_packet(loss_rng)) {
+                    ++simulated_lost_packets;
+                    simulated_lost_bytes += datagram.size();
+                    continue;
                 }
 
                 if (!udp.send(datagram, error)) {
@@ -179,6 +254,7 @@ int main(int argc, char** argv) {
                           << " encoded=" << encoded_frames
                           << " replaced=" << dropped
                           << " packets=" << sent_packets
+                          << " sim-loss=" << simulated_lost_packets
                           << " failed=" << failed_packets
                           << " bytes=" << sent_bytes << '\n';
                 next_report = now + std::chrono::seconds(2);
@@ -193,8 +269,11 @@ int main(int argc, char** argv) {
         std::cout << "FlowX sender stopped: captured=" << captured
                   << " encoded=" << encoded_frames
                   << " packets=" << sent_packets
+                  << " sim-loss=" << simulated_lost_packets
                   << " failed=" << failed_packets
                   << " bytes=" << sent_bytes;
+        if (simulated_lost_bytes > 0)
+            std::cout << " sim-loss-bytes=" << simulated_lost_bytes;
         if (failed_bytes > 0)
             std::cout << " failed-bytes=" << failed_bytes;
         std::cout << '\n';
