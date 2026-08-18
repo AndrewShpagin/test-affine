@@ -1,0 +1,21 @@
+{
+  "source": {
+    "type": "camera",
+    "device": "/dev/video0",
+    "width": 416,
+    "height": 416,
+    "fps": 20
+  },
+  "codec": {
+    "keyframe_bytes": 40000,
+    "keyframe_period": 5,
+    "keyframe_codec": "jpeg",
+    "strips": true,
+    "homography": true,
+    "mesh": true
+  },
+  "udp": {
+    "host": "127.0.0.1",
+    "port": 5000
+  }
+}
