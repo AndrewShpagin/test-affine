@@ -62,15 +62,16 @@ if(WIN32)
     target_link_libraries(flowx_sender_runtime PUBLIC ws2_32)
 endif()
 
-# Receiver core: UDP input plus thread-safe publication of the latest decoded frame.
-# The HTTP server is intentionally added in the next product PR.
+# Receiver runtime: UDP input, latest-frame publication, and HTTP image/status output.
 add_library(flowx_receiver_runtime
     flowx_udp_receiver.cpp
-    flowx_frame_store.cpp)
+    flowx_frame_store.cpp
+    flowx_http_server.cpp)
 target_include_directories(flowx_receiver_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_receiver_runtime
     PUBLIC
         flowx_common
+        ${FLOWX_HTTPLIB_TARGET}
         Threads::Threads)
 if(WIN32)
     target_link_libraries(flowx_receiver_runtime PUBLIC ws2_32)
