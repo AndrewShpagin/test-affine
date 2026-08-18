@@ -133,7 +133,8 @@ async function run() {
 }
 async function reconnectLoop(){ for(;;){ try{ await run(); }catch(e){ setState(String(e),false); stats.errors++; putStats(); await new Promise(r=>setTimeout(r,1000)); } } }
 reconnectLoop();
-})();)FLOWXJS";
+})();
+)FLOWXJS";
     return kJs;
 }
 
