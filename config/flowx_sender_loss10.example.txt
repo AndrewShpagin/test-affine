@@ -1,0 +1,3 @@
+Example reproducible 10% UDP loss test:
+
+./build/bin/flowx_sender config/flowx_sender_folder.json --loss-percent 10 --loss-seed 1
