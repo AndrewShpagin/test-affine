@@ -14,11 +14,10 @@ public:
     HttpServer();
     ~HttpServer();
 
-    HttpServer(HttpServer&&) noexcept;
-    HttpServer& operator=(HttpServer&&) noexcept;
-
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
+    HttpServer(HttpServer&&) = delete;
+    HttpServer& operator=(HttpServer&&) = delete;
 
     bool start(const HttpConfig& config,
                const FrameStore& frames,
