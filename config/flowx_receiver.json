@@ -1,0 +1,15 @@
+{
+  "udp": {
+    "bind": "0.0.0.0",
+    "port": 5000
+  },
+  "http": {
+    "bind": "0.0.0.0",
+    "port": 8080,
+    "jpeg_quality": 85,
+    "stream_fps": 20,
+    "frame_endpoint": "/frame.jpg",
+    "stream_endpoint": "/stream.mjpg",
+    "status_endpoint": "/status.json"
+  }
+}
