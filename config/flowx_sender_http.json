@@ -1,0 +1,20 @@
+{
+  "source": {
+    "type": "http",
+    "url": "http://127.0.0.1:8081/current.jpg",
+    "fps": 20,
+    "timeout_ms": 500
+  },
+  "codec": {
+    "keyframe_bytes": 40000,
+    "keyframe_period": 5,
+    "keyframe_codec": "jpeg",
+    "strips": true,
+    "homography": true,
+    "mesh": true
+  },
+  "udp": {
+    "host": "127.0.0.1",
+    "port": 5000
+  }
+}
