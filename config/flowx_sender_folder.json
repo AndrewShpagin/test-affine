@@ -11,7 +11,9 @@
     "keyframe_codec": "jpeg",
     "strips": true,
     "homography": true,
-    "mesh": true
+    "mesh": true,
+    "mesh_grid_x": 6,
+    "mesh_grid_y": 6
   },
   "udp": {
     "host": "127.0.0.1",
