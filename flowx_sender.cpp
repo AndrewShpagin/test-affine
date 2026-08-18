@@ -119,6 +119,10 @@ int main(int argc, char** argv) {
         std::uint64_t encoded_frames = 0;
         std::uint64_t sent_packets = 0;
         std::uint64_t sent_bytes = 0;
+        std::uint64_t failed_packets = 0;
+        std::uint64_t failed_bytes = 0;
+        std::string last_udp_error;
+        auto last_udp_error_time = std::chrono::steady_clock::time_point{};
         auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         bool fatal_error = false;
 
@@ -146,12 +150,23 @@ int main(int argc, char** argv) {
                     g_stop.store(true, std::memory_order_relaxed);
                     break;
                 }
+
                 if (!udp.send(datagram, error)) {
-                    std::cerr << "UDP send failed: " << error << '\n';
-                    fatal_error = true;
-                    g_stop.store(true, std::memory_order_relaxed);
-                    break;
+                    ++failed_packets;
+                    failed_bytes += datagram.size();
+
+                    const auto now = std::chrono::steady_clock::now();
+                    if (error != last_udp_error ||
+                        last_udp_error_time == std::chrono::steady_clock::time_point{} ||
+                        now - last_udp_error_time >= std::chrono::seconds(1)) {
+                        std::cerr << "UDP send failed (continuing): " << error
+                                  << " [failed packets=" << failed_packets << "]\n";
+                        last_udp_error = error;
+                        last_udp_error_time = now;
+                    }
+                    continue;
                 }
+
                 ++sent_packets;
                 sent_bytes += datagram.size();
             }
@@ -164,6 +179,7 @@ int main(int argc, char** argv) {
                           << " encoded=" << encoded_frames
                           << " replaced=" << dropped
                           << " packets=" << sent_packets
+                          << " failed=" << failed_packets
                           << " bytes=" << sent_bytes << '\n';
                 next_report = now + std::chrono::seconds(2);
             }
@@ -177,7 +193,11 @@ int main(int argc, char** argv) {
         std::cout << "FlowX sender stopped: captured=" << captured
                   << " encoded=" << encoded_frames
                   << " packets=" << sent_packets
-                  << " bytes=" << sent_bytes << '\n';
+                  << " failed=" << failed_packets
+                  << " bytes=" << sent_bytes;
+        if (failed_bytes > 0)
+            std::cout << " failed-bytes=" << failed_bytes;
+        std::cout << '\n';
         return fatal_error ? 1 : 0;
     } catch (const std::exception& e) {
         std::cerr << "flowx_sender: " << e.what() << '\n';
