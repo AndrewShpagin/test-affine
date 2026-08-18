@@ -6,6 +6,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(OpenCV REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(Threads REQUIRED)
+
+# cpp-httplib: prefer its CMake package when available; Debian packages also
+# provide a pkg-config module.
+find_package(httplib CONFIG QUIET)
+if(TARGET httplib::httplib)
+    set(FLOWX_HTTPLIB_TARGET httplib::httplib)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CPPHTTPLIB REQUIRED IMPORTED_TARGET cpp-httplib)
+    set(FLOWX_HTTPLIB_TARGET PkgConfig::CPPHTTPLIB)
+endif()
 
 add_executable(affine_test affine_test.cpp)
 target_link_libraries(affine_test PRIVATE ${OpenCV_LIBS})
@@ -26,8 +38,6 @@ target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS})
 add_executable(codec_test codec_test.cpp)
 target_link_libraries(codec_test PRIVATE flowx_codec)
 
-# Product-level transport/config foundation. Networking and image sources are
-# intentionally added in subsequent PRs.
 add_library(flowx_common
     flowx_protocol.cpp
     flowx_config.cpp)
@@ -37,8 +47,23 @@ target_link_libraries(flowx_common
         flowx_codec
         nlohmann_json::nlohmann_json)
 
+# Sender-side runtime: image acquisition and FlowX UDP transmission. HTTP image
+# acquisition intentionally uses cpp-httplib; raw sockets are used only for UDP.
+add_library(flowx_sender_runtime
+    flowx_image_source.cpp
+    flowx_net.cpp)
+target_include_directories(flowx_sender_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(flowx_sender_runtime
+    PUBLIC
+        flowx_common
+        ${FLOWX_HTTPLIB_TARGET}
+        Threads::Threads)
+if(WIN32)
+    target_link_libraries(flowx_sender_runtime PUBLIC ws2_32)
+endif()
+
 add_executable(flowx_sender flowx_sender.cpp)
-target_link_libraries(flowx_sender PRIVATE flowx_common)
+target_link_libraries(flowx_sender PRIVATE flowx_sender_runtime)
 
 add_executable(flowx_receiver flowx_receiver.cpp)
 target_link_libraries(flowx_receiver PRIVATE flowx_common)
