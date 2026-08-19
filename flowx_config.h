@@ -31,6 +31,7 @@ struct CodecConfig {
     int keyframe_bytes = 40000;
     int keyframe_period = 5;
     KeyframeCodec keyframe_codec = KeyframeCodec::Jpeg;
+    bool grayscale = false;
     bool strips = true;
     bool homography = true;
     bool mesh = true;
