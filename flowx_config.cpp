@@ -117,6 +117,7 @@ CodecConfig parseCodec(const json& j) {
     cfg.keyframe_period = j.value("keyframe_period", cfg.keyframe_period);
     cfg.keyframe_codec = parseKeyframeCodec(
         j.value("keyframe_codec", std::string("jpeg")));
+    cfg.grayscale = j.value("grayscale", cfg.grayscale);
     cfg.strips = j.value("strips", cfg.strips);
     cfg.homography = j.value("homography", cfg.homography);
     cfg.mesh = j.value("mesh", cfg.mesh);
