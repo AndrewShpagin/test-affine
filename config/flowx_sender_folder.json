@@ -9,6 +9,7 @@
     "keyframe_bytes": 40000,
     "keyframe_period": 5,
     "keyframe_codec": "jpeg",
+    "grayscale": false,
     "strips": true,
     "homography": true,
     "mesh": true,
