@@ -1,6 +1,7 @@
 #include "flowx_protocol.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -345,7 +346,10 @@ bool wrapPatch(const std::vector<u_char>& codec,
         mesh_q.reserve(point_count * 2);
         for (std::size_t i = 0; i < point_count * 2; ++i) {
             float v = 0.0f;
-            if (!readFloat(codec, pos, v)) return false;
+            if (!readFloat(codec, pos, v)) {
+                setError(error, "truncated AFC1 mesh");
+                return false;
+            }
             mesh_q.push_back(quantizeMesh(v));
         }
     } else {
@@ -406,9 +410,12 @@ bool wrapLayerEnd(const std::vector<u_char>& codec,
         return false;
     }
     datagram.clear();
+    datagram.reserve(kFlowXHeaderBytes + 4);
     appendWireCommon(datagram, WirePacketType::LayeredKeyframeEnd,
                      keyFlags(0, layer_count), stream_id, h.frame_id,
                      capture_timestamp_us);
+    appendU16(datagram, h.width);
+    appendU16(datagram, h.height);
     return true;
 }
 
@@ -567,7 +574,8 @@ bool unwrapPatch(const std::vector<u_char>& datagram,
     return packet.codec_packet.size() == afc_size;
 }
 
-bool unwrapLayerEnd(std::uint8_t flags,
+bool unwrapLayerEnd(const std::vector<u_char>& datagram,
+                    std::uint8_t flags,
                     FlowXPacket& packet,
                     std::string* error) {
     std::uint8_t layer_index = 0, layer_count = 0;
@@ -575,14 +583,19 @@ bool unwrapLayerEnd(std::uint8_t flags,
         setError(error, "invalid FlowX layered-end flags");
         return false;
     }
+    std::size_t pos = kFlowXHeaderBytes;
+    std::uint16_t ow = 0, oh = 0;
+    if (!readU16(datagram, pos, ow) || !readU16(datagram, pos, oh) ||
+        ow == 0 || oh == 0 || pos != datagram.size()) {
+        setError(error, "invalid FlowX layered-end size");
+        return false;
+    }
     packet.metadata.keyframe_id = packet.metadata.frame_id;
     packet.codec_packet.clear();
     packet.codec_packet.reserve(kAfcLayerEndBytes);
-    // Original size is not used by the AFC1 end handler beyond common validation;
-    // use 1x1 because v4 intentionally does not repeat keyframe dimensions here.
     appendAfcCommon(packet.codec_packet, kAfcLayeredKeyframeEnd,
                     static_cast<std::uint16_t>(kAfcLayerEndBytes),
-                    packet.metadata.frame_id, packet.metadata.frame_id, 1, 1);
+                    packet.metadata.frame_id, packet.metadata.frame_id, ow, oh);
     appendU8(packet.codec_packet, layer_count);
     appendU8(packet.codec_packet, 0);
     appendU16(packet.codec_packet, 0);
@@ -671,11 +684,11 @@ bool unwrapCodecPacket(const std::vector<u_char>& datagram,
         ok = unwrapPatch(datagram, flags, packet, error);
         break;
     case WirePacketType::LayeredKeyframeEnd:
-        if (datagram.size() != kFlowXHeaderBytes) {
-            setError(error, "FlowX layered end must contain only common header");
+        if (datagram.size() != kFlowXHeaderBytes + 4) {
+            setError(error, "FlowX layered end has wrong size");
             return false;
         }
-        ok = unwrapLayerEnd(flags, packet, error);
+        ok = unwrapLayerEnd(datagram, flags, packet, error);
         break;
     }
     if (!ok) packet = FlowXPacket{};
