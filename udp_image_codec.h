@@ -134,6 +134,11 @@ private:
 class Decoder {
 public:
     void pushData(const std::vector<u_char>& data);
+    // FlowX v4 does not transmit the historical layered-keyframe end packet.
+    // The receiver calls this after each input packet; it publishes immediately
+    // once every expected layer is complete. Partial-layer recovery on the first
+    // following patch remains handled by pushData().
+    bool finalizePendingLayeredKeyframe();
     bool updateKeyframe(std::vector<u_char>& jpeg_data);
     bool getNextPatch(std::vector<PatchData>& patch);
     void render(cv::Mat& destination, const std::vector<PatchData>& patch, const std::vector<u_char>& jpeg_data);
