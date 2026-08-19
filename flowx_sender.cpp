@@ -6,6 +6,7 @@
 #include "flowx_protocol.h"
 
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,21 @@ std::atomic<bool> g_stop{false};
 
 void signalHandler(int) {
     g_stop.store(true, std::memory_order_relaxed);
+}
+
+bool convertToGrayscale(cv::Mat& image) {
+    if (image.empty() || image.channels() == 1) return !image.empty();
+
+    cv::Mat gray;
+    if (image.channels() == 3)
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    else if (image.channels() == 4)
+        cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+    else
+        return false;
+
+    image = std::move(gray);
+    return true;
 }
 
 struct CommandLine {
@@ -115,6 +131,7 @@ int main(int argc, char** argv) {
                   << "  codec: " << flowx::keyframeCodecName(cfg.codec.keyframe_codec)
                   << ", key=" << cfg.codec.keyframe_bytes << " B/"
                   << cfg.codec.keyframe_period << " frames"
+                  << ", grayscale=" << (cfg.codec.grayscale ? "yes" : "no")
                   << ", strips=" << (cfg.codec.strips ? "yes" : "no")
                   << ", H=" << (cfg.codec.homography ? "yes" : "no");
         if (cfg.codec.mesh)
@@ -189,6 +206,14 @@ int main(int argc, char** argv) {
             }
             if (frame.image.empty()) continue;
 
+            if (cfg.codec.grayscale && !convertToGrayscale(frame.image)) {
+                std::cerr << "Cannot convert source image with " << frame.image.channels()
+                          << " channels to grayscale\n";
+                fatal_error = true;
+                g_stop.store(true, std::memory_order_relaxed);
+                break;
+            }
+
             encoder.pushImage(frame.image,
                               cfg.codec.keyframe_bytes,
                               cfg.codec.keyframe_period);
@@ -217,7 +242,7 @@ int main(int argc, char** argv) {
                     break;
                 }
 
-                // Drop after the FlowX v3 envelope has been built, immediately before
+                // Drop after the final FlowX v4 datagram has been built, immediately before
                 // the socket send. This simulates loss of complete UDP datagrams and
                 // therefore exercises the same recovery path as real network loss.
                 if (command_line.loss_percent > 0.0 && lose_packet(loss_rng)) {
