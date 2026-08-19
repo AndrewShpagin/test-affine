@@ -30,7 +30,7 @@ target_link_libraries(keyframe_test PRIVATE ${OpenCV_LIBS})
 
 # Stable codec implementation. Keep the historical target name as an alias while
 # product-facing code uses FlowX naming.
-add_library(flowx_codec udp_image_codec.cpp motion_refine.cpp decoder_finalize.cpp)
+add_library(flowx_codec udp_image_codec.cpp motion_refine.cpp)
 add_library(udp_image_codec ALIAS flowx_codec)
 target_include_directories(flowx_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS})
