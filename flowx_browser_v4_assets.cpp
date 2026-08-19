@@ -15,7 +15,7 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}header{p
 </head>
 <body>
 <header>
-  <strong>FlowX browser decoder (WebGL2)</strong>
+  <strong>FlowX v4 browser decoder (WebGL2)</strong>
   <span id="state">connecting…</span>
   <span>stream <code id="stream">-</code></span>
   <span>frame <code id="frame">-</code></span>
@@ -43,8 +43,8 @@ const gl = canvas.getContext('webgl2', {alpha:false, antialias:false});
 const stats = {records:0, packets:0, keys:0, patches:0, renders:0, skipped:0, errors:0};
 const setState = (text, ok=true) => { $('state').textContent=text; $('state').className=ok?'ok':'bad'; };
 const putStats = () => { for (const k of Object.keys(stats)) { const e=$(k); if(e) e.textContent=stats[k]; } };
-const u16 = (v,o) => v.getUint16(o,true), u32 = (v,o) => v.getUint32(o,true), f32=(v,o)=>v.getFloat32(o,true);
-const ascii4 = (u,o) => String.fromCharCode(u[o],u[o+1],u[o+2],u[o+3]);
+const u16=(v,o)=>v.getUint16(o,true), i16=(v,o)=>v.getInt16(o,true), u32=(v,o)=>v.getUint32(o,true), f32=(v,o)=>v.getFloat32(o,true);
+const ascii4=(u,o)=>String.fromCharCode(u[o],u[o+1],u[o+2],u[o+3]);
 if(!gl){ setState('WebGL2 unavailable', false); return; }
 
 const vs = `#version 300 es
@@ -142,8 +142,6 @@ function alloc(w,h){
 }
 function draw(){ gl.drawArrays(gl.TRIANGLES,0,3); }
 function display(){ gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,outW,outH); gl.useProgram(copyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(copyProg,'uTex'),0); gl.uniform2f(gl.getUniformLocation(copyProg,'uSize'),outW,outH); draw(); }
-// Keep browser-decoded JPEG rows in image-space order: texture row 0 is image y=0 (top).
-// This avoids relying on UNPACK_FLIP_Y_WEBGL behavior for ImageBitmap uploads.
 function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); }
 function renderKey(frameId){
   current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); display();
@@ -179,32 +177,80 @@ function renderPatch(p){
   gl.uniform2f(gl.getUniformLocation(patchProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(patchProg,'uKeySize'),keyW,keyH); gl.uniformMatrix3fv(gl.getUniformLocation(patchProg,'uInvH'),false,inv); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridX'),p.gridX); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridY'),p.gridY); gl.uniform2fv(gl.getUniformLocation(patchProg,'uMesh[0]'),p.mesh); draw(); current=next; display();
   stats.renders++; $('frame').textContent=p.frameId; putStats();
 }
-function parsePatch(u,v,hb,frame,kf,ow,oh){
-  if(hb!==u.length||hb<48) throw new Error('bad patch size');
-  const gx=u[20],gy=u[21],flags=u16(v,22); if(gx<1||gy<1||gx>8||gy>8||(flags&~1)) throw new Error('bad patch grid/flags');
-  let pos=24; const a=[]; for(let i=0;i<6;i++,pos+=4) a.push(f32(v,pos)); const persp=(flags&1)?[f32(v,pos),f32(v,pos+4)]:[0,0]; if(flags&1) pos+=8;
-  const need=pos+gx*gy*8; if(need!==hb) throw new Error('bad patch mesh size');
-  const mesh=new Float32Array(128); for(let y=0;y<gy;y++) for(let x=0;x<gx;x++){ const q=(y*8+x)*2; mesh[q]=f32(v,pos); mesh[q+1]=f32(v,pos+4); pos+=8; }
-  return {frameId:frame,keyframeId:kf,width:ow,height:oh,gridX:gx,gridY:gy,affine:a,perspective:persp,mesh};
+
+function resetKey(frameId,width,height,kind,layerCount){ key={frameId,width,height,kind,layerCount,layers:new Map()}; }
+function getLayer(index,total,count,jw,jh){
+  let l=key.layers.get(index);
+  if(!l){ l={total,count,jw,jh,chunks:new Array(count),gotCount:0}; key.layers.set(index,l); }
+  else if(l.total!==total||l.count!==count||l.jw!==jw||l.jh!==jh) throw new Error('key layer metadata changed');
+  return l;
 }
-function resetKey(frameId,width,height,kind,layerCount=1){ key={frameId,width,height,kind,layerCount,layers:new Map()}; }
-function getLayer(index,bytes,count,jw,jh){ let l=key.layers.get(index); if(!l){ l={bytes:new Uint8Array(bytes),got:new Uint8Array(count),gotCount:0,count,jw,jh}; key.layers.set(index,l); } return l; }
-function addChunk(layer,index,offset,payload){ if(index>=layer.count||layer.got[index]) return; if(offset+payload.length>layer.bytes.length) throw new Error('chunk outside layer'); layer.bytes.set(payload,offset); layer.got[index]=1; layer.gotCount++; }
-function complete(l){ return l&&l.gotCount===l.count; }
+function addChunk(layer,index,payload){ if(index>=layer.count||layer.chunks[index]) return; layer.chunks[index]=payload; layer.gotCount++; }
+function complete(layer){ return layer&&layer.gotCount===layer.count; }
+function layerBytes(layer){
+  const out=new Uint8Array(layer.total); let p=0;
+  for(let i=0;i<layer.count;i++){ const c=layer.chunks[i]; if(!c||p+c.length>out.length) throw new Error('bad key layer chunks'); out.set(c,p); p+=c.length; }
+  if(p!==out.length) throw new Error('key layer byte count mismatch'); return out;
+}
 async function bitmap(bytes){ return await createImageBitmap(new Blob([bytes],{type:'image/jpeg'})); }
-async function showClassic(){ const l=key.layers.get(0); if(!complete(l)) return; const k=key,b=await bitmap(l.bytes); uploadKey(b,k.width,k.height,k.frameId); b.close(); key=null; }
-async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(a.bytes),bitmap(b.bytes)]); uploadStrips(ia,ib,k.width,k.height,k.frameId); ia.close(); ib.close(); key=null; }
-async function processCodec(codec){
-  const u=new Uint8Array(codec.buffer,codec.byteOffset,codec.byteLength),v=new DataView(codec.buffer,codec.byteOffset,codec.byteLength); if(codec.byteLength<20||ascii4(u,0)!=='AFC1'||u[4]!==2) throw new Error('bad AFC1 packet');
-  const type=u[5],hb=u16(v,6),frame=u32(v,8),kf=u32(v,12),ow=u16(v,16),oh=u16(v,18);
-  if(type===2){ stats.patches++; renderPatch(parsePatch(u,v,hb,frame,kf,ow,oh)); return; }
-  if(type===1){ if(hb!==40||codec.byteLength<40) throw new Error('bad classic key header'); if(!key||key.frameId!==frame||key.kind!=='classic') resetKey(frame,ow,oh,'classic'); const jw=u16(v,20),jh=u16(v,22),ci=u16(v,24),cc=u16(v,26),total=u32(v,28),off=u32(v,32),n=u16(v,36); if(hb+n!==codec.byteLength) throw new Error('bad classic chunk length'); addChunk(getLayer(0,total,cc,jw,jh),ci,off,u.slice(hb)); await showClassic(); return; }
-  if(type===3){ if(hb!==44||codec.byteLength<44) throw new Error('bad layered key header'); const li=u[20],lc=u[21]; if(lc!==2) return; if(!key||key.frameId!==frame||key.kind!=='strips') resetKey(frame,ow,oh,'strips',lc); const jw=u16(v,24),jh=u16(v,26),ci=u16(v,28),cc=u16(v,30),total=u32(v,32),off=u32(v,36),n=u16(v,40); if(hb+n!==codec.byteLength) throw new Error('bad layered chunk length'); addChunk(getLayer(li,total,cc,jw,jh),ci,off,u.slice(hb)); await showStrips(); return; }
+async function showClassic(){ const l=key.layers.get(0); if(!complete(l)) return; const k=key,b=await bitmap(layerBytes(l)); uploadKey(b,k.width,k.height,k.frameId); b.close(); key=null; }
+async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(layerBytes(a)),bitmap(layerBytes(b))]); uploadStrips(ia,ib,k.width,k.height,k.frameId); ia.close(); ib.close(); key=null; }
+
+function parsePatchV4(u,v,flags,frame){
+  if((flags&~3)!==0) throw new Error('bad patch flags');
+  const homography=(flags&1)!==0, hasMesh=(flags&2)!==0;
+  if(u.length<51) throw new Error('short patch');
+  const age=u16(v,20), ow=u16(v,22), oh=u16(v,24), grid=u[26];
+  let pos=27; const a=[]; for(let i=0;i<6;i++,pos+=4) a.push(f32(v,pos));
+  const persp=homography?[f32(v,pos),f32(v,pos+4)]:[0,0]; if(homography) pos+=8;
+  const mesh=new Float32Array(128); let gx=1,gy=1;
+  if(hasMesh){
+    gx=(grid&15)+1; gy=((grid>>4)&15)+1;
+    if(gx<2||gy<2||gx>8||gy>8||pos+gx*gy*4!==u.length) throw new Error('bad mesh grid/size');
+    for(let y=0;y<gy;y++) for(let x=0;x<gx;x++){ const q=(y*8+x)*2; mesh[q]=i16(v,pos)/128.0; mesh[q+1]=i16(v,pos+2)/128.0; pos+=4; }
+  }else if(grid!==0||pos!==u.length) throw new Error('mesh-disabled patch has extra data');
+  return {frameId:frame,keyframeId:(frame-age)>>>0,width:ow,height:oh,gridX:gx,gridY:gy,affine:a,perspective:persp,mesh};
 }
-async function processDatagram(d){ const u=new Uint8Array(d.buffer,d.byteOffset,d.byteLength),v=new DataView(d.buffer,d.byteOffset,d.byteLength); if(d.byteLength<32||ascii4(u,0)!=='FXV3'||u[4]!==3||u16(v,6)!==32) throw new Error('bad FXV3 packet'); const sid=u32(v,8),payload=u16(v,28); if(32+payload!==d.byteLength) throw new Error('bad FXV3 payload length'); if(streamId!==sid){ streamId=sid; key=null; keyFrameId=null; $('stream').textContent=sid; } stats.packets++; await processCodec(d.slice(32)); }
-async function processRecord(r){ const u=new Uint8Array(r.buffer,r.byteOffset,r.byteLength),v=new DataView(r.buffer,r.byteOffset,r.byteLength); if(r.byteLength<28||ascii4(u,0)!=='FXB1'||u16(v,4)!==1||u16(v,6)!==28) throw new Error('bad FXB1 record'); const recordBytes=u32(v,8),count=u16(v,24); if(recordBytes!==r.byteLength) throw new Error('bad record size'); let p=28; for(let i=0;i<count;i++){ if(p+2>r.length) throw new Error('truncated packet length'); const n=u16(v,p); p+=2; if(p+n>r.length) throw new Error('truncated packet'); await processDatagram(r.slice(p,p+n)); p+=n; } if(p!==r.length) throw new Error('record trailing bytes'); stats.records++; putStats(); }
+
+async function processDatagram(d){
+  const u=new Uint8Array(d.buffer,d.byteOffset,d.byteLength),v=new DataView(d.buffer,d.byteOffset,d.byteLength);
+  if(u.length<20||u16(v,0)!==0x5846) throw new Error('bad FlowX magic');
+  const vt=u[2],version=vt>>4,type=vt&15,flags=u[3],sid=u32(v,4),frame=u32(v,8);
+  if(version!==4||sid===0||type<1||type>3) throw new Error('bad FlowX v4 header');
+  if(streamId!==sid){ streamId=sid; key=null; keyFrameId=null; $('stream').textContent=sid; }
+  stats.packets++;
+
+  if(type===1){
+    if((flags&0xf0)!==0||u.length<=34) throw new Error('bad key chunk flags/size');
+    const li=flags&3,lc=((flags>>2)&3)+1;
+    if(lc<1||lc>3||li>=lc) throw new Error('bad key layer');
+    const ow=u16(v,20),oh=u16(v,22),jw=u16(v,24),jh=u16(v,26),total=u32(v,28),ci=u[32],cc=u[33];
+    if(!ow||!oh||!jw||!jh||!total||!cc||ci>=cc) throw new Error('bad key chunk metadata');
+    if(lc===3) return; // MOSAIC is intentionally outside the browser path.
+    const kind=lc===1?'classic':'strips';
+    if(!key||key.frameId!==frame||key.kind!==kind) resetKey(frame,ow,oh,kind,lc);
+    addChunk(getLayer(li,total,cc,jw,jh),ci,u.slice(34));
+    if(lc===1) await showClassic(); else await showStrips();
+    return;
+  }
+  if(type===2){ stats.patches++; renderPatch(parsePatchV4(u,v,flags,frame)); return; }
+  if(type===3) return; // C++ compatibility end marker; browser completion is chunk-count based.
+}
+
+async function processRecord(r){
+  const u=new Uint8Array(r.buffer,r.byteOffset,r.byteLength),v=new DataView(r.buffer,r.byteOffset,r.byteLength);
+  if(r.byteLength<28||ascii4(u,0)!=='FXB1'||u16(v,4)!==1||u16(v,6)!==28) throw new Error('bad FXB1 record');
+  const recordBytes=u32(v,8),count=u16(v,24); if(recordBytes!==r.byteLength) throw new Error('bad record size');
+  let p=28;
+  for(let i=0;i<count;i++){ if(p+2>r.length) throw new Error('truncated packet length'); const n=u16(v,p); p+=2; if(p+n>r.length) throw new Error('truncated packet'); await processDatagram(r.slice(p,p+n)); p+=n; }
+  if(p!==r.length) throw new Error('record trailing bytes'); stats.records++; putStats();
+}
 function concat(a,b){ const c=new Uint8Array(a.length+b.length); c.set(a); c.set(b,a.length); return c; }
-async function run(){ setState('connecting…'); const res=await fetch('/flowx.bin',{cache:'no-store'}); if(!res.ok||!res.body) throw new Error('HTTP '+res.status); setState('connected'); const rd=res.body.getReader(); let buf=new Uint8Array(0); while(true){ const {value,done}=await rd.read(); if(done) throw new Error('stream ended'); buf=concat(buf,value); while(buf.length>=12){ const v=new DataView(buf.buffer,buf.byteOffset,buf.byteLength); if(ascii4(buf,0)!=='FXB1'){ buf=buf.slice(1); stats.errors++; putStats(); continue; } const n=u32(v,8); if(n<28||n>16*1024*1024){ buf=buf.slice(4); stats.errors++; putStats(); continue; } if(buf.length<n) break; const rec=buf.slice(0,n); buf=buf.slice(n); try{ await processRecord(rec); }catch(e){ stats.errors++; putStats(); console.error(e); } } } }
+async function run(){
+  setState('connecting…'); const res=await fetch('/flowx.bin',{cache:'no-store'}); if(!res.ok||!res.body) throw new Error('HTTP '+res.status);
+  setState('connected'); const rd=res.body.getReader(); let buf=new Uint8Array(0);
+  while(true){ const {value,done}=await rd.read(); if(done) throw new Error('stream ended'); buf=concat(buf,value); while(buf.length>=12){ const v=new DataView(buf.buffer,buf.byteOffset,buf.byteLength); if(ascii4(buf,0)!=='FXB1'){ buf=buf.slice(1); stats.errors++; putStats(); continue; } const n=u32(v,8); if(n<28||n>16*1024*1024){ buf=buf.slice(4); stats.errors++; putStats(); continue; } if(buf.length<n) break; const rec=buf.slice(0,n); buf=buf.slice(n); try{ await processRecord(rec); }catch(e){ stats.errors++; putStats(); console.error(e); } } }
+}
 async function reconnectLoop(){ for(;;){ try{ await run(); }catch(e){ setState(String(e),false); stats.errors++; putStats(); await new Promise(r=>setTimeout(r,1000)); } } }
 reconnectLoop();
 })();

@@ -38,14 +38,19 @@ target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS})
 add_executable(codec_test codec_test.cpp)
 target_link_libraries(codec_test PRIVATE flowx_codec)
 
+# The stable codec still speaks AFC1 internally. flowx_protocol_v4.cpp compacts
+# AFC1 to the network wire format and reconstructs AFC1 for the C++ decoder.
 add_library(flowx_common
-    flowx_protocol.cpp
+    flowx_protocol_v4.cpp
     flowx_config.cpp)
 target_include_directories(flowx_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_common
     PUBLIC
         flowx_codec
         nlohmann_json::nlohmann_json)
+
+add_executable(flowx_protocol_test flowx_protocol_test.cpp)
+target_link_libraries(flowx_protocol_test PRIVATE flowx_common)
 
 # Sender-side runtime: image acquisition, product-level patch shaping, and FlowX
 # UDP transmission. HTTP image acquisition intentionally uses cpp-httplib; raw
@@ -70,7 +75,7 @@ add_library(flowx_receiver_runtime
     flowx_udp_receiver.cpp
     flowx_frame_store.cpp
     flowx_raw_store.cpp
-    flowx_browser_assets.cpp
+    flowx_browser_v4_assets.cpp
     flowx_http_server.cpp)
 target_include_directories(flowx_receiver_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_receiver_runtime
@@ -89,7 +94,7 @@ add_executable(flowx_receiver flowx_receiver.cpp)
 target_link_libraries(flowx_receiver PRIVATE flowx_receiver_runtime)
 
 # Keep executable paths stable across single- and multi-config generators.
-foreach(target affine_test mesh_test keyframe_test codec_test flowx_sender flowx_receiver)
+foreach(target affine_test mesh_test keyframe_test codec_test flowx_protocol_test flowx_sender flowx_receiver)
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"

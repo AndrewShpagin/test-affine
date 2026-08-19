@@ -9,12 +9,22 @@
 
 namespace flowx {
 
-// FlowX network envelope v3. The existing codec packet is kept intact as the
-// payload, while the product transport adds stream/session identity and capture time.
-constexpr std::uint8_t kProtocolVersion = 3;
-constexpr std::size_t kFlowXHeaderBytes = 32;
+// FlowX v4 is the compact network wire format. The codec still uses AFC1 v2
+// internally, but AFC1 headers are removed on the wire and reconstructed by the
+// receiver adapter. All multibyte fields are little-endian.
+constexpr std::uint8_t kProtocolVersion = 4;
+constexpr std::uint16_t kFlowXMagic = 0x5846u; // bytes: 'F' 'X'
+constexpr std::size_t kFlowXHeaderBytes = 20;  // common v4 header
 constexpr std::size_t kMaxUdpDatagramBytes = 1400;
 constexpr std::size_t kMaxFlowXPayloadBytes = kMaxUdpDatagramBytes - kFlowXHeaderBytes;
+constexpr float kMeshWireScale = 128.0f;
+constexpr float kMeshWireLimit = 255.0f;
+
+enum class WirePacketType : std::uint8_t {
+    KeyframeChunk = 1,
+    Patch = 2,
+    LayeredKeyframeEnd = 3,
+};
 
 struct PacketMetadata {
     std::uint32_t stream_id = 0;
@@ -25,21 +35,22 @@ struct PacketMetadata {
 
 struct FlowXPacket {
     PacketMetadata metadata;
+    // Reconstructed AFC1 v2 packet for the existing C++ decoder. AFC1 is an
+    // internal compatibility representation and is not present in the UDP data.
     std::vector<u_char> codec_packet;
 };
 
 std::uint32_t generateStreamId();
 
-// Wrap one codec packet into a FlowX v3 UDP datagram. frame_id/keyframe_id are
-// extracted from the codec packet so transport metadata cannot disagree with it.
+// Compact one internal AFC1 v2 packet into one FlowX v4 UDP datagram.
 bool wrapCodecPacket(const std::vector<u_char>& codec_packet,
                      std::uint32_t stream_id,
                      std::uint64_t capture_timestamp_us,
                      std::vector<u_char>& datagram,
                      std::string* error = nullptr);
 
-// Parse a complete FlowX UDP datagram and return its transport metadata plus the
-// original codec packet ready to pass to flowx::Decoder::pushData().
+// Parse one FlowX v4 UDP datagram and reconstruct the AFC1 packet expected by
+// flowx::Decoder::pushData().
 bool unwrapCodecPacket(const std::vector<u_char>& datagram,
                        FlowXPacket& packet,
                        std::string* error = nullptr);

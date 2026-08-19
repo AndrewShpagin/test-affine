@@ -1,35 +1,29 @@
 # FlowX receiver
 
-`flowx_receiver` receives FlowX v3 UDP datagrams, unwraps the transport envelope, feeds the codec decoder, publishes reconstructed images into a thread-safe `FrameStore`, and exposes both conventional HTTP video output and a raw FlowX browser transport.
+`flowx_receiver` receives compact FlowX v4 UDP datagrams. The transport adapter reconstructs the internal AFC1 representation for the existing C++ decoder, while the browser path parses v4 directly.
 
 ## HTTP endpoints
 
 The default receiver config listens on HTTP port 8080 and exposes:
 
-- `/frame.jpg` — latest reconstructed frame as a standalone JPEG.
-- `/stream.mjpg` — multipart MJPEG stream suitable for a browser `<img>` element.
+- `/frame.jpg` — latest C++-decoded frame as JPEG.
+- `/stream.mjpg` — C++-decoded MJPEG stream.
 - `/status.json` — current FlowX/UDP/decode/frame status.
-- `/flowx.html` — built-in direct FlowX browser decoder page.
+- `/flowx.html` — built-in direct FlowX browser decoder.
 - `/flowx.js` — embedded browser decoder code.
-- `/flowx.bin` — binary stream of validated FlowX frame bundles.
+- `/flowx.bin` — original validated FlowX v4 datagrams grouped by source frame.
 
-JPEG encoding for `/frame.jpg` and `/stream.mjpg` is lazy and cached by decoded-frame sequence. Multiple HTTP clients requesting the same frame reuse the same encoded JPEG rather than each encoding another copy. If there are no conventional HTTP image clients, the receiver does not continuously JPEG-encode decoded frames.
+JPEG encoding for `/frame.jpg` and `/stream.mjpg` is lazy and cached by decoded-frame sequence.
 
-The MJPEG output is capped by `http.stream_fps`; if the decoder runs faster, the HTTP stream skips intermediate frames and always uses the freshest available frame.
+## Direct browser decoder
 
-## Direct browser FlowX decoder
+The browser receives the original v4 datagrams through `/flowx.bin` and does not depend on the C++ image decoder.
 
-`/flowx.bin` does not contain receiver-reencoded JPEG frames. It carries the original validated FlowX v3 datagrams grouped by source frame. A small `FXB1` HTTP framing record contains one frame bundle; the FlowX datagrams inside the record are unchanged.
-
-The browser decoder now renders both JPEG keyframes and patch frames directly:
-
-- classic JPEG keyframes and the current two-layer STRIPS JPEG keyframes are decoded with the browser-native JPEG decoder;
-- STRIPS interleaving is assembled entirely in WebGL2: the two decoded JPEG layers are uploaded as textures and a tiny shader writes even/odd columns into the assembled keyframe texture, with no per-column Canvas2D `drawImage()` loop;
-- patch affine/homography parameters are parsed directly from AFC1;
-- the 6x6 residual mesh is evaluated in a WebGL2 fragment shader using the same cubic kernel coefficient used by OpenCV `INTER_CUBIC`;
-- the shader subtracts the dense mesh, applies the inverse affine/homography, and samples the keyframe texture;
-- two framebuffer textures are ping-ponged so pixels outside the valid remap retain the previous rendered frame, matching the receiver's previous-frame border reuse behavior;
-- the encoded keyframe stays at its native reduced resolution in the GPU texture, so warp and keyframe upscaling happen in one sampling pass.
+- JPEG/STRIPS keyframes use the browser-native JPEG decoder;
+- STRIPS interleaving is assembled in WebGL2;
+- v4 patch affine/homography fields are parsed directly;
+- the fixed-point `int16` mesh is converted with `value = short / 128.0`;
+- mesh interpolation, inverse transform, keyframe sampling, border reuse, and final rendering run in WebGL2.
 
 JPEG2000 and three-layer MOSAIC remain intentionally unsupported in the browser path. The normal JPEG + STRIPS sender configuration is the target configuration.
 
@@ -39,13 +33,17 @@ Open:
 http://127.0.0.1:8080/flowx.html
 ```
 
-The page shows stream/frame IDs plus record, packet, keyframe, patch, rendered, skipped, and error counters. With a healthy local stream, `renders` should advance at the source frame rate rather than only at the keyframe rate.
+## C++ decoder compatibility
+
+FlowX v4 does not transmit AFC1 headers. `flowx_protocol_v4.cpp` reconstructs AFC1 packets after UDP parsing so the stable `flowx::Decoder` can remain unchanged. This keeps the native decoder available as a fallback/reference implementation.
+
+See `FLOWX_WIRE_PROTOCOL.md` for the actual UDP layout.
 
 ## Session behavior
 
-The receiver follows one active FlowX `stream_id`. A different stream is adopted only when a keyframe packet is seen, at which point the codec decoder and pending state are reset. Recently retired stream IDs are ignored so delayed UDP packets from the previous sender process cannot switch the receiver back to an obsolete session.
+The receiver follows one active `stream_id`. A new stream is adopted from a keyframe and resets C++ decoder state. Recently retired stream IDs are ignored so delayed UDP packets from an old sender process cannot switch the receiver backwards.
 
-The browser independently resets its keyframe state when the FlowX `stream_id` changes and waits for a compatible JPEG keyframe before rendering subsequent patches.
+The browser independently resets its keyframe state when `stream_id` changes.
 
 ## Local end-to-end test
 
@@ -61,7 +59,7 @@ Terminal 2:
 ./build/bin/flowx_sender config/flowx_sender_folder.json
 ```
 
-Then open or query:
+Then open:
 
 ```text
 http://127.0.0.1:8080/flowx.html
@@ -70,12 +68,14 @@ http://127.0.0.1:8080/stream.mjpg
 http://127.0.0.1:8080/status.json
 ```
 
-For a non-HTTP debug check, `--dump-last` is still available:
+Wire round-trip sanity test:
+
+```bash
+./build/bin/flowx_protocol_test
+```
+
+For a non-HTTP debug check, `--dump-last` remains available:
 
 ```bash
 ./build/bin/flowx_receiver config/flowx_receiver.json --dump-last output/flowx_receiver_last.jpg
 ```
-
-The receiver prints UDP and decoded-frame counters every two seconds. Restarting `flowx_sender` while the receiver remains running should produce a new `stream_id`; the receiver and browser should both reacquire from the new sender keyframe.
-
-The HTTP responses use no-cache headers and allow cross-origin reads for local browser/JS integration.
