@@ -49,6 +49,9 @@ target_link_libraries(flowx_common
         flowx_codec
         nlohmann_json::nlohmann_json)
 
+add_executable(flowx_protocol_test flowx_protocol_test.cpp)
+target_link_libraries(flowx_protocol_test PRIVATE flowx_common)
+
 # Sender-side runtime: image acquisition, product-level patch shaping, and FlowX
 # UDP transmission. HTTP image acquisition intentionally uses cpp-httplib; raw
 # sockets are used only for UDP.
@@ -91,7 +94,7 @@ add_executable(flowx_receiver flowx_receiver.cpp)
 target_link_libraries(flowx_receiver PRIVATE flowx_receiver_runtime)
 
 # Keep executable paths stable across single- and multi-config generators.
-foreach(target affine_test mesh_test keyframe_test codec_test flowx_sender flowx_receiver)
+foreach(target affine_test mesh_test keyframe_test codec_test flowx_protocol_test flowx_sender flowx_receiver)
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
         RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
