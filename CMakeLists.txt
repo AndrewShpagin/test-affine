@@ -38,8 +38,10 @@ target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS})
 add_executable(codec_test codec_test.cpp)
 target_link_libraries(codec_test PRIVATE flowx_codec)
 
+# The stable codec still speaks AFC1 internally. flowx_protocol_v4.cpp compacts
+# AFC1 to the network wire format and reconstructs AFC1 for the C++ decoder.
 add_library(flowx_common
-    flowx_protocol.cpp
+    flowx_protocol_v4.cpp
     flowx_config.cpp)
 target_include_directories(flowx_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_common
@@ -70,7 +72,7 @@ add_library(flowx_receiver_runtime
     flowx_udp_receiver.cpp
     flowx_frame_store.cpp
     flowx_raw_store.cpp
-    flowx_browser_assets.cpp
+    flowx_browser_v4_assets.cpp
     flowx_http_server.cpp)
 target_include_directories(flowx_receiver_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_receiver_runtime
