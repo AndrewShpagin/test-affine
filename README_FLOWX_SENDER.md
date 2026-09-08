@@ -61,6 +61,7 @@ If the `control` section is omitted, the control server stays disabled.
 
 - `GET <codec_endpoint>` — returns the current codec parameters as JSON.
 - `POST <codec_endpoint>` (or `PUT`) — applies a partial JSON patch to the live parameters and returns the merged result.
+- `GET /setparam/<name>/<value>[/<name>/<value>...]` — path-based mirror of the JSON patch for quick edits from a browser or `curl`.
 
 Any subset of fields may be sent; omitted fields keep their current value. Supported fields:
 
@@ -91,7 +92,12 @@ curl -X POST http://127.0.0.1:8090/codec.json \
 # Toggle transform stages and mesh grid
 curl -X POST http://127.0.0.1:8090/codec.json \
      -d '{"homography":false,"mesh_grid_x":4,"mesh_grid_y":4}'
+
+# Same edits via the GET path API (handy from a browser address bar)
+curl "http://127.0.0.1:8090/setparam/keyframe_bytes/5000/grayscale/false"
 ```
+
+The `/setparam` path takes alternating `name/value` pairs. Booleans accept `true`/`false` or `1`/`0`; integers and `keyframe_codec` use the same names, bounds, and merge behavior as the JSON patch. It returns the merged parameters as JSON, or HTTP `400` on an unknown name, malformed value, or an odd number of segments.
 
 ## Runtime model
 

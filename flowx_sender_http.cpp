@@ -7,13 +7,17 @@
 #include <atomic>
 #include <cctype>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace flowx {
 namespace {
 
 using json = nlohmann::json;
+
+constexpr const char* kSetParamPrefix = "/setparam";
 
 void addNoCacheHeaders(httplib::Response& res) {
     res.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -104,6 +108,45 @@ bool applyPatch(const CodecConfig& current, const json& body,
     return true;
 }
 
+// Coerces a string value from the GET path API into the JSON type expected for
+// the named field and stores it in patch. Unknown fields and malformed values
+// are rejected via error.
+bool assignPathField(json& patch, const std::string& name, const std::string& value,
+                     std::string& error) {
+    static const char* kIntFields[] = {"keyframe_bytes", "keyframe_period",
+                                       "mesh_grid_x", "mesh_grid_y"};
+    static const char* kBoolFields[] = {"grayscale", "strips", "homography", "mesh"};
+
+    for (const char* field : kIntFields) {
+        if (name == field) {
+            try {
+                std::size_t consumed = 0;
+                const int parsed = std::stoi(value, &consumed);
+                if (consumed != value.size()) throw std::invalid_argument("trailing characters");
+                patch[name] = parsed;
+            } catch (const std::exception&) {
+                error = name + " must be an integer, got '" + value + "'";
+                return false;
+            }
+            return true;
+        }
+    }
+    for (const char* field : kBoolFields) {
+        if (name == field) {
+            if (value == "true" || value == "1") patch[name] = true;
+            else if (value == "false" || value == "0") patch[name] = false;
+            else { error = name + " must be a boolean, got '" + value + "'"; return false; }
+            return true;
+        }
+    }
+    if (name == "keyframe_codec") {
+        patch[name] = value;
+        return true;
+    }
+    error = "unknown parameter: " + name;
+    return false;
+}
+
 } // namespace
 
 struct SenderControlServer::Impl {
@@ -152,6 +195,50 @@ struct SenderControlServer::Impl {
 
         server.Post(config.codec_endpoint, update);
         server.Put(config.codec_endpoint, update);
+
+        // Mirror of the JSON patch as a GET path API, e.g.
+        // /setparam/keyframe_bytes/5000/grayscale/false
+        server.Get(std::string(kSetParamPrefix) + R"(/(.*))",
+                   [this](const httplib::Request& req, httplib::Response& res) {
+            addNoCacheHeaders(res);
+
+            std::vector<std::string> segments;
+            {
+                const std::string& rest = req.matches.size() > 1 ? req.matches[1].str()
+                                                                  : std::string();
+                std::string token;
+                std::istringstream stream(rest);
+                while (std::getline(stream, token, '/'))
+                    if (!token.empty()) segments.push_back(token);
+            }
+
+            std::string error;
+            if (segments.empty() || segments.size() % 2 != 0) {
+                res.status = 400;
+                res.set_content(
+                    json{{"error", "expected alternating name/value pairs in the path"}}.dump(2),
+                    "application/json");
+                return;
+            }
+
+            json patch = json::object();
+            for (std::size_t i = 0; i < segments.size(); i += 2) {
+                if (!assignPathField(patch, segments[i], segments[i + 1], error)) {
+                    res.status = 400;
+                    res.set_content(json{{"error", error}}.dump(2), "application/json");
+                    return;
+                }
+            }
+
+            CodecConfig merged;
+            if (!applyPatch(params->snapshot(), patch, merged, error)) {
+                res.status = 400;
+                res.set_content(json{{"error", error}}.dump(2), "application/json");
+                return;
+            }
+            params->store(merged);
+            res.set_content(codecToJson(merged).dump(2), "application/json");
+        });
     }
 };
 
