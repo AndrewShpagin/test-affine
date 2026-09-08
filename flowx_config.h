@@ -44,10 +44,18 @@ struct UdpTargetConfig {
     std::uint16_t port = 5000;
 };
 
+struct SenderControlConfig {
+    bool enabled = false;
+    std::string bind = "0.0.0.0";
+    std::uint16_t port = 8090;
+    std::string codec_endpoint = "/codec.json";
+};
+
 struct SenderConfig {
     SourceConfig source;
     CodecConfig codec;
     UdpTargetConfig udp;
+    SenderControlConfig control;
 };
 
 struct UdpListenConfig {
@@ -72,6 +80,11 @@ struct ReceiverConfig {
 
 const char* sourceTypeName(SourceType type);
 const char* keyframeCodecName(KeyframeCodec codec);
+
+// Non-throwing validation of the runtime-tunable codec parameters. Shared by the
+// config loader and the sender HTTP control server so both enforce identical
+// bounds. Returns false and sets error on the first violation.
+bool validateCodecConfig(const CodecConfig& codec, std::string& error);
 
 SenderConfig loadSenderConfig(const std::string& filename);
 ReceiverConfig loadReceiverConfig(const std::string& filename);

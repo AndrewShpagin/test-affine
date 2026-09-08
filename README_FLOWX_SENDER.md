@@ -40,6 +40,59 @@ On the v4 wire each mesh `(dx,dy)` uses two signed 16-bit fixed-point values wit
 
 See `FLOWX_WIRE_PROTOCOL.md` for the binary layout.
 
+## Runtime codec control (HTTP)
+
+The sender can expose an optional HTTP backend that reads and updates the codec parameters live, in memory. Changes take effect on the next encoded frame and are **not** written back to the config file. All updates are applied under a mutex, so the encode loop always observes a consistent set of parameters.
+
+Enable it with a `control` section in the sender config:
+
+```json
+"control": {
+  "enabled": true,
+  "bind": "0.0.0.0",
+  "port": 8090,
+  "codec_endpoint": "/codec.json"
+}
+```
+
+If the `control` section is omitted, the control server stays disabled.
+
+### Endpoints
+
+- `GET <codec_endpoint>` — returns the current codec parameters as JSON.
+- `POST <codec_endpoint>` (or `PUT`) — applies a partial JSON patch to the live parameters and returns the merged result.
+
+Any subset of fields may be sent; omitted fields keep their current value. Supported fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `keyframe_bytes` | integer | Target keyframe size in bytes, must be > 0 |
+| `keyframe_period` | integer | Keyframe cadence in frames, must be > 0 |
+| `keyframe_codec` | string | `"jpeg"` or `"jpeg2000"` (`jpeg2000` requires an OpenCV JP2 writer) |
+| `grayscale` | boolean | Convert frames to grayscale before encoding |
+| `strips` | boolean | Strip-based keyframes |
+| `homography` | boolean | Homography transform stage |
+| `mesh` | boolean | Emit the mesh residual field |
+| `mesh_grid_x` | integer | Transmitted mesh grid width, 2..8 |
+| `mesh_grid_y` | integer | Transmitted mesh grid height, 2..8 |
+
+Invalid input (wrong type or out-of-range value) is rejected with HTTP `400` and a JSON `{"error": "..."}` body; no partial update is applied.
+
+### Examples
+
+```bash
+# Read current parameters
+curl http://127.0.0.1:8090/codec.json
+
+# Retune keyframe sizing and cadence in real time
+curl -X POST http://127.0.0.1:8090/codec.json \
+     -d '{"keyframe_bytes":60000,"keyframe_period":8}'
+
+# Toggle transform stages and mesh grid
+curl -X POST http://127.0.0.1:8090/codec.json \
+     -d '{"homography":false,"mesh_grid_x":4,"mesh_grid_y":4}'
+```
+
 ## Runtime model
 
 Capture runs on its own thread and publishes into a single latest-frame slot. If encoding is slower than capture, stale frames are replaced rather than queued, so latency does not grow from backlog.

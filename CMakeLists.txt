@@ -58,7 +58,8 @@ target_link_libraries(flowx_protocol_test PRIVATE flowx_common)
 add_library(flowx_sender_runtime
     flowx_image_source.cpp
     flowx_net.cpp
-    flowx_patch_rewrite.cpp)
+    flowx_patch_rewrite.cpp
+    flowx_sender_http.cpp)
 target_include_directories(flowx_sender_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_sender_runtime
     PUBLIC

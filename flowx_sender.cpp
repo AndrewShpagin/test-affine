@@ -1,9 +1,11 @@
+#include "flowx_codec_params.h"
 #include "flowx_config.h"
 #include "flowx_image_source.h"
 #include "flowx_latest_frame.h"
 #include "flowx_net.h"
 #include "flowx_patch_rewrite.h"
 #include "flowx_protocol.h"
+#include "flowx_sender_http.h"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -121,6 +123,16 @@ int main(int argc, char** argv) {
         encoder.setKeyframeCodec(cfg.codec.keyframe_codec);
         encoder.setHomographyTransform(cfg.codec.homography);
 
+        // Live, mutex-protected codec parameters. The encode loop reads a snapshot
+        // per frame; the optional HTTP control server updates them in memory.
+        flowx::CodecParamsStore codec_params(cfg.codec);
+
+        flowx::SenderControlServer control_server;
+        if (cfg.control.enabled) {
+            if (!control_server.start(cfg.control, codec_params, error))
+                throw std::runtime_error("control server start failed: " + error);
+        }
+
         std::mt19937 loss_rng(command_line.loss_seed);
         std::bernoulli_distribution lose_packet(command_line.loss_percent / 100.0);
 
@@ -142,6 +154,10 @@ int main(int argc, char** argv) {
                   << "  UDP target: " << cfg.udp.host << ':' << cfg.udp.port << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n";
+        if (cfg.control.enabled) {
+            std::cout << "  control HTTP: " << cfg.control.bind << ':' << cfg.control.port
+                      << cfg.control.codec_endpoint << " (GET/POST)\n";
+        }
         if (command_line.loss_percent > 0.0) {
             std::cout << "  simulated UDP loss: " << command_line.loss_percent
                       << "%  seed=" << command_line.loss_seed << '\n';
@@ -206,7 +222,12 @@ int main(int argc, char** argv) {
             }
             if (frame.image.empty()) continue;
 
-            if (cfg.codec.grayscale && !convertToGrayscale(frame.image)) {
+            const flowx::CodecConfig codec = codec_params.snapshot();
+            encoder.setStripsKeyframes(codec.strips);
+            encoder.setKeyframeCodec(codec.keyframe_codec);
+            encoder.setHomographyTransform(codec.homography);
+
+            if (codec.grayscale && !convertToGrayscale(frame.image)) {
                 std::cerr << "Cannot convert source image with " << frame.image.channels()
                           << " channels to grayscale\n";
                 fatal_error = true;
@@ -215,16 +236,16 @@ int main(int argc, char** argv) {
             }
 
             encoder.pushImage(frame.image,
-                              cfg.codec.keyframe_bytes,
-                              cfg.codec.keyframe_period);
+                              codec.keyframe_bytes,
+                              codec.keyframe_period);
             ++encoded_frames;
 
             std::vector<flowx::u_char> codec_packet;
             while (encoder.getNextChunk(codec_packet)) {
                 if (!flowx::reshapePatchMesh(codec_packet,
-                                             cfg.codec.mesh,
-                                             cfg.codec.mesh_grid_x,
-                                             cfg.codec.mesh_grid_y,
+                                             codec.mesh,
+                                             codec.mesh_grid_x,
+                                             codec.mesh_grid_y,
                                              &error)) {
                     std::cerr << "FlowX patch rewrite failed: " << error << '\n';
                     fatal_error = true;

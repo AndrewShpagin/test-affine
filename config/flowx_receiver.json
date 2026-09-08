@@ -5,7 +5,7 @@
   },
   "http": {
     "bind": "0.0.0.0",
-    "port": 8080,
+    "port": 8002,
     "jpeg_quality": 85,
     "stream_fps": 20,
     "frame_endpoint": "/frame.jpg",

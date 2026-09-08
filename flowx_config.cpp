@@ -59,13 +59,6 @@ void requirePositive(int value, const char* name) {
         throw std::runtime_error(std::string(name) + " must be > 0");
 }
 
-void requireRange(int value, int min_value, int max_value, const char* name) {
-    if (value < min_value || value > max_value)
-        throw std::runtime_error(std::string(name) + " must be in [" +
-                                 std::to_string(min_value) + ", " +
-                                 std::to_string(max_value) + "]");
-}
-
 SourceType parseSourceType(const std::string& value) {
     const std::string type = lower(value);
     if (type == "camera") return SourceType::Camera;
@@ -123,10 +116,9 @@ CodecConfig parseCodec(const json& j) {
     cfg.mesh = j.value("mesh", cfg.mesh);
     cfg.mesh_grid_x = j.value("mesh_grid_x", cfg.mesh_grid_x);
     cfg.mesh_grid_y = j.value("mesh_grid_y", cfg.mesh_grid_y);
-    requirePositive(cfg.keyframe_bytes, "codec.keyframe_bytes");
-    requirePositive(cfg.keyframe_period, "codec.keyframe_period");
-    requireRange(cfg.mesh_grid_x, 2, 8, "codec.mesh_grid_x");
-    requireRange(cfg.mesh_grid_y, 2, 8, "codec.mesh_grid_y");
+    std::string error;
+    if (!validateCodecConfig(cfg, error))
+        throw std::runtime_error(error);
     return cfg;
 }
 
@@ -145,6 +137,19 @@ const char* keyframeCodecName(KeyframeCodec codec) {
     return codec == KeyframeCodec::Jpeg2000 ? "jpeg2000" : "jpeg";
 }
 
+bool validateCodecConfig(const CodecConfig& codec, std::string& error) {
+    error.clear();
+    if (codec.keyframe_bytes <= 0) { error = "codec.keyframe_bytes must be > 0"; return false; }
+    if (codec.keyframe_period <= 0) { error = "codec.keyframe_period must be > 0"; return false; }
+    if (codec.mesh_grid_x < 2 || codec.mesh_grid_x > 8) {
+        error = "codec.mesh_grid_x must be in [2, 8]"; return false;
+    }
+    if (codec.mesh_grid_y < 2 || codec.mesh_grid_y > 8) {
+        error = "codec.mesh_grid_y must be in [2, 8]"; return false;
+    }
+    return true;
+}
+
 SenderConfig loadSenderConfig(const std::string& filename) {
     const json root = readJsonFile(filename);
     SenderConfig cfg;
@@ -155,6 +160,20 @@ SenderConfig loadSenderConfig(const std::string& filename) {
     cfg.udp.host = udp.value("host", cfg.udp.host);
     cfg.udp.port = parsePort(udp, "port", cfg.udp.port);
     if (cfg.udp.host.empty()) throw std::runtime_error("udp.host must not be empty");
+
+    const auto control_it = root.find("control");
+    if (control_it != root.end()) {
+        if (!control_it->is_object())
+            throw std::runtime_error("control must be a JSON object");
+        const json& control = *control_it;
+        cfg.control.enabled = control.value("enabled", cfg.control.enabled);
+        cfg.control.bind = control.value("bind", cfg.control.bind);
+        cfg.control.port = parsePort(control, "port", cfg.control.port);
+        cfg.control.codec_endpoint = control.value("codec_endpoint", cfg.control.codec_endpoint);
+        if (cfg.control.bind.empty()) throw std::runtime_error("control.bind must not be empty");
+        if (cfg.control.codec_endpoint.empty() || cfg.control.codec_endpoint.front() != '/')
+            throw std::runtime_error("control.codec_endpoint must begin with '/'");
+    }
     return cfg;
 }
 
