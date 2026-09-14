@@ -1,4 +1,5 @@
 #include "flowx_protocol.h"
+#include "jpeg_restart.h"
 
 #include <algorithm>
 #include <array>
@@ -183,7 +184,7 @@ bool readWireCommon(const std::vector<u_char>& data,
         return false;
     const std::uint8_t raw_type = version_type & 0x0fu;
     if (raw_type < static_cast<std::uint8_t>(WirePacketType::KeyframeChunk) ||
-        raw_type > static_cast<std::uint8_t>(WirePacketType::LayeredKeyframeEnd))
+        raw_type > static_cast<std::uint8_t>(WirePacketType::JpegRestartRegion))
         return false;
     type = static_cast<WirePacketType>(raw_type);
     return true;
@@ -212,6 +213,49 @@ std::int16_t quantizeMesh(float value) {
 
 float dequantizeMesh(std::int16_t value) {
     return static_cast<float>(value) / kMeshWireScale;
+}
+
+bool readRestartRegion(const std::vector<u_char>& data, std::size_t pos,
+                       cv::Size original, affinecodec::JpegRestartRegion& r) {
+    std::uint8_t reserved = 0;
+    if (!readU16(data, pos, r.layer_width) || !readU16(data, pos, r.layer_height) ||
+        !readU16(data, pos, r.x) || !readU16(data, pos, r.y) ||
+        !readU16(data, pos, r.width) || !readU8(data, pos, r.profile) ||
+        !readU8(data, pos, reserved) || reserved ||
+        !affinecodec::validRestartGeometry(r, original)) return false;
+    r.entropy.assign(data.begin() + pos, data.end());
+    return affinecodec::validRestartEntropy(r.entropy);
+}
+
+bool wrapRestartRegion(const std::vector<u_char>& codec, const AfcCommon& h,
+                       std::uint32_t stream_id, std::uint64_t timestamp,
+                       std::vector<u_char>& datagram, std::string* error) {
+    affinecodec::JpegRestartRegion region;
+    if (h.header_bytes != affinecodec::kRestartHeaderBytes || h.frame_id != h.keyframe_id ||
+        !readRestartRegion(codec, kAfcCommonBytes, cv::Size(h.width, h.height), region)) {
+        setError(error, "invalid independent JPEG region"); return false;
+    }
+    appendWireCommon(datagram, WirePacketType::JpegRestartRegion, 0, stream_id, h.frame_id, timestamp);
+    appendU16(datagram, h.width); appendU16(datagram, h.height);
+    datagram.insert(datagram.end(), codec.begin() + kAfcCommonBytes, codec.end());
+    return true;
+}
+
+bool unwrapRestartRegion(const std::vector<u_char>& datagram, std::uint8_t flags,
+                         FlowXPacket& packet, std::string* error) {
+    std::size_t pos = kFlowXHeaderBytes;
+    std::uint16_t ow = 0, oh = 0;
+    affinecodec::JpegRestartRegion region;
+    if (flags || !readU16(datagram, pos, ow) || !readU16(datagram, pos, oh) ||
+        !readRestartRegion(datagram, pos, cv::Size(ow, oh), region)) {
+        setError(error, "invalid FlowX independent JPEG region"); return false;
+    }
+    packet.metadata.keyframe_id = packet.metadata.frame_id;
+    appendAfcCommon(packet.codec_packet, affinecodec::kRestartPacketType,
+                    affinecodec::kRestartHeaderBytes, packet.metadata.frame_id,
+                    packet.metadata.frame_id, ow, oh);
+    packet.codec_packet.insert(packet.codec_packet.end(), datagram.begin() + pos, datagram.end());
+    return true;
 }
 
 bool wrapKeyChunk(const std::vector<u_char>& codec,
@@ -636,6 +680,9 @@ bool wrapCodecPacket(const std::vector<u_char>& codec_packet,
 
     bool ok = false;
     switch (h.type) {
+    case affinecodec::kRestartPacketType:
+        ok = wrapRestartRegion(codec_packet, h, stream_id, capture_timestamp_us, datagram, error);
+        break;
     case kAfcKeyframeChunk:
     case kAfcLayeredKeyframeChunk:
         ok = wrapKeyChunk(codec_packet, h, stream_id, capture_timestamp_us, datagram, error);
@@ -677,6 +724,9 @@ bool unwrapCodecPacket(const std::vector<u_char>& datagram,
 
     bool ok = false;
     switch (type) {
+    case WirePacketType::JpegRestartRegion:
+        ok = unwrapRestartRegion(datagram, flags, packet, error);
+        break;
     case WirePacketType::KeyframeChunk:
         ok = unwrapKeyChunk(datagram, flags, packet, error);
         break;

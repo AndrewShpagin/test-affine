@@ -15,7 +15,7 @@ namespace flowx {
 constexpr std::uint8_t kProtocolVersion = 4;
 constexpr std::uint16_t kFlowXMagic = 0x5846u; // bytes: 'F' 'X'
 constexpr std::size_t kFlowXHeaderBytes = 20;  // common v4 header
-constexpr std::size_t kMaxUdpDatagramBytes = 1400;
+constexpr std::size_t kMaxUdpDatagramBytes = 1300;
 constexpr std::size_t kMaxFlowXPayloadBytes = kMaxUdpDatagramBytes - kFlowXHeaderBytes;
 constexpr float kMeshWireScale = 128.0f;
 constexpr float kMeshWireLimit = 255.0f;
@@ -24,6 +24,7 @@ enum class WirePacketType : std::uint8_t {
     KeyframeChunk = 1,
     Patch = 2,
     LayeredKeyframeEnd = 3,
+    JpegRestartRegion = 4,
 };
 
 struct PacketMetadata {

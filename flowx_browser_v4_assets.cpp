@@ -1,4 +1,7 @@
 #include "flowx_browser_assets.h"
+#include "jpeg_restart.h"
+#include "flowx_restart_browser_source.h"
+#include <string>
 
 namespace flowx {
 
@@ -134,6 +137,9 @@ const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
 function tex(){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
 const keyTex=tex(), stripTex=[tex(),tex()], keyFbo=gl.createFramebuffer(), frameTex=[tex(),tex()], fbo=[gl.createFramebuffer(),gl.createFramebuffer()];
 let outW=0,outH=0,keyW=0,keyH=0,current=0,keyFrameId=null,streamId=0,key=null;
+let restartAssembly=null,lastDisplayedFrame=null;
+const newer=(a,b)=>((a-b)|0)>0;
+const retiredStreams=new Set();
 function alloc(w,h){
   if(outW===w&&outH===h) return;
   outW=w; outH=h; canvas.width=w; canvas.height=h;
@@ -144,6 +150,7 @@ function draw(){ gl.drawArrays(gl.TRIANGLES,0,3); }
 function display(){ gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,outW,outH); gl.useProgram(copyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(copyProg,'uTex'),0); gl.uniform2f(gl.getUniformLocation(copyProg,'uSize'),outW,outH); draw(); }
 function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); }
 function renderKey(frameId){
+  lastDisplayedFrame=frameId;
   current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); display();
   keyFrameId=frameId; stats.keys++; stats.renders++; $('frame').textContent=frameId; putStats();
 }
@@ -169,13 +176,14 @@ function invH(a,p){
   return new Float32Array([r[0],r[3],r[6],r[1],r[4],r[7],r[2],r[5],r[8]]);
 }
 function renderPatch(p){
+  if(lastDisplayedFrame!==null && !newer(p.frameId,lastDisplayedFrame)) return;
   if(keyFrameId===null||p.keyframeId!==keyFrameId||p.width!==outW||p.height!==outH){ stats.skipped++; putStats(); return; }
   const inv=invH(p.affine,p.perspective); if(!inv){ stats.skipped++; putStats(); return; }
   const next=1-current; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[next]); gl.viewport(0,0,outW,outH); gl.useProgram(patchProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(patchProg,'uPrev'),1);
   gl.uniform2f(gl.getUniformLocation(patchProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(patchProg,'uKeySize'),keyW,keyH); gl.uniformMatrix3fv(gl.getUniformLocation(patchProg,'uInvH'),false,inv); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridX'),p.gridX); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridY'),p.gridY); gl.uniform2fv(gl.getUniformLocation(patchProg,'uMesh[0]'),p.mesh); draw(); current=next; display();
-  stats.renders++; $('frame').textContent=p.frameId; putStats();
+  lastDisplayedFrame=p.frameId;stats.renders++; $('frame').textContent=p.frameId; putStats();
 }
 
 function resetKey(frameId,width,height,kind,layerCount){ key={frameId,width,height,kind,layerCount,layers:new Map()}; }
@@ -193,6 +201,32 @@ function layerBytes(layer){
   if(p!==out.length) throw new Error('key layer byte count mismatch'); return out;
 }
 async function bitmap(bytes){ return await createImageBitmap(new Blob([bytes],{type:'image/jpeg'})); }
+async function decodeRegion(bytes,width,height){
+  const b=await bitmap(bytes);
+  try {
+    if(b.width!==width||b.height!==height) throw new Error('JPEG region size mismatch');
+    const scratch=new OffscreenCanvas(width,height),ctx=scratch.getContext('2d',{willReadFrequently:true});
+    ctx.drawImage(b,0,0);return ctx.getImageData(0,0,width,height).data;
+  } finally { b.close(); }
+}
+async function acceptRegion(u,frame){
+  if(keyFrameId!==null && frame!==keyFrameId && !newer(frame,keyFrameId)) return;
+  if(key && !newer(frame,key.frameId)) return;
+  if(keyFrameId===frame && !restartAssembly) return;
+  if(!restartAssembly) restartAssembly=new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion);
+  const a=restartAssembly,result=await a.accept(u);
+  if(!result || a!==restartAssembly) return;
+  if(result.newKeyframe){
+    key=null;alloc(a.ow,a.oh);keyW=a.width;keyH=a.height;
+    gl.bindTexture(gl.TEXTURE_2D,keyTex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
+    keyFrameId=frame;
+    if(lastDisplayedFrame===null||newer(frame,lastDisplayedFrame)) renderKey(frame);
+  } else {
+    gl.bindTexture(gl.TEXTURE_2D,keyTex);
+    gl.texSubImage2D(gl.TEXTURE_2D,0,result.x,result.y,result.width,8,gl.RGBA,gl.UNSIGNED_BYTE,result.pixels);
+  }
+}
 async function showClassic(){ const l=key.layers.get(0); if(!complete(l)) return; const k=key,b=await bitmap(layerBytes(l)); uploadKey(b,k.width,k.height,k.frameId); b.close(); key=null; }
 async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(layerBytes(a)),bitmap(layerBytes(b))]); uploadStrips(ia,ib,k.width,k.height,k.frameId); ia.close(); ib.close(); key=null; }
 
@@ -216,17 +250,27 @@ async function processDatagram(d){
   const u=new Uint8Array(d.buffer,d.byteOffset,d.byteLength),v=new DataView(d.buffer,d.byteOffset,d.byteLength);
   if(u.length<20||u16(v,0)!==0x5846) throw new Error('bad FlowX magic');
   const vt=u[2],version=vt>>4,type=vt&15,flags=u[3],sid=u32(v,4),frame=u32(v,8);
-  if(version!==4||sid===0||type<1||type>3) throw new Error('bad FlowX v4 header');
-  if(streamId!==sid){ streamId=sid; key=null; keyFrameId=null; $('stream').textContent=sid; }
+  if(version!==4||sid===0||type<1||type>4||u.length>1300) throw new Error('bad FlowX v4 header');
+  if(streamId!==sid){
+    if(retiredStreams.has(sid)||type===2) return;
+    if(streamId) retiredStreams.add(streamId);
+    if(retiredStreams.size>16) retiredStreams.delete(retiredStreams.values().next().value);
+    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;lastDisplayedFrame=null;$('stream').textContent=sid;
+  }
   stats.packets++;
 
+  if(type===4){ await acceptRegion(u,frame);return; }
+
   if(type===1){
+    if(keyFrameId!==null && !newer(frame,keyFrameId)) return;
+    if(key && frame!==key.frameId && !newer(frame,key.frameId)) return;
     if((flags&0xf0)!==0||u.length<=34) throw new Error('bad key chunk flags/size');
     const li=flags&3,lc=((flags>>2)&3)+1;
     if(lc<1||lc>3||li>=lc) throw new Error('bad key layer');
     const ow=u16(v,20),oh=u16(v,22),jw=u16(v,24),jh=u16(v,26),total=u32(v,28),ci=u[32],cc=u[33];
     if(!ow||!oh||!jw||!jh||!total||!cc||ci>=cc) throw new Error('bad key chunk metadata');
     if(lc===3) return; // MOSAIC is intentionally outside the browser path.
+    restartAssembly=null;
     const kind=lc===1?'classic':'strips';
     if(!key||key.frameId!==frame||key.kind!==kind) resetKey(frame,ow,oh,kind,lc);
     addChunk(getLayer(li,total,cc,jw,jh),ci,u.slice(34));
@@ -255,7 +299,24 @@ async function reconnectLoop(){ for(;;){ try{ await run(); }catch(e){ setState(S
 reconnectLoop();
 })();
 )FLOWXJS";
-    return kJs;
+    static const std::string script = [] {
+        std::string result = "const FLOWX_RESTART_HEADERS={";
+        for (unsigned profile = 1; profile <= 2; ++profile) {
+            if (profile > 1) result += ',';
+            result += std::to_string(profile) + ":[";
+            const auto bytes = affinecodec::restartJpegHeader(static_cast<std::uint8_t>(profile), 8);
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                if (i) result += ',';
+                result += std::to_string(bytes[i]);
+            }
+            result += ']';
+        }
+        result += "};\n";
+        result += kRestartBrowserSource;
+        result += kJs;
+        return result;
+    }();
+    return script;
 }
 
 } // namespace flowx

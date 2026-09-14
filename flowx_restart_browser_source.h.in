@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr char kRestartBrowserSource[] = R"FXRESTART(@FLOWX_RESTART_BROWSER_SOURCE@)FXRESTART";

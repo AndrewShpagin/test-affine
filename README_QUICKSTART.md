@@ -5,14 +5,14 @@ watch the decoded video in a browser.
 
 ## 1. Install dependencies
 
-The project needs a C++17 compiler, CMake, OpenCV, nlohmann-json, and
+The project needs a C++17 compiler, CMake, OpenCV, libjpeg, nlohmann-json, and
 cpp-httplib. On Debian / Raspberry Pi OS / Ubuntu:
 
 ```bash
 sudo apt update
 sudo apt install -y \
     build-essential cmake \
-    libopencv-dev \
+    libopencv-dev libjpeg-dev \
     nlohmann-json3-dev \
     libcpp-httplib-dev
 ```

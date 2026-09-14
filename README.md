@@ -34,6 +34,12 @@ F5 configures/builds first, then runs from the repository root.
 
 ## UDP codec prototype
 
+JPEG + STRIPS uses independently decodable 8-pixel-high regions, with a maximum
+1300-byte FlowX UDP payload and progressive even/odd recovery. See
+[JPEG restart assembly](README_JPEG_RESTART.md) for configuration, fixed tables,
+late-packet behavior, and tests. The chunk API example below describes classic
+JPEG mode.
+
 Files:
 
 ```text

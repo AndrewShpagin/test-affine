@@ -97,6 +97,7 @@ private:
     bool emitKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool emitStripsKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
+    bool emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gray, int desired_jpeg_size, std::uint32_t frame_id);
     bool estimatePatch(const cv::Mat& current_gray, std::uint32_t frame_id, PatchData& patch);
     void setReference(const cv::Mat& gray, std::uint32_t frame_id);
     cv::Size input_size_;
@@ -173,6 +174,18 @@ private:
         double image_decode_ms = 0.0;
         std::array<MosaicLayerAssembly, 3> layers;
     };
+    struct RestartAssembly {
+        bool active = false;
+        std::uint32_t frame_id = 0;
+        cv::Size original_size;
+        cv::Size layer_size;
+        std::uint8_t profile = 0;
+        cv::Mat assembled;
+        // One bit-valued byte per actual 8x8 block and parity. Concealed pixels
+        // never set these entries, so late real data can always replace them.
+        std::vector<unsigned char> received_blocks;
+    };
+    void acceptRestartRegion(const std::vector<u_char>& data, std::uint32_t frame_id, cv::Size original);
     cv::Mat getDecodedKeyframe(const std::vector<u_char>& jpeg_data);
     void resetPendingKeyframe();
     bool decodeMosaicLayer(std::uint8_t layer_index);
@@ -185,6 +198,7 @@ private:
     cv::Mat decoded_keyframe_;
     KeyframeAssembly pending_keyframe_;
     MosaicAssembly pending_mosaic_;
+    RestartAssembly pending_restart_;
     std::deque<PatchData> pending_patch_queue_;
     std::deque<PatchData> patch_queue_;
     cv::Mat dense_mesh_;

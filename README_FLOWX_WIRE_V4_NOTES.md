@@ -15,4 +15,7 @@ Main savings:
 
 A 6x6 homography patch is 203 bytes on v4 versus about 376 bytes with the previous v3+AFC1 envelope. A homography patch without mesh is 59 bytes.
 
-One 24-byte layered-keyframe end marker is retained for immediate compatibility with the stable native layered-keyframe decoder. It occurs once per STRIPS/MOSAIC keyframe, so its bandwidth cost is negligible compared with the encoded keyframe data; removing it can be considered separately after the v4 path is validated.
+One 24-byte layered-keyframe end marker is retained for legacy STRIPS/MOSAIC.
+JPEG + STRIPS now uses type 4 independent JPEG restart regions, without an end
+marker. This extension requires an updated sender and receiver; older v4 clients
+reject type 4. See [JPEG restart assembly](README_JPEG_RESTART.md).

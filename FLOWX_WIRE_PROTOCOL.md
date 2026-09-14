@@ -30,9 +30,11 @@ Packet types:
 1 = KEY_CHUNK
 2 = PATCH
 3 = LAYER_END
+4 = JPEG_RESTART_REGION
 ```
 
-No `reserved`, `header_size`, `payload_size`, or second magic is transmitted. UDP already supplies the datagram size.
+No `header_size`, `payload_size`, or second magic is transmitted. UDP already supplies the datagram size.
+Datagrams are limited to 1300 bytes, including the FlowX header.
 
 ---
 
@@ -83,6 +85,9 @@ keyframe_id = frame_id
 ```
 
 ### STRIPS
+
+This chunk form is retained for legacy STRIPS and JPEG2000. New JPEG + STRIPS
+uses type 4 below.
 
 For two layers:
 
@@ -165,7 +170,8 @@ For comparison, the previous v3 + AFC1 6x6 homography packet was about 376 bytes
 
 ## Type 3 — LAYER_END
 
-Used once after a STRIPS/MOSAIC keyframe so the existing C++ decoder can finalize the layered keyframe immediately.
+Used once after a legacy STRIPS/MOSAIC keyframe so the C++ decoder can finalize
+the layered keyframe immediately. JPEG restart regions do not send LAYER_END.
 
 ```cpp
 struct LayerEndV4 {
@@ -181,11 +187,51 @@ The WebGL browser decoder does not need this packet; it knows completion from th
 
 ---
 
+## Type 4 — JPEG_RESTART_REGION
+
+Used by JPEG + STRIPS. Each packet independently decodes to an 8-pixel-high
+region of one half-image. All offsets below include the common 20-byte header.
+`version_type = 0x44`, `flags = 0`, and `keyframe_id = frame_id`.
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 20 | Common FlowX v4 header |
+| 20 | 2 | Original output width |
+| 22 | 2 | Original output height |
+| 24 | 2 | Encoded half-image width |
+| 26 | 2 | Encoded half-image height |
+| 28 | 2 | X coordinate in the assembled encoded keyframe |
+| 30 | 2 | Y coordinate in the assembled encoded keyframe |
+| 32 | 2 | Region width in half-image samples |
+| 34 | 1 | Fixed JPEG profile: 1 = gray Q85, 2 = YCbCr 4:4:4 Q85 |
+| 35 | 1 | Reserved, zero |
+| 36 | 1–1264 | JPEG entropy data, without restart markers |
+
+The assembled keyframe dimensions are `2 * half_width` by `half_height`,
+and are scaled to the original output size when rendered. A decoded sample
+`(i,j)` is placed at `(x + 2*i, y + j)`; `x & 1` selects the column half.
+Half dimensions and region width are positive multiples of 8.
+`floor(x/2)` and `y` are multiples of 8; the full region must fit the half.
+Original width must be even; original dimensions cannot be smaller than
+the assembled raster. Maximum original area is 16 megapixels.
+
+Payload bytes retain JPEG FF00 stuffing and end padding, but contain no raw
+markers. The receiver reconstructs an ordinary baseline JPEG using the fixed
+profile's standard tables, region width, and height 8. No previous segment,
+table packet, or end marker is required. See
+[JPEG restart assembly](README_JPEG_RESTART.md) for sizing and mask rules.
+
+Older v4 receivers reject type 4; deploy sender and receiver together.
+
 ## Loss behavior
 
 A PATCH contains all data needed for that frame relative to its keyframe. Losing one PATCH does not invalidate later PATCH packets.
 
-A fragmented keyframe is usable only when sufficient keyframe chunks arrive. If a keyframe cannot be reconstructed, the decoder waits for/reacquires a later keyframe; later independent frames are not permanently poisoned.
+For type 4, every received region is usable immediately. Missing even/odd data
+is copied from the received counterpart; if both are missing, the hole remains
+black. Late data for the active key improves subsequent PATCH rendering without
+replaying an old frame. Old-key packets are discarded after a newer key starts.
+Legacy type-1 JPEG chunks still require a complete layer before decoding.
 
 For reproducible testing:
 
@@ -196,3 +242,7 @@ For reproducible testing:
 ## `/flowx.bin`
 
 `/flowx.bin` is HTTP framing, not the UDP wire protocol. Its `FXB1` records contain the original FlowX v4 UDP datagrams unchanged.
+Records can contain individual updates or an accumulated active-key snapshot
+followed by the latest compatible PATCH. The latter lets new or slow browsers
+catch up without losing received key regions. Parse each contained datagram's
+own frame ID; one record may contain both key data and a later PATCH.

@@ -1,4 +1,5 @@
 #include "udp_image_codec.h"
+#include "jpeg_restart.h"
 
 #include <opencv2/opencv.hpp>
 
@@ -1052,8 +1053,77 @@ bool Encoder::emitMosaicKeyframe(const cv::Mat& image, const cv::Mat& gray,
     input_size_ = image.size(); setReference(gray, frame_id); return true;
 }
 
+bool Encoder::emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gray,
+                                       int desired_jpeg_size, std::uint32_t frame_id) {
+    std::array<cv::Mat, 2> layers;
+    if (!buildStripsLayers(image, layers) || image.total() > kRestartMaxImagePixels)
+        return false;
+    if (strips_jpeg_model_channels_ != layers[0].channels()) {
+        strips_jpeg_model_channels_ = layers[0].channels();
+        strips_jpeg_bytes_per_pixel_ = 0.0;
+    }
+    const auto start = ProfileClock::now();
+    const double target = std::max(1, desired_jpeg_size) * kJpegTargetFill;
+    const double bpp = strips_jpeg_bytes_per_pixel_ > 0.0 ? strips_jpeg_bytes_per_pixel_ : 0.35;
+    cv::Size size = scaledSize8(layers[0].size(),
+        std::sqrt(target / (2.0 * bpp * layers[0].total())));
+    std::array<std::vector<JpegRestartRegion>, 2> regions;
+    std::size_t wire_bytes = 0;
+    for (int pass = 0; pass < kJpegMaxEncodePasses; ++pass) {
+        wire_bytes = 0;
+        for (unsigned parity = 0; parity < 2; ++parity) {
+            cv::Mat small;
+            if (layers[parity].size() == size) small = layers[parity];
+            else cv::resize(layers[parity], small, size, 0, 0, cv::INTER_AREA);
+            if (!encodeJpegRestartLayer(small, parity, regions[parity])) return false;
+            for (const auto& r : regions[parity]) wire_bytes += kRestartWireHeaderBytes + r.entropy.size();
+        }
+        if (pass + 1 == kJpegMaxEncodePasses ||
+            (wire_bytes >= target * (1.0 - kJpegSizeTolerance) &&
+             wire_bytes <= target * (1.0 + kJpegSizeTolerance))) break;
+        const double scale = std::min(double(size.width) / layers[0].cols,
+                                      double(size.height) / layers[0].rows);
+        const cv::Size next = scaledSize8(layers[0].size(), scale * std::sqrt(target / wire_bytes));
+        if (next == size) break;
+        size = next;
+    }
+    last_timing_.jpeg_ms += profileMs(start);
+    strips_jpeg_bytes_per_pixel_ = wire_bytes / (2.0 * size.area());
+    last_timing_.keyframe = true;
+    last_timing_.strips_keyframe = true;
+    last_timing_.keyframe_codec = KeyframeCodec::Jpeg;
+    last_timing_.jpeg_size = size;
+    last_timing_.jpeg_quality = 85;
+    const auto chunk_start = ProfileClock::now();
+    std::vector<std::vector<u_char>> packets;
+    for (unsigned parity = 0; parity < 2; ++parity) {
+        for (const auto& r : regions[parity]) {
+            if (!validRestartGeometry(r, image.size())) return false;
+            std::vector<u_char> packet;
+            packet.reserve(kRestartHeaderBytes + r.entropy.size());
+            appendCommonHeader(packet, kRestartPacketType, kRestartHeaderBytes,
+                               frame_id, frame_id, image.size());
+            appendU16(packet, r.layer_width); appendU16(packet, r.layer_height);
+            appendU16(packet, r.x); appendU16(packet, r.y); appendU16(packet, r.width);
+            appendU8(packet, r.profile); appendU8(packet, 0);
+            packet.insert(packet.end(), r.entropy.begin(), r.entropy.end());
+            if (packet.size() > kMaxUdpPacketBytes) return false;
+            last_timing_.jpeg_layer_bytes[parity] += r.entropy.size();
+            packets.push_back(std::move(packet));
+        }
+    }
+    // Each datagram is usable independently; there is no required end marker.
+    for (auto& packet : packets) output_queue_.push_back(std::move(packet));
+    last_timing_.chunk_ms += profileMs(chunk_start);
+    input_size_ = image.size();
+    setReference(gray, frame_id);
+    return true;
+}
+
 bool Encoder::emitStripsKeyframe(const cv::Mat& image, const cv::Mat& gray,
                                  int desired_jpeg_size, std::uint32_t frame_id) {
+    if (keyframe_codec_ == KeyframeCodec::Jpeg)
+        return emitRestartStripsKeyframe(image, gray, desired_jpeg_size, frame_id);
     std::array<cv::Mat, 2> layers;
     if (!buildStripsLayers(image, layers)) return false;
 
@@ -1123,6 +1193,9 @@ bool Encoder::emitStripsKeyframe(const cv::Mat& image, const cv::Mat& gray,
 bool Encoder::emitKeyframe(const cv::Mat& image, const cv::Mat& gray,
                            int desired_jpeg_size, std::uint32_t frame_id) {
     if (strips_keyframes_ && stripsEligible(image.size())) {
+        // Do not silently replace a failed resilient JPEG with fragile chunks.
+        if (keyframe_codec_ == KeyframeCodec::Jpeg)
+            return emitStripsKeyframe(image, gray, desired_jpeg_size, frame_id);
         if (emitStripsKeyframe(image, gray, desired_jpeg_size, frame_id)) return true;
     }
     if (mosaic_keyframes_ && mosaicEligible(image.size())) {
@@ -1459,6 +1532,7 @@ bool Decoder::rebuildMosaicKeyframe() {
     have_keyframe_ = true;
     current_jpeg_.clear();
     decoded_keyframe_ = reconstructed;
+    pending_restart_ = RestartAssembly{};
     last_keyframe_image_decode_ms_ = pending_mosaic_.image_decode_ms;
     keyframe_changed_ = true;
     previous_render_.release();
@@ -1474,6 +1548,14 @@ bool Decoder::rebuildMosaicKeyframe() {
 }
 
 void Decoder::pushData(const std::vector<u_char>& data){
+    if (data.size() > 5 && data[5] == kRestartPacketType) {
+        CommonHeader h;
+        std::size_t offset = 0;
+        if (data.size() <= kMaxUdpPacketBytes && readCommonHeader(data, offset, h) &&
+            h.header_bytes == kRestartHeaderBytes && h.keyframe_id == h.frame_id)
+            acceptRestartRegion(data, h.frame_id, h.original_size);
+        return;
+    }
     if(data.size()<kCommonHeaderBytes||data.size()>kMaxUdpPacketBytes)return;std::size_t pos=0;CommonHeader h;if(!readCommonHeader(data,pos,h)||h.header_bytes>data.size())return;
 
     if(h.type==kPacketKeyframeChunk){
@@ -1504,7 +1586,7 @@ void Decoder::pushData(const std::vector<u_char>& data){
         }
         if(pending_keyframe_.received_count==pending_keyframe_.chunk_count){
             current_jpeg_=std::move(pending_keyframe_.bytes);original_size_=pending_keyframe_.original_size;keyframe_id_=pending_keyframe_.frame_id;
-            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();previous_render_.release();patch_queue_.clear();last_keyframe_image_decode_ms_=0.0;
+            have_keyframe_=true;keyframe_changed_=true;decoded_keyframe_.release();pending_restart_=RestartAssembly{};previous_render_.release();patch_queue_.clear();last_keyframe_image_decode_ms_=0.0;
             while(!pending_patch_queue_.empty()){patch_queue_.push_back(std::move(pending_patch_queue_.front()));pending_patch_queue_.pop_front();}
             pending_keyframe_=KeyframeAssembly{};pending_mosaic_=MosaicAssembly{};
         }

@@ -261,8 +261,8 @@ int main(int argc, char** argv) {
             }
 
             // Publish the exact validated FlowX datagram to the browser transport.
-            // RawFrameStore groups all datagrams of one frame into an atomic bundle,
-            // so a slow HTTP client skips old frames rather than half a keyframe.
+            // RawFrameStore retains active-key regions, including late arrivals,
+            // and supplies a cumulative snapshot when an HTTP client skips updates.
             raw_frame_store.push(datagram, metadata);
 
             rememberArrival(metadata, receive_timestamp_us);

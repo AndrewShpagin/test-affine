@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(OpenCV REQUIRED)
+find_package(JPEG REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -30,10 +31,10 @@ target_link_libraries(keyframe_test PRIVATE ${OpenCV_LIBS})
 
 # Stable codec implementation. Keep the historical target name as an alias while
 # product-facing code uses FlowX naming.
-add_library(flowx_codec udp_image_codec.cpp motion_refine.cpp)
+add_library(flowx_codec udp_image_codec.cpp motion_refine.cpp jpeg_restart.cpp jpeg_restart_assembly.cpp)
 add_library(udp_image_codec ALIAS flowx_codec)
 target_include_directories(flowx_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS})
+target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS} JPEG::JPEG)
 
 add_executable(codec_test codec_test.cpp)
 target_link_libraries(codec_test PRIVATE flowx_codec)
@@ -72,6 +73,9 @@ endif()
 
 # Receiver runtime: UDP input, decoded-frame publication, browser FlowX transport,
 # and HTTP image/status/browser output.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS flowx_restart_browser.js)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/flowx_restart_browser.js" FLOWX_RESTART_BROWSER_SOURCE)
+configure_file(flowx_restart_browser_source.h.in flowx_restart_browser_source.h @ONLY)
 add_library(flowx_receiver_runtime
     flowx_udp_receiver.cpp
     flowx_frame_store.cpp
@@ -79,6 +83,7 @@ add_library(flowx_receiver_runtime
     flowx_browser_v4_assets.cpp
     flowx_http_server.cpp)
 target_include_directories(flowx_receiver_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(flowx_receiver_runtime PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(flowx_receiver_runtime
     PUBLIC
         flowx_common
@@ -93,6 +98,24 @@ target_link_libraries(flowx_sender PRIVATE flowx_sender_runtime)
 
 add_executable(flowx_receiver flowx_receiver.cpp)
 target_link_libraries(flowx_receiver PRIVATE flowx_receiver_runtime)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(jpeg_restart_test jpeg_restart_test.cpp)
+    target_link_libraries(jpeg_restart_test PRIVATE flowx_receiver_runtime)
+    add_test(NAME flowx_protocol COMMAND flowx_protocol_test)
+    add_test(NAME jpeg_restart COMMAND jpeg_restart_test)
+    find_program(FLOWX_NODE_EXECUTABLE NAMES node nodejs)
+    if(FLOWX_NODE_EXECUTABLE)
+        add_test(NAME jpeg_restart_fixtures COMMAND jpeg_restart_test --export
+            "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
+        set_tests_properties(jpeg_restart_fixtures PROPERTIES FIXTURES_SETUP restart_fixtures)
+        add_test(NAME jpeg_restart_browser COMMAND "${FLOWX_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_restart_browser_test.js"
+            "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
+        set_tests_properties(jpeg_restart_browser PROPERTIES FIXTURES_REQUIRED restart_fixtures)
+    endif()
+endif()
 
 # Keep executable paths stable across single- and multi-config generators.
 foreach(target affine_test mesh_test keyframe_test codec_test flowx_protocol_test flowx_sender flowx_receiver)

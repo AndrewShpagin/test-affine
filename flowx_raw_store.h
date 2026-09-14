@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace flowx {
@@ -20,9 +21,8 @@ struct RawFrameBundle {
     std::vector<std::vector<u_char>> datagrams;
 };
 
-// Groups validated FlowX UDP datagrams by frame and publishes only the latest
-// completed frame bundle. HTTP clients can therefore skip old frames without
-// ever receiving half of a fragmented keyframe because they were slow.
+// Publishes each validated datagram immediately, including late key regions.
+// Clients that skip updates receive the accumulated key plus the latest patch.
 class RawFrameStore {
 public:
     void push(const std::vector<u_char>& datagram, const PacketMetadata& metadata);
@@ -37,16 +37,17 @@ public:
 
 private:
     static bool frameIdNewer(std::uint32_t a, std::uint32_t b);
-    void startBundleLocked(const std::vector<u_char>& datagram,
-                           const PacketMetadata& metadata);
-    void publishCurrentLocked();
+    std::shared_ptr<const RawFrameBundle> snapshotLocked() const;
 
     mutable std::mutex mutex_;
     mutable std::condition_variable changed_;
-    RawFrameBundle current_;
-    bool have_current_ = false;
+    RawFrameBundle key_;
+    bool have_key_ = false;
+    std::uint32_t stream_id_ = 0;
+    std::size_t key_bytes_ = 0;
+    std::unordered_map<std::uint64_t, std::size_t> key_slots_;
     std::shared_ptr<const RawFrameBundle> latest_;
-    std::shared_ptr<const RawFrameBundle> latest_keyframe_;
+    std::shared_ptr<const RawFrameBundle> latest_patch_;
     std::uint64_t next_sequence_ = 1;
     bool closed_ = false;
 };
