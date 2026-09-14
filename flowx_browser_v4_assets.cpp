@@ -31,6 +31,7 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}header{p
   <span>shown <code id="shown">0</code></span>
   <span>playout drops <code id="playoutDrops">0</code></span>
   <label>Playback delay <input id="playoutDelay" type="number" min="0" max="200" step="10" value="60" style="width:4em"> ms</label>
+  <label title="Disable to show missing data in black. Changing this reloads the view."><input id="fillGaps" type="checkbox" checked> Fill missing pixels</label>
   <span>skipped <code id="skipped">0</code></span>
   <span>errors <code id="errors">0</code></span>
 </header>
@@ -54,6 +55,10 @@ const u16=(v,o)=>v.getUint16(o,true), i16=(v,o)=>v.getInt16(o,true), u32=(v,o)=>
 const captureMs=v=>u32(v,12)/1000+u32(v,16)*(4294967296/1000);
 const ascii4=(u,o)=>String.fromCharCode(u[o],u[o+1],u[o+2],u[o+3]);
 if(!gl){ setState('WebGL2 unavailable', false); return; }
+const query=new URLSearchParams(location.search);
+const fillGaps=query.get('fill_gaps')!=='0';
+const fillControl=$('fillGaps');fillControl.checked=fillGaps;
+if(!fillGaps)canvas.style.imageRendering='pixelated';
 
 const vs = `#version 300 es
 void main(){
@@ -95,6 +100,7 @@ const patchFs = `#version 300 es
 precision highp float;
 uniform sampler2D uKey;
 uniform sampler2D uPrev;
+uniform bool uFillGaps;
 uniform vec2 uOutSize;
 uniform vec2 uKeySize;
 uniform mat3 uInvH;
@@ -130,9 +136,11 @@ void main(){
     vec2 s=src*scale;
     vec2 uv=vec2((s.x+0.5)/uKeySize.x,(s.y+0.5)/uKeySize.y);
     color=texture(uKey,uv);
-  }else{
+  }else if(uFillGaps){
     vec2 uv=vec2((dst.x+0.5)/uOutSize.x,1.0-(dst.y+0.5)/uOutSize.y);
     color=texture(uPrev,uv);
+  }else{
+    color=vec4(0.0,0.0,0.0,1.0);
   }
 }`;
 function sh(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
@@ -141,6 +149,12 @@ const keyProg=prog(keyFs), stripsProg=prog(stripsFs), copyProg=prog(copyFs), pat
 const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
 function tex(){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
 const keyTex=tex(), stripTex=[tex(),tex()], keyFbo=gl.createFramebuffer(), frameTex=[tex(),tex()], fbo=[gl.createFramebuffer(),gl.createFramebuffer()];
+if(!fillGaps){
+  // Keep absent columns black through key scaling and PATCH warping in debug mode.
+  gl.bindTexture(gl.TEXTURE_2D,keyTex);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+}
 let outW=0,outH=0,keyW=0,keyH=0,current=0,keyFrameId=null,streamId=0,key=null;
 let restartAssembly=null,lastRenderedFrame=null,lastPresentedFrame=null;
 let restartPresentation=null,restartPresentationTimer=null;
@@ -149,7 +163,7 @@ const newer=(a,b)=>((a-b)|0)>0;
 const retiredStreams=new Set();
 const presentationPool=[];
 const delayControl=$('playoutDelay');
-const queryDelay=new URLSearchParams(location.search).get('playout_ms');
+const queryDelay=query.get('playout_ms');
 const playout=new FlowXFramePlayout({
   now:()=>performance.now(),requestFrame:fn=>requestAnimationFrame(fn),cancelFrame:id=>cancelAnimationFrame(id),
   delayMs:queryDelay===null?60:Number(queryDelay),
@@ -164,6 +178,14 @@ delayControl.value=String(playout.delayMs);
 delayControl.addEventListener('change',()=>{
   playout.setDelay(delayControl.value===''?60:Number(delayControl.value));
   delayControl.value=String(playout.delayMs);
+});
+fillControl.addEventListener('change',()=>{
+  // A fresh view avoids mixing already filled reference pixels and queued frames
+  // with the new debug mode. Keep other URL options and the current delay.
+  const params=new URLSearchParams(location.search);
+  params.set('fill_gaps',fillControl.checked?'1':'0');
+  params.set('playout_ms',String(playout.delayMs));
+  location.search=params.toString();
 });
 function queuePresentation(frameId,timestamp){
   const slot=presentationPool.pop()||{texture:tex(),width:0,height:0};
@@ -261,6 +283,7 @@ function renderPatch(p){
   const next=1-current; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[next]); gl.viewport(0,0,outW,outH); gl.useProgram(patchProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(patchProg,'uPrev'),1);
+  gl.uniform1i(gl.getUniformLocation(patchProg,'uFillGaps'),fillGaps?1:0);
   gl.uniform2f(gl.getUniformLocation(patchProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(patchProg,'uKeySize'),keyW,keyH); gl.uniformMatrix3fv(gl.getUniformLocation(patchProg,'uInvH'),false,inv); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridX'),p.gridX); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridY'),p.gridY); gl.uniform2fv(gl.getUniformLocation(patchProg,'uMesh[0]'),p.mesh); draw(); current=next; queuePresentation(p.frameId,p.timestamp);
   lastRenderedFrame=p.frameId;stats.renders++; putStats();
 }
@@ -295,7 +318,7 @@ async function acceptRegion(u,frame,timestamp){
   // Keep the prior assembly available until its burst is finalized. Reusing
   // one object across frame IDs would discard its pixels before nearest fill.
   const previous=restartAssembly,previousStream=streamId;
-  const a=previous&&previous.frameId===frame?previous:new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion);
+  const a=previous&&previous.frameId===frame?previous:new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion,{fillGaps});
   const result=await a.accept(u);
   if(!result||restartAssembly!==previous||streamId!==previousStream)return;
   if(result.newKeyframe){

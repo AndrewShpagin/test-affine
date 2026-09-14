@@ -97,10 +97,12 @@
     return true;
   }
   class RestartAssembler {
-    constructor(headers,decode) { this.headers=headers;this.decode=decode;this.frameId=null;this.fillDirty=false; }
+    constructor(headers,decode,{fillGaps=true}={}) {
+      this.headers=headers;this.decode=decode;this.fillGaps=fillGaps;this.frameId=null;this.fillDirty=false;
+    }
     matching(r) { return this.ow===r.ow && this.oh===r.oh && this.lw===r.lw && this.lh===r.lh && this.profile===r.profile; }
     fillMissing() {
-      if(this.frameId===null||!this.fillDirty)return false;
+      if(!this.fillGaps||this.frameId===null||!this.fillDirty)return false;
       const changed=fillMissingPixels(this.pixels,this.received,this.width,this.height);
       this.fillDirty=false;return changed;
     }
@@ -133,7 +135,7 @@
       for(let b=0;b<count;b++) {
         const own=2*(first+b)+parity;
         if(this.received[own]) continue;
-        const fill=!this.received[own^1];
+        const fill=this.fillGaps&&!this.received[own^1];
         for(let y=0;y<8;y++) for(let x=0;x<8;x++) {
           const sx=8*b+x,dx=r.x+2*sx,src=(y*r.width+sx)*4,dst=((r.y+y)*this.width+dx)*4;
           for(let c=0;c<4;c++) {

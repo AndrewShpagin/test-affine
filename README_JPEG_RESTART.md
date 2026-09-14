@@ -89,6 +89,27 @@ snapshot followed by the latest compatible PATCH when it skips updates.
 The snapshot is bounded to 12 MiB and 65534 key packets. Supported original
 images are at most 16 megapixels; use an appropriate keyframe byte budget.
 
+## Debug without filling
+
+Uncheck **Fill missing pixels** in the browser header, or open
+`/flowx.html?fill_gaps=0`. Filling is enabled by default; `fill_gaps=1` enables it
+explicitly. Changing the checkbox reloads the view so previously filled pixels
+and queued frames cannot survive the switch. Other URL options and the current
+playback delay are preserved.
+
+With filling disabled, every unreceived sample stays opaque black, including
+missing odd/even columns when only the other half arrived. Areas missing both
+halves also stay black after the wait ends. Late packets still replace black
+samples with their actual decoded pixels. Receipt masks, completion detection,
+and presentation timing are unchanged.
+
+Debug rendering uses nearest-pixel key sampling and pixelated canvas scaling
+to avoid blending black columns with received neighbours. PATCH areas outside
+the keyframe are also black instead of being copied from the previous frame.
+The vertical lines are one pixel wide in the encoded keyframe raster; their
+display size depends on keyframe/output scaling and browser zoom. This option
+controls the browser view only, not native decoding or the wire protocol.
+
 ## Build and tests
 
 Install libjpeg development headers in addition to the existing dependencies

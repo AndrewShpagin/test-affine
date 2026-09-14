@@ -20,28 +20,35 @@ function patch(frame,key,stream=7,scale=1) {
   v.setUint16(20,(frame-key)>>>0,true);v.setUint16(22,fixture.width*scale,true);v.setUint16(24,fixture.height*scale,true);
   v.setFloat32(27,1,true);v.setFloat32(43,1,true);return u;
 }
-function harness(delayMs=0) {
+function harness(delayMs=0,extraQuery='') {
   let now=0,nextTimer=0,resizes=0;
-  const timers=new Map(),nodes=new Map(),uploads=[];
+  const timers=new Map(),nodes=new Map(),uploads=[],filters=[],uniforms=[];
+  const location={search:'?playout_ms='+delayMs+extraQuery};
   const gl=new Proxy({}, {get:(_,name)=>{
     if(/^[A-Z_0-9]+$/.test(name)) return name;
     if(name==='getShaderParameter'||name==='getProgramParameter') return ()=>true;
     if(name==='checkFramebufferStatus') return ()=>'FRAMEBUFFER_COMPLETE';
     if(name.startsWith('create')) return ()=>({});
     if(name==='texSubImage2D')return (...a)=>uploads.push({width:a[4],height:a[5],pixels:Uint8Array.from(a[8])});
+    if(name==='texParameteri')return (...a)=>filters.push(a);
+    if(name==='getUniformLocation')return (_,name)=>name;
+    if(name==='uniform1i')return (name,value)=>uniforms.push({name,value});
     return ()=>{};
   }});
-  const canvas={getContext:()=>gl};
+  const canvas={getContext:()=>gl,style:{}};
   for(const name of ['width','height']) {
     let value=0;Object.defineProperty(canvas,name,{get:()=>value,set:v=>{value=v;resizes++;}});
   }
   nodes.set('view',canvas);
   const context=vm.createContext({
-    console,Uint8Array,DataView,Float32Array,URLSearchParams,location:{search:'?playout_ms='+delayMs},
+    console,Uint8Array,DataView,Float32Array,URLSearchParams,location,
     performance:{now:()=>now},
     requestAnimationFrame:fn=>{const id=++nextTimer;timers.set(id,{fn,at:(Math.floor(now/16)+1)*16});return id;},
     cancelAnimationFrame:id=>timers.delete(id),
-    document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,{addEventListener:()=>{}});return nodes.get(id);}},
+    document:{getElementById:id=>{
+      if(!nodes.has(id))nodes.set(id,{listeners:{},addEventListener(type,fn){this.listeners[type]=fn;}});
+      return nodes.get(id);
+    }},
     setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});return id;},
     clearTimeout:id=>timers.delete(id),
     fixtureDecode:async (jpeg,width,height)=>{
@@ -62,7 +69,7 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
 }):null};
 `),context);
   return {
-    ...context.testBrowser,canvas,timers,uploads,resizes:()=>resizes,
+    ...context.testBrowser,canvas,timers,uploads,filters,uniforms,nodes,location,resizes:()=>resizes,
     advance(ms) {
       const end=now+ms;
       for(;;) {
@@ -77,6 +84,8 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   const count=fixture.regions.length,kept=Math.floor(count*.65);
   // Startup and inactivity: one valid region must not immediately flash black.
   const quiet=harness();
+  assert.equal(quiet.nodes.get('fillGaps').checked,true,'filling must remain the default');
+  assert.ok(!quiet.filters.some(a=>a[2]==='NEAREST'),'normal rendering lost smooth sampling');
   await quiet.processDatagram(patch(101,100));
   assert.equal(quiet.stats.renders,0);assert.equal(quiet.timers.size,0);
   await quiet.processDatagram(region(0));
@@ -97,6 +106,45 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   fillMissingPixels(lateExpected,late.received,late.width,late.height);
   await quiet.processDatagram(patch(101,100));
   assert.deepEqual(quiet.reference().pixels,lateExpected,'PATCH did not refresh late neighbour colors');
+  assert.equal(quiet.uniforms.findLast(u=>u.name==='uFillGaps').value,1);
+
+  // The shipped URL option must bypass both fill paths, including quiet/PATCH
+  // release and new streams. Assert black by the actual per-parity receipt mask.
+  const raw=harness(0,'&fill_gaps=0&keep=example');
+  assert.equal(raw.nodes.get('fillGaps').checked,false);
+  assert.equal(raw.canvas.style.imageRendering,'pixelated');
+  assert.deepEqual(raw.filters.filter(a=>a[2]==='NEAREST').map(a=>a[1]),['TEXTURE_MIN_FILTER','TEXTURE_MAG_FILTER']);
+  function checkMissingBlack(ref) {
+    let missing=0;
+    for(let y=0;y<ref.height;y++)for(let x=0;x<ref.width;x++) {
+      const b=(y>>3)*(ref.width/16)+(x>>4);
+      if(!ref.received[2*b+(x&1)]) {
+        const p=(y*ref.width+x)*4;
+        assert.deepEqual(Array.from(ref.pixels.subarray(p,p+4)),[0,0,0,255]);missing++;
+      }
+    }
+    assert.ok(missing>0,'test needs missing pixels');
+  }
+  await raw.processDatagram(region(0));
+  const rawWaiting=raw.reference();checkMissingBlack(rawWaiting);
+  raw.advance(100);assert.equal(raw.stats.renders,1);
+  assert.deepEqual(raw.reference().pixels,rawWaiting.pixels,'timeout filled debug view');
+  assert.equal(raw.uploads.length,0,'timeout uploaded estimates in debug mode');
+  await raw.processDatagram(region(1));await raw.processDatagram(patch(101,100));
+  checkMissingBlack(raw.reference());
+  assert.equal(raw.uniforms.findLast(u=>u.name==='uFillGaps').value,0,'PATCH retained border filling');
+  await raw.processDatagram(region(0,110));await raw.processDatagram(patch(111,110));
+  checkMissingBlack(raw.reference());
+  await raw.processDatagram(region(0,1,8));raw.advance(100);checkMissingBlack(raw.reference());
+  // UI changes reload with a clean reference, preserving other options/delay.
+  const delay=raw.nodes.get('playoutDelay');delay.value='80';delay.listeners.change();
+  const fill=raw.nodes.get('fillGaps');fill.checked=true;fill.listeners.change();
+  const params=new URLSearchParams(raw.location.search);
+  assert.equal(params.get('fill_gaps'),'1');assert.equal(params.get('playout_ms'),'80');
+  assert.equal(params.get('keep'),'example');
+  fill.checked=false;fill.listeners.change();
+  assert.equal(new URLSearchParams(raw.location.search).get('fill_gaps'),'0');
+  assert.equal(harness(0,'&fill_gaps=1').nodes.get('fillGaps').checked,true);
 
   const h=harness();
   for(let i=0;i<count;i++)await h.processDatagram(region(i));

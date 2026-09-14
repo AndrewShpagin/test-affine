@@ -11,7 +11,7 @@ function decode(jpeg,w,h) {
   assert.ok(pixels,'JS reconstructed different JPEG bytes from C++');
   assert.equal(pixels.length,w*h*4);return Promise.resolve(pixels);
 }
-function expected(indices) {
+function expected(indices,fillGaps=true) {
   const pixels=new Uint8Array(f.width*f.height*4),mask=new Uint8Array(f.width*f.height);
   for(let p=3;p<pixels.length;p+=4) pixels[p]=255;
   for(const i of indices) {
@@ -21,7 +21,7 @@ function expected(indices) {
       pixels.set(source.slice(src,src+4),dest*4);mask[dest]=1;
     }
   }
-  for(let y=0;y<f.height;y++) for(let x=0;x<f.width;x++) {
+  if(fillGaps)for(let y=0;y<f.height;y++) for(let x=0;x<f.width;x++) {
     const own=y*f.width+x,other=y*f.width+(x^1);
     if(!mask[own]&&mask[other]) pixels.set(pixels.slice(other*4,other*4+4),own*4);
   }
@@ -73,6 +73,25 @@ function frame(packet,id) {
     const bad=frame(packets[1],111);bad[34]=99;
     await assert.rejects(a.accept(bad),/geometry/);assert.equal(a.frameId,110);
   }
+  // Either parity can arrive first. With concealment off, only its actual
+  // samples exist; absent columns and regions stay opaque black even after fill.
+  for(const parity of [0,1]) {
+    const indices=packets.map((_,i)=>i).filter(i=>(parseRegion(packets[i]).x&1)===parity);
+    const raw=new RestartAssembler(f.headers,decode,{fillGaps:false});
+    await raw.accept(packets[indices[0]]);
+    assert.equal(raw.fillMissing(),false);
+    assert.deepEqual(raw.pixels,expected(indices.slice(0,1),false),'raw gaps were filled');
+    for(const i of indices.slice(1))await raw.accept(packets[i]);
+    const mask=raw.received.slice();
+    assert.equal(raw.fillMissing(),false);
+    assert.deepEqual(raw.pixels,expected(indices,false),'missing parity did not stay black');
+    assert.deepEqual(raw.received,mask);
+    assert.equal(raw.receivedCount,raw.received.length/2);
+    for(let i=0;i<packets.length;i++)await raw.accept(packets[i]);
+    assert.deepEqual(raw.pixels,Uint8Array.from(f.complete),'late parity failed to restore raw view');
+    await raw.accept(frame(packets[indices[0]],110));
+    assert.deepEqual(raw.pixels,expected(indices.slice(0,1),false),'new raw key retained old pixels');
+  }
   const wrap=new RestartAssembler(f.headers,decode);
   await wrap.accept(frame(packets[0],0xfffffffe));await wrap.accept(frame(packets[1],1));
   assert.equal(wrap.frameId,1);assert.equal(await wrap.accept(frame(packets[0],0xfffffffe)),null);
@@ -84,5 +103,5 @@ function frame(packet,id) {
   pending[1]();await fresh;pending[0]();assert.equal(await old,null);assert.equal(racing.frameId,101);
   for(const i of [0,Math.floor(packets.length/2),packets.length-1])
     assert.deepEqual(Array.from(makeJpeg(parseRegion(packets[i]),f.headers)),f.regions[i].jpeg);
-  console.log('PASS: browser/native JPEG bytes, 35% loss (12 trials), fills, duplicates, late restore, frame wrap, async reorder');
+  console.log('PASS: browser/native JPEG bytes, 35% loss (12 trials), fills on/off, black odd/even columns, duplicates, late restore, frame wrap, async reorder');
 })().catch(e=>{console.error(e);process.exitCode=1;});
