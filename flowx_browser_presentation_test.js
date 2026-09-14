@@ -8,16 +8,18 @@ const decoded=new Map(fixture.regions.map(r=>[Buffer.from(r.jpeg).toString('base
 function region(i,frame=100,stream=7,scale=1) {
   const u=Uint8Array.from(fixture.regions[i].wire),v=new DataView(u.buffer);
   v.setUint32(8,frame,true);v.setUint32(4,stream,true);
+  v.setUint32(12,1000000000+((frame-100)|0)*32000,true);v.setUint32(16,0,true);
   v.setUint16(20,fixture.width*scale,true);v.setUint16(22,fixture.height*scale,true);
   return u;
 }
 function patch(frame,key,stream=7,scale=1) {
   const u=new Uint8Array(51),v=new DataView(u.buffer);
   v.setUint16(0,0x5846,true);u[2]=0x42;v.setUint32(4,stream,true);v.setUint32(8,frame,true);
+  v.setUint32(12,1000000000+((frame-100)|0)*32000,true);
   v.setUint16(20,(frame-key)>>>0,true);v.setUint16(22,fixture.width*scale,true);v.setUint16(24,fixture.height*scale,true);
   v.setFloat32(27,1,true);v.setFloat32(43,1,true);return u;
 }
-function harness() {
+function harness(delayMs=0) {
   let now=0,nextTimer=0,resizes=0;
   const timers=new Map(),nodes=new Map();
   const gl=new Proxy({}, {get:(_,name)=>{
@@ -33,8 +35,11 @@ function harness() {
   }
   nodes.set('view',canvas);
   const context=vm.createContext({
-    console,Uint8Array,DataView,Float32Array,
-    document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);}},
+    console,Uint8Array,DataView,Float32Array,URLSearchParams,location:{search:'?playout_ms='+delayMs},
+    performance:{now:()=>now},
+    requestAnimationFrame:fn=>{const id=++nextTimer;timers.set(id,{fn,at:(Math.floor(now/16)+1)*16});return id;},
+    cancelAnimationFrame:id=>timers.delete(id),
+    document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,{addEventListener:()=>{}});return nodes.get(id);}},
     setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});return id;},
     clearTimeout:id=>timers.delete(id),
     fixtureDecode:async (jpeg,width,height)=>{
@@ -47,7 +52,8 @@ function harness() {
   vm.runInContext(source.replace(hook,`
 decodeRegion=globalThis.fixtureDecode;
 globalThis.testBrowser={processDatagram,stats,state:()=>({
-  frame:lastDisplayedFrame,key:keyFrameId,pending:restartPresentation!==null,stream:streamId
+  frame:lastRenderedFrame,shown:lastPresentedFrame,key:keyFrameId,pending:restartPresentation!==null,stream:streamId,
+  queued:playout.frames.length,pool:presentationPool.length
 })};
 `),context);
   return {
@@ -79,7 +85,8 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
 
   const h=harness();
   for(let i=0;i<count;i++)await h.processDatagram(region(i));
-  assert.equal(h.stats.renders,1,'complete key not shown immediately');assert.equal(h.timers.size,0);
+  assert.equal(h.stats.renders,1,'complete key not rendered immediately');assert.equal(h.state().pending,false);
+  h.advance(16);assert.equal(h.state().shown,100);
   await h.processDatagram(patch(101,100));
   const before=h.stats.renders,oldResizes=h.resizes();
   // A resolution change must also keep the old canvas until presentation.
@@ -87,10 +94,11 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   assert.equal(h.state().frame,101);assert.equal(h.stats.renders,before,'partial key flashed');
   assert.equal(h.resizes(),oldResizes,'pending key cleared canvas on resize');
   await h.processDatagram(patch(111,110,7,2));
-  assert.equal(h.stats.renders,before+1,'intermediate key rendered before PATCH');
+  assert.equal(h.stats.renders,before+2,'key capture-time slot was lost');
+  h.advance(16);
   assert.equal(h.stats.keys,2);assert.equal(h.canvas.width,fixture.width*2);
   for(let i=kept;i<count;i++)await h.processDatagram(region(i,110,7,2));
-  h.advance(1000);assert.equal(h.stats.renders,before+1,'stale timeout/late data rewound display');
+  h.advance(1000);assert.equal(h.stats.renders,before+2,'stale timeout/late data rewound display');
   assert.equal(h.state().frame,111);
   await h.processDatagram(patch(112,110,7,2));assert.equal(h.state().frame,112);
 
@@ -115,6 +123,20 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   const wrap=harness();
   await wrap.processDatagram(region(0,0xfffffffe));
   await wrap.processDatagram(patch(1,0xfffffffe));
-  wrap.advance(1000);assert.equal(wrap.state().frame,1);assert.equal(wrap.stats.renders,1);
+  wrap.advance(1000);assert.equal(wrap.state().frame,1);assert.equal(wrap.stats.renders,2);
+  assert.equal(wrap.stats.shown,1,'zero-delay playback replayed overdue key');
+  // Key + PATCH become ready together after 35% loss. They must still occupy
+  // distinct 32 ms capture slots on the actual shipped browser control path.
+  const timed=harness(40);
+  for(let i=0;i<kept;i++)await timed.processDatagram(region(i));
+  timed.advance(32);await timed.processDatagram(patch(101,100));
+  assert.equal(timed.stats.shown,0);
+  timed.advance(16);assert.equal(timed.state().shown,100);
+  timed.advance(32);assert.equal(timed.state().shown,101);
+  await timed.processDatagram(patch(102,100));await timed.processDatagram(patch(103,100));
+  timed.advance(32);assert.equal(timed.state().shown,102,'burst skipped an on-time PATCH');
+  timed.advance(32);assert.equal(timed.state().shown,103);
+  assert.equal(timed.stats.playoutDrops,0);
+  assert.ok(timed.state().queued+timed.state().pool<=5,'unbounded snapshot textures');
   console.log('PASS: no first-region flash, completion/PATCH/burst/quiet presentation, 35% loss, deferred resize, duplicates, late data, stream reset, frame wrap');
 })().catch(e=>{console.error(e);process.exitCode=1;});

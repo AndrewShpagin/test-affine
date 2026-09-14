@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr char kBrowserPlayoutSource[] = R"FXPLAYOUT(@FLOWX_BROWSER_PLAYOUT_SOURCE@)FXPLAYOUT";

@@ -59,8 +59,9 @@ retransmission in this version, and burst losses can remove both counterparts.
 Native and browser decoders update the active reference progressively.
 The browser keeps the current image visible while a new reference is assembled;
 receiving its first region does not display a mostly black keyframe. It presents
-a fully received key immediately, or presents the first matching PATCH directly
-when that packet closes the key burst. A newer key also closes the prior burst.
+a fully received key for playback immediately. The first matching PATCH closes
+the key burst and queues both the partial key and PATCH at their respective
+capture times. A newer key also closes the prior burst.
 If the stream pauses, 100 ms without a newly decoded region presents the partial
 key, so missing packets cannot make it wait forever. Duplicates do not extend
 this timeout. Canvas resizing is deferred until presentation as well.
@@ -97,7 +98,41 @@ CTest also exports native JPEG/RGBA fixtures and checks browser assembly against
 the same bytes, including asynchronous decode reordering.
 The browser presentation regression test also executes the shipped JavaScript
 with a virtual clock and a canvas/WebGL stub, checking that partial keys and
-resolution changes preserve the displayed frame until presentation.
+resolution changes preserve the displayed frame until presentation. Playout
+tests simulate packet bursts, missing frames, paused tabs, and clock changes.
+
+## Browser frame timing
+
+The browser uses each packet's existing capture timestamp to schedule decoded
+images on `requestAnimationFrame`. Rendering is separate from presentation:
+up to four GPU snapshots wait for their display times, so successive key/PATCH
+renders cannot overwrite an image that is still waiting to be shown. The queue
+uses at most five reusable snapshot textures including a staging texture;
+each RGBA texture consumes approximately `width * height * 4` bytes.
+
+**Playback delay** in the browser header defaults to **60 ms**, adjustable from
+0 to 200 ms. It can also be initialized using `/flowx.html?playout_ms=80`.
+This is additional buffering, not a measurement of total end-to-end latency.
+If a high frame rate needs more than four queued images, queue pressure shortens
+the effective delay and drops older images so playback cannot stall waiting for
+frames that have already been evicted.
+Use 0 for the next available display refresh, or increase it if network/decode
+jitter exceeds the default budget. The default covers one 50 ms frame period at
+the sample configurations' 20 fps. Covering a frame period helps a partial key
+and its following PATCH occupy separate display slots instead of skipping every
+loss-affected keyframe. Sender and browser clocks need not be synchronized;
+the first timestamp establishes a relative timeline.
+
+At most one image is presented per display refresh. If playback falls behind,
+overdue frames are dropped in favor of the newest due frame; the queue never
+grows indefinitely or rapidly replays a backlog. Stream/clock resets discard
+queued images. Visible canvas dimensions change only when the new image is
+actually presented.
+
+The header distinguishes `renders` from `shown` and reports `playout drops`.
+This smooths arrival jitter within the chosen delay budget. It cannot recreate
+lost PATCH frames or frames the sender never captured/encoded: those gaps still
+hold the most recent available image. No motion interpolation is applied.
 
 For actual JPEG decoding and WebGL rendering, with Playwright and Chromium
 installed:

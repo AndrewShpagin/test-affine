@@ -1,6 +1,7 @@
 #include "flowx_browser_assets.h"
 #include "jpeg_restart.h"
 #include "flowx_restart_browser_source.h"
+#include "flowx_browser_playout_source.h"
 #include <string>
 
 namespace flowx {
@@ -27,6 +28,9 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}header{p
   <span>keyframes <code id="keys">0</code></span>
   <span>patches <code id="patches">0</code></span>
   <span>renders <code id="renders">0</code></span>
+  <span>shown <code id="shown">0</code></span>
+  <span>playout drops <code id="playoutDrops">0</code></span>
+  <label>Playback delay <input id="playoutDelay" type="number" min="0" max="200" step="10" value="60" style="width:4em"> ms</label>
   <span>skipped <code id="skipped">0</code></span>
   <span>errors <code id="errors">0</code></span>
 </header>
@@ -43,10 +47,11 @@ std::string_view browserJs() {
 const $ = id => document.getElementById(id);
 const canvas = $('view');
 const gl = canvas.getContext('webgl2', {alpha:false, antialias:false});
-const stats = {records:0, packets:0, keys:0, patches:0, renders:0, skipped:0, errors:0};
+const stats = {records:0, packets:0, keys:0, patches:0, renders:0, shown:0, playoutDrops:0, skipped:0, errors:0};
 const setState = (text, ok=true) => { $('state').textContent=text; $('state').className=ok?'ok':'bad'; };
 const putStats = () => { for (const k of Object.keys(stats)) { const e=$(k); if(e) e.textContent=stats[k]; } };
 const u16=(v,o)=>v.getUint16(o,true), i16=(v,o)=>v.getInt16(o,true), u32=(v,o)=>v.getUint32(o,true), f32=(v,o)=>v.getFloat32(o,true);
+const captureMs=v=>u32(v,12)/1000+u32(v,16)*(4294967296/1000);
 const ascii4=(u,o)=>String.fromCharCode(u[o],u[o+1],u[o+2],u[o+3]);
 if(!gl){ setState('WebGL2 unavailable', false); return; }
 
@@ -137,24 +142,60 @@ const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
 function tex(){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
 const keyTex=tex(), stripTex=[tex(),tex()], keyFbo=gl.createFramebuffer(), frameTex=[tex(),tex()], fbo=[gl.createFramebuffer(),gl.createFramebuffer()];
 let outW=0,outH=0,keyW=0,keyH=0,current=0,keyFrameId=null,streamId=0,key=null;
-let restartAssembly=null,lastDisplayedFrame=null;
+let restartAssembly=null,lastRenderedFrame=null,lastPresentedFrame=null;
 let restartPresentation=null,restartPresentationTimer=null;
 const restartQuietMs=100;
 const newer=(a,b)=>((a-b)|0)>0;
 const retiredStreams=new Set();
+const presentationPool=[];
+const delayControl=$('playoutDelay');
+const queryDelay=new URLSearchParams(location.search).get('playout_ms');
+const playout=new FlowXFramePlayout({
+  now:()=>performance.now(),requestFrame:fn=>requestAnimationFrame(fn),cancelFrame:id=>cancelAnimationFrame(id),
+  delayMs:queryDelay===null?60:Number(queryDelay),
+  present:frame=>{
+    display(frame.payload);
+    lastPresentedFrame=frame.frameId;stats.shown++;$('frame').textContent=frame.frameId;putStats();
+  },
+  release:slot=>presentationPool.push(slot),
+  onDrop:()=>{stats.playoutDrops++;}
+});
+delayControl.value=String(playout.delayMs);
+delayControl.addEventListener('change',()=>{
+  playout.setDelay(delayControl.value===''?60:Number(delayControl.value));
+  delayControl.value=String(playout.delayMs);
+});
+function queuePresentation(frameId,timestamp){
+  const slot=presentationPool.pop()||{texture:tex(),width:0,height:0};
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,slot.texture);
+  if(slot.width!==outW||slot.height!==outH){
+    slot.width=outW;slot.height=outH;
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,outW,outH,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  }
+  // Keep queued images independent of later PATCH rendering and late key data.
+  // The queue holds at most four snapshots, with one reusable staging texture.
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]);
+  gl.copyTexSubImage2D(gl.TEXTURE_2D,0,0,0,0,0,outW,outH);
+  playout.enqueue(frameId,timestamp,slot);
+}
 function alloc(w,h){
   if(outW===w&&outH===h) return;
-  outW=w; outH=h; canvas.width=w; canvas.height=h;
+  outW=w; outH=h;
   for(let i=0;i<2;i++){ gl.bindTexture(gl.TEXTURE_2D,frameTex[i]); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null); gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[i]); gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,frameTex[i],0); if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE) throw new Error('framebuffer incomplete'); }
   gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,w,h);
 }
 function draw(){ gl.drawArrays(gl.TRIANGLES,0,3); }
-function display(){ gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,outW,outH); gl.useProgram(copyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(copyProg,'uTex'),0); gl.uniform2f(gl.getUniformLocation(copyProg,'uSize'),outW,outH); draw(); }
+function display(slot){
+  if(canvas.width!==slot.width||canvas.height!==slot.height){canvas.width=slot.width;canvas.height=slot.height;}
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,slot.width,slot.height);gl.useProgram(copyProg);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,slot.texture);
+  gl.uniform1i(gl.getUniformLocation(copyProg,'uTex'),0);gl.uniform2f(gl.getUniformLocation(copyProg,'uSize'),slot.width,slot.height);draw();
+}
 function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); }
-function renderKey(frameId){
-  lastDisplayedFrame=frameId;
-  current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); display();
-  keyFrameId=frameId; stats.keys++; stats.renders++; $('frame').textContent=frameId; putStats();
+function renderKey(frameId,timestamp){
+  lastRenderedFrame=frameId;
+  current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); queuePresentation(frameId,timestamp);
+  keyFrameId=frameId; stats.keys++; stats.renders++; putStats();
 }
 function cancelRestartPresentation(){
   if(restartPresentationTimer!==null) clearTimeout(restartPresentationTimer);
@@ -164,9 +205,9 @@ function presentRestartKey(){
   const pending=restartPresentation;
   if(!pending) return;
   cancelRestartPresentation();
-  if(pending.frameId!==keyFrameId || (lastDisplayedFrame!==null&&!newer(pending.frameId,lastDisplayedFrame))) return;
+  if(pending.frameId!==keyFrameId || (lastRenderedFrame!==null&&!newer(pending.frameId,lastRenderedFrame))) return;
   alloc(pending.width,pending.height);
-  renderKey(pending.frameId);
+  renderKey(pending.frameId,pending.timestamp);
 }
 function scheduleRestartPresentation(){
   if(!restartPresentation) return;
@@ -175,8 +216,8 @@ function scheduleRestartPresentation(){
   // if the stream pauses or every following PATCH is lost.
   restartPresentationTimer=setTimeout(presentRestartKey,restartQuietMs);
 }
-function uploadKey(source,ow,oh,frameId){ alloc(ow,oh); keyW=source.width; keyH=source.height; uploadBitmap(keyTex,source); renderKey(frameId); }
-function uploadStrips(even,odd,ow,oh,frameId){
+function uploadKey(source,ow,oh,frameId,timestamp){ alloc(ow,oh); keyW=source.width; keyH=source.height; uploadBitmap(keyTex,source); renderKey(frameId,timestamp); }
+function uploadStrips(even,odd,ow,oh,frameId,timestamp){
   if(even.width!==odd.width||even.height!==odd.height) throw new Error('strip size mismatch');
   alloc(ow,oh); keyW=even.width*2; keyH=even.height;
   uploadBitmap(stripTex[0],even); uploadBitmap(stripTex[1],odd);
@@ -185,7 +226,7 @@ function uploadStrips(even,odd,ow,oh,frameId){
   gl.viewport(0,0,keyW,keyH); gl.useProgram(stripsProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,stripTex[0]); gl.uniform1i(gl.getUniformLocation(stripsProg,'uEven'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,stripTex[1]); gl.uniform1i(gl.getUniformLocation(stripsProg,'uOdd'),1);
-  draw(); renderKey(frameId);
+  draw(); renderKey(frameId,timestamp);
 }
 function invH(a,p){
   const m00=a[0],m01=a[1],m02=a[2],m10=a[3],m11=a[4],m12=a[5],m20=p[0],m21=p[1],m22=1;
@@ -197,24 +238,24 @@ function invH(a,p){
   return new Float32Array([r[0],r[3],r[6],r[1],r[4],r[7],r[2],r[5],r[8]]);
 }
 function renderPatch(p){
-  if(lastDisplayedFrame!==null && !newer(p.frameId,lastDisplayedFrame)) return;
+  if(lastRenderedFrame!==null && !newer(p.frameId,lastRenderedFrame)) return;
   const pending=restartPresentation;
   const width=pending?pending.width:outW,height=pending?pending.height:outH;
   if(keyFrameId===null||p.keyframeId!==keyFrameId||p.width!==width||p.height!==height){ stats.skipped++; putStats(); return; }
   const inv=invH(p.affine,p.perspective); if(!inv){ stats.skipped++; putStats(); return; }
   if(pending){
-    // A matching PATCH closes the key burst. Present that PATCH directly,
-    // preserving the previous display/border buffer until this point.
-    cancelRestartPresentation();alloc(width,height);stats.keys++;
+    // Keep the key's capture-time slot. Playout spaces key and PATCH even when
+    // both become ready together, rather than holding through every lost key.
+    presentRestartKey();
   }
   const next=1-current; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[next]); gl.viewport(0,0,outW,outH); gl.useProgram(patchProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(patchProg,'uPrev'),1);
-  gl.uniform2f(gl.getUniformLocation(patchProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(patchProg,'uKeySize'),keyW,keyH); gl.uniformMatrix3fv(gl.getUniformLocation(patchProg,'uInvH'),false,inv); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridX'),p.gridX); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridY'),p.gridY); gl.uniform2fv(gl.getUniformLocation(patchProg,'uMesh[0]'),p.mesh); draw(); current=next; display();
-  lastDisplayedFrame=p.frameId;stats.renders++; $('frame').textContent=p.frameId; putStats();
+  gl.uniform2f(gl.getUniformLocation(patchProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(patchProg,'uKeySize'),keyW,keyH); gl.uniformMatrix3fv(gl.getUniformLocation(patchProg,'uInvH'),false,inv); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridX'),p.gridX); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridY'),p.gridY); gl.uniform2fv(gl.getUniformLocation(patchProg,'uMesh[0]'),p.mesh); draw(); current=next; queuePresentation(p.frameId,p.timestamp);
+  lastRenderedFrame=p.frameId;stats.renders++; putStats();
 }
 
-function resetKey(frameId,width,height,kind,layerCount){ key={frameId,width,height,kind,layerCount,layers:new Map()}; }
+function resetKey(frameId,width,height,kind,layerCount,timestamp){ key={frameId,width,height,kind,layerCount,timestamp,layers:new Map()}; }
 function getLayer(index,total,count,jw,jh){
   let l=key.layers.get(index);
   if(!l){ l={total,count,jw,jh,chunks:new Array(count),gotCount:0}; key.layers.set(index,l); }
@@ -237,7 +278,7 @@ async function decodeRegion(bytes,width,height){
     ctx.drawImage(b,0,0);return ctx.getImageData(0,0,width,height).data;
   } finally { b.close(); }
 }
-async function acceptRegion(u,frame){
+async function acceptRegion(u,frame,timestamp){
   if(keyFrameId!==null && frame!==keyFrameId && !newer(frame,keyFrameId)) return;
   if(key && !newer(frame,key.frameId)) return;
   if(keyFrameId===frame && !restartAssembly) return;
@@ -251,7 +292,7 @@ async function acceptRegion(u,frame){
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
     keyFrameId=frame;
-    restartPresentation={frameId:frame,width:a.ow,height:a.oh};
+    restartPresentation={frameId:frame,width:a.ow,height:a.oh,timestamp};
   } else {
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texSubImage2D(gl.TEXTURE_2D,0,result.x,result.y,result.width,8,gl.RGBA,gl.UNSIGNED_BYTE,result.pixels);
@@ -259,8 +300,8 @@ async function acceptRegion(u,frame){
   if(a.receivedCount===a.received.length) presentRestartKey();
   else scheduleRestartPresentation();
 }
-async function showClassic(){ const l=key.layers.get(0); if(!complete(l)) return; const k=key,b=await bitmap(layerBytes(l)); uploadKey(b,k.width,k.height,k.frameId); b.close(); key=null; }
-async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(layerBytes(a)),bitmap(layerBytes(b))]); uploadStrips(ia,ib,k.width,k.height,k.frameId); ia.close(); ib.close(); key=null; }
+async function showClassic(){ const l=key.layers.get(0); if(!complete(l)) return; const k=key,b=await bitmap(layerBytes(l)); uploadKey(b,k.width,k.height,k.frameId,k.timestamp); b.close(); key=null; }
+async function showStrips(){ const a=key.layers.get(0),b=key.layers.get(1); if(!complete(a)||!complete(b)) return; const k=key,[ia,ib]=await Promise.all([bitmap(layerBytes(a)),bitmap(layerBytes(b))]); uploadStrips(ia,ib,k.width,k.height,k.frameId,k.timestamp); ia.close(); ib.close(); key=null; }
 
 function parsePatchV4(u,v,flags,frame){
   if((flags&~3)!==0) throw new Error('bad patch flags');
@@ -275,7 +316,7 @@ function parsePatchV4(u,v,flags,frame){
     if(gx<2||gy<2||gx>8||gy>8||pos+gx*gy*4!==u.length) throw new Error('bad mesh grid/size');
     for(let y=0;y<gy;y++) for(let x=0;x<gx;x++){ const q=(y*8+x)*2; mesh[q]=i16(v,pos)/128.0; mesh[q+1]=i16(v,pos+2)/128.0; pos+=4; }
   }else if(grid!==0||pos!==u.length) throw new Error('mesh-disabled patch has extra data');
-  return {frameId:frame,keyframeId:(frame-age)>>>0,width:ow,height:oh,gridX:gx,gridY:gy,affine:a,perspective:persp,mesh};
+  return {frameId:frame,keyframeId:(frame-age)>>>0,timestamp:captureMs(v),width:ow,height:oh,gridX:gx,gridY:gy,affine:a,perspective:persp,mesh};
 }
 
 async function processDatagram(d){
@@ -287,12 +328,14 @@ async function processDatagram(d){
     if(retiredStreams.has(sid)||type===2) return;
     if(streamId) retiredStreams.add(streamId);
     if(retiredStreams.size>16) retiredStreams.delete(retiredStreams.values().next().value);
-    cancelRestartPresentation();
-    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;lastDisplayedFrame=null;$('stream').textContent=sid;
+    cancelRestartPresentation();playout.reset();
+    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;lastRenderedFrame=null;lastPresentedFrame=null;$('stream').textContent=sid;
   }
+  const timestamp=captureMs(v);
+  playout.observe(frame,timestamp);
   stats.packets++;
 
-  if(type===4){ await acceptRegion(u,frame);return; }
+  if(type===4){ await acceptRegion(u,frame,timestamp);return; }
 
   if(type===1){
     if(keyFrameId!==null && !newer(frame,keyFrameId)) return;
@@ -305,7 +348,7 @@ async function processDatagram(d){
     if(lc===3) return; // MOSAIC is intentionally outside the browser path.
     presentRestartKey();restartAssembly=null;
     const kind=lc===1?'classic':'strips';
-    if(!key||key.frameId!==frame||key.kind!==kind) resetKey(frame,ow,oh,kind,lc);
+    if(!key||key.frameId!==frame||key.kind!==kind) resetKey(frame,ow,oh,kind,lc,timestamp);
     addChunk(getLayer(li,total,cc,jw,jh),ci,u.slice(34));
     if(lc===1) await showClassic(); else await showStrips();
     return;
@@ -346,6 +389,7 @@ reconnectLoop();
         }
         result += "};\n";
         result += kRestartBrowserSource;
+        result += kBrowserPlayoutSource;
         result += kJs;
         return result;
     }();

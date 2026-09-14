@@ -76,6 +76,9 @@ endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS flowx_restart_browser.js)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/flowx_restart_browser.js" FLOWX_RESTART_BROWSER_SOURCE)
 configure_file(flowx_restart_browser_source.h.in flowx_restart_browser_source.h @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS flowx_browser_playout.js)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/flowx_browser_playout.js" FLOWX_BROWSER_PLAYOUT_SOURCE)
+configure_file(flowx_browser_playout_source.h.in flowx_browser_playout_source.h @ONLY)
 add_library(flowx_receiver_runtime
     flowx_udp_receiver.cpp
     flowx_frame_store.cpp
@@ -107,6 +110,8 @@ if(BUILD_TESTING)
     add_test(NAME jpeg_restart COMMAND jpeg_restart_test)
     find_program(FLOWX_NODE_EXECUTABLE NAMES node nodejs)
     if(FLOWX_NODE_EXECUTABLE)
+        add_test(NAME flowx_browser_playout COMMAND "${FLOWX_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_browser_playout_test.js")
         add_test(NAME jpeg_restart_fixtures COMMAND jpeg_restart_test --export
             "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
         set_tests_properties(jpeg_restart_fixtures PROPERTIES FIXTURES_SETUP restart_fixtures)

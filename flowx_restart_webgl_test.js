@@ -18,7 +18,15 @@ const path=process.argv[2],fixture=JSON.parse(fs.readFileSync(path,'utf8'));
     assert.ok(original.includes('\nreconnectLoop();\n'));
     const script=original.replace('\nreconnectLoop();\n',`
 globalThis.flowxTest={processDatagram,stats,
-  state:()=>({frame:lastDisplayedFrame,key:keyFrameId,stream:streamId}),
+  state:()=>({frame:lastRenderedFrame,shown:lastPresentedFrame,key:keyFrameId,stream:streamId}),
+  snapshots:()=>playout.frames.map(frame=>{
+    const slot=frame.payload,pixels=new Uint8Array(slot.width*slot.height*4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,keyFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,slot.texture,0);
+    gl.readPixels(0,0,slot.width,slot.height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+    if(gl.getError()!==gl.NO_ERROR)throw new Error('snapshot read failed');
+    return {frame:frame.frameId,pixels:Array.from(pixels)};
+  }),
   pixels:(reference)=>{
     const w=reference?keyW:outW,h=reference?keyH:outH;
     gl.bindFramebuffer(gl.FRAMEBUFFER,reference?keyFbo:fbo[current]);
@@ -52,6 +60,8 @@ globalThis.flowxTest={processDatagram,stats,
       await send(patch(101));
       check(t.state().frame===101,'PATCH not rendered');
       const displayed=t.pixels(false),renders=t.stats.renders;
+      const queued=t.snapshots().find(s=>s.frame===101);
+      check(queued&&equal(queued.pixels,displayed),'queued GPU snapshot differs from rendered PATCH');
       for(const i of order.slice(kept)) await send(f.regions[i].wire);
       check(t.stats.renders===renders&&equal(displayed,t.pixels(false)),'late key rewound display');
       const key=t.pixels(true);
@@ -69,7 +79,7 @@ globalThis.flowxTest={processDatagram,stats,
       }
       check(equal(completed,t.pixels(false)),'pending key cleared the displayed image');
       await send(patch(111,110));
-      check(t.stats.renders===rerender+1&&t.state().frame===111,'PATCH did not present pending reference directly');
+      check(t.stats.renders===rerender+2&&t.state().frame===111,'key/PATCH capture slots were not both rendered');
       const fresh=Uint8Array.from(f.regions[0].wire),v=new DataView(fresh.buffer);
       v.setUint32(4,8,true);v.setUint32(8,1,true);await send(fresh);
       await send(f.regions[1].wire);
