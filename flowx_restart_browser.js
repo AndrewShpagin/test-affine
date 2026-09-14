@@ -35,9 +35,75 @@
     jpeg.set(header);jpeg.set(r.entropy,header.length);jpeg.set([255,217],jpeg.length-2);
     return jpeg;
   }
+  function fillMissingPixels(pixels,received,width,height) {
+    const columns=width/16,rows=height/8;
+    if(!Number.isInteger(columns)||!Number.isInteger(rows)||columns<1||rows<1||
+       pixels.length!==width*height*4||received.length!==columns*rows*2)
+      throw new Error('bad nearest-fill dimensions');
+    // A received half-block makes both interleaved columns usable through the
+    // existing counterpart copy. Neither that copy nor this fill changes the
+    // received mask. Pixel color, including genuine black, is not a validity flag.
+    const valid=new Uint8Array(columns*rows);
+    let known=0;
+    for(let b=0;b<valid.length;b++) {
+      valid[b]=Number(Boolean(received[2*b]||received[2*b+1]));known+=valid[b];
+    }
+    if(known===0||known===valid.length)return false;
+
+    // Vertical nearest-source coordinates are identical for all 16 columns
+    // in a paired block. This needs 1/16 of a full per-pixel source map.
+    const nearestY=new Int32Array(columns*height);
+    for(let bx=0;bx<columns;bx++) {
+      let above=-1;
+      for(let y=0;y<height;y++) {
+        if(valid[(y>>3)*columns+bx])above=y;
+        nearestY[y*columns+bx]=above;
+      }
+      let below=-1;
+      for(let y=height-1;y>=0;y--) {
+        if(valid[(y>>3)*columns+bx])below=y;
+        const i=y*columns+bx,prior=nearestY[i];
+        if(below>=0&&(prior<0||below-y<y-prior))nearestY[i]=below;
+      }
+    }
+    // For each row, minimize (x-sourceX)^2 + (y-sourceY)^2 using the
+    // lower envelope of parabolas. Exact Euclidean nearest pixel, O(W*H).
+    const sites=new Int32Array(width),edges=new Float64Array(width+1),cost=new Float64Array(width);
+    for(let y=0;y<height;y++) {
+      let last=-1;
+      for(let x=0;x<width;x++) {
+        const sy=nearestY[y*columns+(x>>4)];
+        if(sy<0)continue;
+        cost[x]=(y-sy)*(y-sy);
+        let boundary=-Infinity;
+        while(last>=0) {
+          const p=sites[last];
+          boundary=(cost[x]+x*x-cost[p]-p*p)/(2*(x-p));
+          if(boundary>edges[last])break;
+          last--;
+        }
+        last++;sites[last]=x;edges[last]=last===0?-Infinity:boundary;edges[last+1]=Infinity;
+      }
+      let site=0;
+      for(let x=0;x<width;x++) {
+        if(valid[(y>>3)*columns+(x>>4)])continue;
+        // Strict comparison resolves equal-distance ties toward the left.
+        while(site<last&&edges[site+1]<x)site++;
+        const sx=sites[site],sy=nearestY[y*columns+(sx>>4)];
+        const from=(sy*width+sx)*4,to=(y*width+x)*4;
+        for(let c=0;c<4;c++)pixels[to+c]=pixels[from+c];
+      }
+    }
+    return true;
+  }
   class RestartAssembler {
-    constructor(headers,decode) { this.headers=headers;this.decode=decode;this.frameId=null; }
+    constructor(headers,decode) { this.headers=headers;this.decode=decode;this.frameId=null;this.fillDirty=false; }
     matching(r) { return this.ow===r.ow && this.oh===r.oh && this.lw===r.lw && this.lh===r.lh && this.profile===r.profile; }
+    fillMissing() {
+      if(this.frameId===null||!this.fillDirty)return false;
+      const changed=fillMissingPixels(this.pixels,this.received,this.width,this.height);
+      this.fillDirty=false;return changed;
+    }
     async accept(u) {
       const r=parseRegion(u);
       const columns=r.lw/8,first=(r.y/8)*columns+(r.x>>4),count=r.width/8,parity=r.x&1;
@@ -78,6 +144,7 @@
         this.received[own]=1;this.receivedCount++;changed=true;
       }
       if(!changed) return null;
+      this.fillDirty=true;
       const x=r.x&~1,width=2*r.width,patch=new Uint8Array(width*8*4);
       for(let y=0;y<8;y++) {
         const begin=((r.y+y)*this.width+x)*4;
@@ -87,5 +154,5 @@
     }
   }
   root.FlowXRestartAssembler=RestartAssembler;
-  if(typeof module!=='undefined' && module.exports) module.exports={RestartAssembler,parseRegion,makeJpeg};
+  if(typeof module!=='undefined' && module.exports) module.exports={RestartAssembler,parseRegion,makeJpeg,fillMissingPixels};
 })(globalThis);

@@ -112,6 +112,8 @@ if(BUILD_TESTING)
     if(FLOWX_NODE_EXECUTABLE)
         add_test(NAME flowx_browser_playout COMMAND "${FLOWX_NODE_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/flowx_browser_playout_test.js")
+        add_test(NAME flowx_nearest_fill COMMAND "${FLOWX_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_nearest_fill_test.js")
         add_test(NAME jpeg_restart_fixtures COMMAND jpeg_restart_test --export
             "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
         set_tests_properties(jpeg_restart_fixtures PROPERTIES FIXTURES_SETUP restart_fixtures)

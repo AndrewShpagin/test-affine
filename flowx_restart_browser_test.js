@@ -45,8 +45,23 @@ function frame(packet,id) {
     assert.equal(events,1);
     assert.equal(a.receivedCount,a.received.reduce((sum,n)=>sum+n,0),'duplicate counted twice');
     assert.deepEqual(a.pixels,expected(order.slice(0,kept)),'35% loss reconstruction');
+    const beforeFill=a.pixels.slice(),received=a.received.slice(),receivedCount=a.receivedCount;
+    a.fillMissing();
+    assert.deepEqual(a.received,received,'concealment claimed lost blocks');
+    assert.equal(a.receivedCount,receivedCount);
+    assert.equal(a.fillMissing(),false,'clean key was filled again');
+    for(let y=0;y<a.height;y++)for(let x=0;x<a.width;x++) {
+      const block=(y>>3)*(a.lw/8)+(x>>4);
+      if(received[2*block]||received[2*block+1]) {
+        const p=(y*a.width+x)*4;
+        assert.deepEqual(a.pixels.subarray(p,p+4),beforeFill.subarray(p,p+4),'known/counterpart pixel changed');
+      }
+    }
     const displayed=a.pixels.slice(),frozen=displayed.slice();
-    for(const i of order.slice(kept)) assert.equal((await a.accept(packets[i])).newKeyframe,false);
+    for(const i of order.slice(kept)) {
+      assert.equal((await a.accept(packets[i])).newKeyframe,false);
+      a.fillMissing();
+    }
     assert.deepEqual(displayed,frozen,'late region changed display snapshot');
     assert.deepEqual(a.pixels,Uint8Array.from(f.complete),'late restore differs from native');
     assert.equal(a.receivedCount,a.received.length,'completion count missed late blocks');

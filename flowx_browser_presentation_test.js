@@ -5,6 +5,7 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const path=process.argv[2],fixture=JSON.parse(fs.readFileSync(path,'utf8'));
 const source=fs.readFileSync(path+'.js','utf8');
 const decoded=new Map(fixture.regions.map(r=>[Buffer.from(r.jpeg).toString('base64'),Uint8Array.from(r.rgba)]));
+const {fillMissingPixels}=require('./flowx_restart_browser.js');
 function region(i,frame=100,stream=7,scale=1) {
   const u=Uint8Array.from(fixture.regions[i].wire),v=new DataView(u.buffer);
   v.setUint32(8,frame,true);v.setUint32(4,stream,true);
@@ -21,12 +22,13 @@ function patch(frame,key,stream=7,scale=1) {
 }
 function harness(delayMs=0) {
   let now=0,nextTimer=0,resizes=0;
-  const timers=new Map(),nodes=new Map();
+  const timers=new Map(),nodes=new Map(),uploads=[];
   const gl=new Proxy({}, {get:(_,name)=>{
     if(/^[A-Z_0-9]+$/.test(name)) return name;
     if(name==='getShaderParameter'||name==='getProgramParameter') return ()=>true;
     if(name==='checkFramebufferStatus') return ()=>'FRAMEBUFFER_COMPLETE';
     if(name.startsWith('create')) return ()=>({});
+    if(name==='texSubImage2D')return (...a)=>uploads.push({width:a[4],height:a[5],pixels:Uint8Array.from(a[8])});
     return ()=>{};
   }});
   const canvas={getContext:()=>gl};
@@ -54,10 +56,13 @@ decodeRegion=globalThis.fixtureDecode;
 globalThis.testBrowser={processDatagram,stats,state:()=>({
   frame:lastRenderedFrame,shown:lastPresentedFrame,key:keyFrameId,pending:restartPresentation!==null,stream:streamId,
   queued:playout.frames.length,pool:presentationPool.length
-})};
+}),reference:()=>restartAssembly?({
+  pixels:restartAssembly.pixels.slice(),received:restartAssembly.received.slice(),
+  width:restartAssembly.width,height:restartAssembly.height
+}):null};
 `),context);
   return {
-    ...context.testBrowser,canvas,timers,resizes:()=>resizes,
+    ...context.testBrowser,canvas,timers,uploads,resizes:()=>resizes,
     advance(ms) {
       const end=now+ms;
       for(;;) {
@@ -78,10 +83,20 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   assert.equal(quiet.stats.renders,0);assert.equal(quiet.resizes(),0);
   quiet.advance(99);assert.equal(quiet.stats.renders,0);
   await quiet.processDatagram(region(1));
+  const waiting=quiet.reference(),filled=waiting.pixels.slice();
+  assert.equal(fillMissingPixels(filled,waiting.received,waiting.width,waiting.height),true);
   quiet.advance(99);assert.equal(quiet.stats.renders,0,'quiet timer was not extended');
+  assert.deepEqual(quiet.reference().pixels,waiting.pixels,'holes filled before wait ended');
   quiet.advance(1);assert.equal(quiet.stats.renders,1);assert.equal(quiet.state().frame,100);
+  assert.deepEqual(quiet.reference().pixels,filled,'timeout did not fill key holes');
+  assert.deepEqual(quiet.reference().received,waiting.received);
+  assert.deepEqual(quiet.uploads.at(-1).pixels,filled,'filled reference not uploaded to WebGL');
   await quiet.processDatagram(region(2));quiet.advance(1000);
   assert.equal(quiet.stats.renders,1,'late region replayed key');
+  const late=quiet.reference(),lateExpected=late.pixels.slice();
+  fillMissingPixels(lateExpected,late.received,late.width,late.height);
+  await quiet.processDatagram(patch(101,100));
+  assert.deepEqual(quiet.reference().pixels,lateExpected,'PATCH did not refresh late neighbour colors');
 
   const h=harness();
   for(let i=0;i<count;i++)await h.processDatagram(region(i));
@@ -103,11 +118,17 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   await h.processDatagram(patch(112,110,7,2));assert.equal(h.state().frame,112);
 
   // All following PATCH packets may be lost: a next key closes the prior burst.
-  for(let i=0;i<kept;i++)await h.processDatagram(region(i,120));
+  for(let i=0;i<Math.max(1,Math.floor(kept/2));i++)await h.processDatagram(region(i,120));
+  const oldKey=h.reference(),oldExpected=oldKey.pixels.slice();
+  assert.equal(fillMissingPixels(oldExpected,oldKey.received,oldKey.width,oldKey.height),true);
   const beforeBoundary=h.stats.renders;
+  // Use a genuinely incomplete old key, rather than a half that covers all
+  // paired blocks, to verify it survives the next assembly's creation.
   await h.processDatagram(region(0,130));
+  assert.deepEqual(h.uploads.at(-1).pixels,oldExpected,'new key discarded the old key before filling it');
   assert.equal(h.state().frame,120);assert.equal(h.stats.renders,beforeBoundary+1);
   assert.equal(h.state().key,130);assert.equal(h.state().pending,true);
+  assert.equal(h.reference().received.reduce((n,v)=>n+v,0),fixture.regions[0].rgba.length/256);
   // Duplicates do not keep a pending key hidden indefinitely.
   h.advance(99);await h.processDatagram(region(0,130));
   h.advance(1);assert.equal(h.state().frame,130);

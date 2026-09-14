@@ -228,9 +228,11 @@ Older v4 receivers reject type 4; deploy sender and receiver together.
 A PATCH contains all data needed for that frame relative to its keyframe. Losing one PATCH does not invalidate later PATCH packets.
 
 For type 4, every received region is usable immediately. Missing even/odd data
-is copied from the received counterpart; if both are missing, the hole remains
-black. Late data for the active key improves subsequent PATCH rendering without
-replaying an old frame. Old-key packets are discarded after a newer key starts.
+is copied from the received counterpart. Before presenting a partial key, the
+browser fills areas missing from both halves with the nearest usable pixel's
+color, retaining the actual receipt masks. Late data for the active key improves
+subsequent PATCH rendering without replaying an old frame. Old-key packets are
+discarded after a newer key starts.
 Legacy type-1 JPEG chunks still require a complete layer before decoding.
 
 For reproducible testing:

@@ -53,8 +53,12 @@ was actually received. Filling never marks a block as received.
 Later packets overwrite these temporary fills with their actual samples.
 Duplicates are ignored. Packets for older keyframes are ignored once a newer
 keyframe is active; comparisons support 32-bit frame-ID wraparound.
-If neither counterpart arrived, the gap remains black. There is no FEC or
-retransmission in this version, and burst losses can remove both counterparts.
+If neither counterpart arrived, the browser fills the gap when the keyframe
+wait ends: each missing pixel copies the color of the nearest usable pixel in
+the encoded keyframe raster. Existing even/odd counterpart copies take priority.
+Distance is Euclidean in pixel coordinates, not block-grid coordinates; ties
+prefer the left source, then the upper source. Genuine black source pixels are
+valid data. There is no FEC or retransmission in this version.
 
 Native and browser decoders update the active reference progressively.
 The browser keeps the current image visible while a new reference is assembled;
@@ -65,12 +69,19 @@ capture times. A newer key also closes the prior burst.
 If the stream pauses, 100 ms without a newly decoded region presents the partial
 key, so missing packets cannot make it wait forever. Duplicates do not extend
 this timeout. Canvas resizing is deferred until presentation as well.
+Nearest-neighbour filling runs before the released key is rendered, whether
+release is caused by the quiet timeout, a matching PATCH, or the next key.
+The received mask remains unchanged. Late real packets overwrite estimates;
+before a subsequent PATCH, remaining holes are refilled from the updated valid
+pixels. Already rendered/queued pictures stay unchanged.
 
 After presentation, late regions change only the reference used by subsequent
 PATCH frames; they do not replay an old image or clear the previous-frame border
 buffer. The native API still signals availability on the first decoded region:
 `Decoder::updateKeyframe()` fires once and returns an empty JPEG vector;
-`render()` uses the assembled reference directly.
+`render()` uses the assembled reference directly. Nearest-neighbour concealment
+described above is performed by the browser; the native codec's raw assembly
+continues to expose missing-both-half areas through black pixels.
 
 The HTTP raw transport forwards late active-key packets immediately. It retains
 the accepted key packets, so a new or slow browser receives a cumulative key
@@ -100,6 +111,9 @@ The browser presentation regression test also executes the shipped JavaScript
 with a virtual clock and a canvas/WebGL stub, checking that partial keys and
 resolution changes preserve the displayed frame until presentation. Playout
 tests simulate packet bursts, missing frames, paused tabs, and clock changes.
+Nearest-fill tests compare the result to a brute-force nearest-pixel search,
+including image edges, diagonal distances, ties, valid black data, unchanged
+receipt masks, and replacement by late packets.
 
 ## Browser frame timing
 

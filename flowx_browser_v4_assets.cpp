@@ -201,11 +201,18 @@ function cancelRestartPresentation(){
   if(restartPresentationTimer!==null) clearTimeout(restartPresentationTimer);
   restartPresentationTimer=null;restartPresentation=null;
 }
+function refreshRestartFill(){
+  const a=restartAssembly;
+  if(!a||a.frameId!==keyFrameId||!a.fillMissing())return;
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,keyTex);
+  gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,a.width,a.height,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
+}
 function presentRestartKey(){
   const pending=restartPresentation;
   if(!pending) return;
   cancelRestartPresentation();
   if(pending.frameId!==keyFrameId || (lastRenderedFrame!==null&&!newer(pending.frameId,lastRenderedFrame))) return;
+  refreshRestartFill();
   alloc(pending.width,pending.height);
   renderKey(pending.frameId,pending.timestamp);
 }
@@ -248,6 +255,9 @@ function renderPatch(p){
     // both become ready together, rather than holding through every lost key.
     presentRestartKey();
   }
+  // Late real regions can change the nearest source for other missing areas.
+  // Refill once before rendering, without modifying already queued snapshots.
+  refreshRestartFill();
   const next=1-current; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[next]); gl.viewport(0,0,outW,outH); gl.useProgram(patchProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(patchProg,'uPrev'),1);
@@ -282,12 +292,16 @@ async function acceptRegion(u,frame,timestamp){
   if(keyFrameId!==null && frame!==keyFrameId && !newer(frame,keyFrameId)) return;
   if(key && !newer(frame,key.frameId)) return;
   if(keyFrameId===frame && !restartAssembly) return;
-  if(!restartAssembly) restartAssembly=new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion);
-  const a=restartAssembly,result=await a.accept(u);
-  if(!result || a!==restartAssembly) return;
+  // Keep the prior assembly available until its burst is finalized. Reusing
+  // one object across frame IDs would discard its pixels before nearest fill.
+  const previous=restartAssembly,previousStream=streamId;
+  const a=previous&&previous.frameId===frame?previous:new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion);
+  const result=await a.accept(u);
+  if(!result||restartAssembly!==previous||streamId!==previousStream)return;
   if(result.newKeyframe){
     // Another key also closes a burst (e.g. keyframe-only streams with loss).
     presentRestartKey();
+    restartAssembly=a;
     key=null;keyW=a.width;keyH=a.height;
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);

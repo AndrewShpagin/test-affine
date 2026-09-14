@@ -18,6 +18,7 @@ const path=process.argv[2],fixture=JSON.parse(fs.readFileSync(path,'utf8'));
     assert.ok(original.includes('\nreconnectLoop();\n'));
     const script=original.replace('\nreconnectLoop();\n',`
 globalThis.flowxTest={processDatagram,stats,
+  reference:()=>Array.from(restartAssembly.pixels),
   state:()=>({frame:lastRenderedFrame,shown:lastPresentedFrame,key:keyFrameId,stream:streamId}),
   snapshots:()=>playout.frames.map(frame=>{
     const slot=frame.payload,pixels=new Uint8Array(slot.width*slot.height*4);
@@ -59,6 +60,7 @@ globalThis.flowxTest={processDatagram,stats,
       check(t.stats.keys===0,'incomplete first key was shown before burst ended');
       await send(patch(101));
       check(t.state().frame===101,'PATCH not rendered');
+      check(equal(t.reference(),t.pixels(true)),'nearest-filled reference was not uploaded intact');
       const displayed=t.pixels(false),renders=t.stats.renders;
       const queued=t.snapshots().find(s=>s.frame===101);
       check(queued&&equal(queued.pixels,displayed),'queued GPU snapshot differs from rendered PATCH');
