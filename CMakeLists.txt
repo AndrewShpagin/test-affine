@@ -114,6 +114,10 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/flowx_restart_browser_test.js"
             "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
         set_tests_properties(jpeg_restart_browser PROPERTIES FIXTURES_REQUIRED restart_fixtures)
+        add_test(NAME flowx_browser_presentation COMMAND "${FLOWX_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_browser_presentation_test.js"
+            "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
+        set_tests_properties(flowx_browser_presentation PROPERTIES FIXTURES_REQUIRED restart_fixtures)
     endif()
 endif()
 

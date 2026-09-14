@@ -43,14 +43,17 @@ function frame(packet,id) {
       assert.equal(await a.accept(packets[i]),null,'duplicate accepted');
     }
     assert.equal(events,1);
+    assert.equal(a.receivedCount,a.received.reduce((sum,n)=>sum+n,0),'duplicate counted twice');
     assert.deepEqual(a.pixels,expected(order.slice(0,kept)),'35% loss reconstruction');
     const displayed=a.pixels.slice(),frozen=displayed.slice();
     for(const i of order.slice(kept)) assert.equal((await a.accept(packets[i])).newKeyframe,false);
     assert.deepEqual(displayed,frozen,'late region changed display snapshot');
     assert.deepEqual(a.pixels,Uint8Array.from(f.complete),'late restore differs from native');
+    assert.equal(a.receivedCount,a.received.length,'completion count missed late blocks');
     assert.equal(await a.accept(frame(packets[0],99)),null);
     assert.equal((await a.accept(frame(packets[0],110))).newKeyframe,true);
     assert.deepEqual(a.pixels,expected([0]),'new frame retained old mask');
+    assert.equal(a.receivedCount,parseRegion(packets[0]).width/8,'new frame retained old count');
     assert.equal(await a.accept(packets[1]),null);
     const bad=frame(packets[1],111);bad[34]=99;
     await assert.rejects(a.accept(bad),/geometry/);assert.equal(a.frameId,110);

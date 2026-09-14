@@ -56,12 +56,20 @@ keyframe is active; comparisons support 32-bit frame-ID wraparound.
 If neither counterpart arrived, the gap remains black. There is no FEC or
 retransmission in this version, and burst losses can remove both counterparts.
 
-Native and browser decoders update the active reference progressively. The
-first region emits one keyframe presentation; subsequent regions change the
-reference used by future PATCH frames. They do not re-publish a stale image,
-change an already displayed PATCH, or clear the previous-frame border buffer.
-`Decoder::updateKeyframe()` therefore fires once for a restart keyframe and
-returns an empty JPEG vector; `render()` uses the assembled reference directly.
+Native and browser decoders update the active reference progressively.
+The browser keeps the current image visible while a new reference is assembled;
+receiving its first region does not display a mostly black keyframe. It presents
+a fully received key immediately, or presents the first matching PATCH directly
+when that packet closes the key burst. A newer key also closes the prior burst.
+If the stream pauses, 100 ms without a newly decoded region presents the partial
+key, so missing packets cannot make it wait forever. Duplicates do not extend
+this timeout. Canvas resizing is deferred until presentation as well.
+
+After presentation, late regions change only the reference used by subsequent
+PATCH frames; they do not replay an old image or clear the previous-frame border
+buffer. The native API still signals availability on the first decoded region:
+`Decoder::updateKeyframe()` fires once and returns an empty JPEG vector;
+`render()` uses the assembled reference directly.
 
 The HTTP raw transport forwards late active-key packets immediately. It retains
 the accepted key packets, so a new or slow browser receives a cumulative key
@@ -87,6 +95,9 @@ late recovery, stale frames, frame-ID wrap, malformed metadata, subsequent
 PATCH rendering, the configured encoder, and HTTP catchup. With Node installed,
 CTest also exports native JPEG/RGBA fixtures and checks browser assembly against
 the same bytes, including asynchronous decode reordering.
+The browser presentation regression test also executes the shipped JavaScript
+with a virtual clock and a canvas/WebGL stub, checking that partial keys and
+resolution changes preserve the displayed frame until presentation.
 
 For actual JPEG decoding and WebGL rendering, with Playwright and Chromium
 installed:

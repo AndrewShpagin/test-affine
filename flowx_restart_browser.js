@@ -59,6 +59,7 @@
         this.frameId=r.frameId;this.ow=r.ow;this.oh=r.oh;this.lw=r.lw;this.lh=r.lh;this.profile=r.profile;
         this.width=r.lw*2;this.height=r.lh;
         this.received=new Uint8Array(2*columns*(r.lh/8));
+        this.receivedCount=0;
         this.pixels=new Uint8Array(this.width*this.height*4);
         for(let p=3;p<this.pixels.length;p+=4) this.pixels[p]=255;
       } else if(!this.matching(r)) throw new Error('JPEG region metadata changed during decode');
@@ -74,7 +75,7 @@
             if(fill) this.pixels[((r.y+y)*this.width+(dx^1))*4+c]=rgba[src+c];
           }
         }
-        this.received[own]=1;changed=true;
+        this.received[own]=1;this.receivedCount++;changed=true;
       }
       if(!changed) return null;
       const x=r.x&~1,width=2*r.width,patch=new Uint8Array(width*8*4);

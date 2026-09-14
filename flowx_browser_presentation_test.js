@@ -1,0 +1,120 @@
+'use strict';
+// Run the shipped browser control flow with native JPEG fixtures, a recording
+// canvas/WebGL stub, and a virtual clock. No browser download is needed.
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const path=process.argv[2],fixture=JSON.parse(fs.readFileSync(path,'utf8'));
+const source=fs.readFileSync(path+'.js','utf8');
+const decoded=new Map(fixture.regions.map(r=>[Buffer.from(r.jpeg).toString('base64'),Uint8Array.from(r.rgba)]));
+function region(i,frame=100,stream=7,scale=1) {
+  const u=Uint8Array.from(fixture.regions[i].wire),v=new DataView(u.buffer);
+  v.setUint32(8,frame,true);v.setUint32(4,stream,true);
+  v.setUint16(20,fixture.width*scale,true);v.setUint16(22,fixture.height*scale,true);
+  return u;
+}
+function patch(frame,key,stream=7,scale=1) {
+  const u=new Uint8Array(51),v=new DataView(u.buffer);
+  v.setUint16(0,0x5846,true);u[2]=0x42;v.setUint32(4,stream,true);v.setUint32(8,frame,true);
+  v.setUint16(20,(frame-key)>>>0,true);v.setUint16(22,fixture.width*scale,true);v.setUint16(24,fixture.height*scale,true);
+  v.setFloat32(27,1,true);v.setFloat32(43,1,true);return u;
+}
+function harness() {
+  let now=0,nextTimer=0,resizes=0;
+  const timers=new Map(),nodes=new Map();
+  const gl=new Proxy({}, {get:(_,name)=>{
+    if(/^[A-Z_0-9]+$/.test(name)) return name;
+    if(name==='getShaderParameter'||name==='getProgramParameter') return ()=>true;
+    if(name==='checkFramebufferStatus') return ()=>'FRAMEBUFFER_COMPLETE';
+    if(name.startsWith('create')) return ()=>({});
+    return ()=>{};
+  }});
+  const canvas={getContext:()=>gl};
+  for(const name of ['width','height']) {
+    let value=0;Object.defineProperty(canvas,name,{get:()=>value,set:v=>{value=v;resizes++;}});
+  }
+  nodes.set('view',canvas);
+  const context=vm.createContext({
+    console,Uint8Array,DataView,Float32Array,
+    document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);}},
+    setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});return id;},
+    clearTimeout:id=>timers.delete(id),
+    fixtureDecode:async (jpeg,width,height)=>{
+      const rgba=decoded.get(Buffer.from(jpeg).toString('base64'));
+      assert.ok(rgba,'unexpected JPEG bytes');assert.equal(rgba.length,width*height*4);return rgba;
+    }
+  });
+  const hook='\nreconnectLoop();\n';
+  assert.ok(source.includes(hook));
+  vm.runInContext(source.replace(hook,`
+decodeRegion=globalThis.fixtureDecode;
+globalThis.testBrowser={processDatagram,stats,state:()=>({
+  frame:lastDisplayedFrame,key:keyFrameId,pending:restartPresentation!==null,stream:streamId
+})};
+`),context);
+  return {
+    ...context.testBrowser,canvas,timers,resizes:()=>resizes,
+    advance(ms) {
+      const end=now+ms;
+      for(;;) {
+        const due=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];
+        if(!due)break;now=due[1].at;timers.delete(due[0]);due[1].fn();
+      }
+      now=end;
+    }
+  };
+}
+(async()=>{
+  const count=fixture.regions.length,kept=Math.floor(count*.65);
+  // Startup and inactivity: one valid region must not immediately flash black.
+  const quiet=harness();
+  await quiet.processDatagram(patch(101,100));
+  assert.equal(quiet.stats.renders,0);assert.equal(quiet.timers.size,0);
+  await quiet.processDatagram(region(0));
+  assert.equal(quiet.stats.renders,0);assert.equal(quiet.resizes(),0);
+  quiet.advance(99);assert.equal(quiet.stats.renders,0);
+  await quiet.processDatagram(region(1));
+  quiet.advance(99);assert.equal(quiet.stats.renders,0,'quiet timer was not extended');
+  quiet.advance(1);assert.equal(quiet.stats.renders,1);assert.equal(quiet.state().frame,100);
+  await quiet.processDatagram(region(2));quiet.advance(1000);
+  assert.equal(quiet.stats.renders,1,'late region replayed key');
+
+  const h=harness();
+  for(let i=0;i<count;i++)await h.processDatagram(region(i));
+  assert.equal(h.stats.renders,1,'complete key not shown immediately');assert.equal(h.timers.size,0);
+  await h.processDatagram(patch(101,100));
+  const before=h.stats.renders,oldResizes=h.resizes();
+  // A resolution change must also keep the old canvas until presentation.
+  for(let i=0;i<kept;i++)await h.processDatagram(region(i,110,7,2));
+  assert.equal(h.state().frame,101);assert.equal(h.stats.renders,before,'partial key flashed');
+  assert.equal(h.resizes(),oldResizes,'pending key cleared canvas on resize');
+  await h.processDatagram(patch(111,110,7,2));
+  assert.equal(h.stats.renders,before+1,'intermediate key rendered before PATCH');
+  assert.equal(h.stats.keys,2);assert.equal(h.canvas.width,fixture.width*2);
+  for(let i=kept;i<count;i++)await h.processDatagram(region(i,110,7,2));
+  h.advance(1000);assert.equal(h.stats.renders,before+1,'stale timeout/late data rewound display');
+  assert.equal(h.state().frame,111);
+  await h.processDatagram(patch(112,110,7,2));assert.equal(h.state().frame,112);
+
+  // All following PATCH packets may be lost: a next key closes the prior burst.
+  for(let i=0;i<kept;i++)await h.processDatagram(region(i,120));
+  const beforeBoundary=h.stats.renders;
+  await h.processDatagram(region(0,130));
+  assert.equal(h.state().frame,120);assert.equal(h.stats.renders,beforeBoundary+1);
+  assert.equal(h.state().key,130);assert.equal(h.state().pending,true);
+  // Duplicates do not keep a pending key hidden indefinitely.
+  h.advance(99);await h.processDatagram(region(0,130));
+  h.advance(1);assert.equal(h.state().frame,130);
+  // Stream resets cancel old pending timers and preserve the displayed canvas.
+  await h.processDatagram(region(0,140));h.advance(50);
+  const resetRenders=h.stats.renders,resetResizes=h.resizes();
+  await h.processDatagram(region(0,1,8));
+  h.advance(50);assert.equal(h.stats.renders,resetRenders,'old stream timeout fired');
+  assert.equal(h.resizes(),resetResizes);
+  await h.processDatagram(region(1,140));assert.equal(h.state().stream,8);
+  h.advance(50);assert.equal(h.state().frame,1);assert.equal(h.stats.renders,resetRenders+1);
+  // Wrapped frame IDs still close the correct pending key.
+  const wrap=harness();
+  await wrap.processDatagram(region(0,0xfffffffe));
+  await wrap.processDatagram(patch(1,0xfffffffe));
+  wrap.advance(1000);assert.equal(wrap.state().frame,1);assert.equal(wrap.stats.renders,1);
+  console.log('PASS: no first-region flash, completion/PATCH/burst/quiet presentation, 35% loss, deferred resize, duplicates, late data, stream reset, frame wrap');
+})().catch(e=>{console.error(e);process.exitCode=1;});
