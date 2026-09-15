@@ -30,7 +30,8 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}header{p
   <span>renders <code id="renders">0</code></span>
   <span>shown <code id="shown">0</code></span>
   <span>playout drops <code id="playoutDrops">0</code></span>
-  <label>Playback delay <input id="playoutDelay" type="number" min="0" max="200" step="10" value="60" style="width:4em"> ms</label>
+  <label title="Additional buffering of all frames on the capture timeline. Zero disables buffering.">Playback buffer <input id="playoutDelay" type="number" min="0" max="200" step="10" value="60" style="width:4em"> ms</label>
+  <label title="Maximum assembly wait from the first accepted keyframe packet. Completion or a matching PATCH releases earlier. Zero disables waiting.">Keyframe wait <input id="keyframeWait" type="number" min="0" max="1000" step="10" value="100" style="width:4em"> ms</label>
   <label title="Disable to show missing data in black. Changing this reloads the view."><input id="fillGaps" type="checkbox" checked> Fill missing pixels</label>
   <label title="Smooth the interior of filled gaps. Changing this reloads the view."><input id="smoothFills" type="checkbox" checked> Smooth filled pixels</label>
   <span>skipped <code id="skipped">0</code></span>
@@ -190,15 +191,24 @@ let outW=0,outH=0,keyW=0,keyH=0,current=0,keyFrameId=null,streamId=0,key=null;
 let restartAssembly=null,lastRenderedFrame=null,lastPresentedFrame=null;
 let restartTextureDirty=false;
 let restartPresentation=null,restartPresentationTimer=null;
-const restartQuietMs=100;
+function playbackMs(value,fallback,maximum){
+  if(value===null||value===undefined||String(value).trim()==='')return fallback;
+  const ms=Number(value);
+  return Number.isFinite(ms)?Math.round(Math.max(0,Math.min(maximum,ms))):fallback;
+}
+const playbackDefaults=globalThis.FLOWX_PLAYBACK_DEFAULTS||{};
+const defaultWaitMs=playbackMs(playbackDefaults.keyframe_wait_ms,100,1000);
+const defaultPlayoutMs=playbackMs(playbackDefaults.playout_ms,60,200);
+let restartWaitMs=playbackMs(query.get('keyframe_wait_ms'),defaultWaitMs,1000);
 const newer=(a,b)=>((a-b)|0)>0;
 const retiredStreams=new Set();
 const presentationPool=[];
 const delayControl=$('playoutDelay');
+const waitControl=$('keyframeWait');
 const queryDelay=query.get('playout_ms');
 const playout=new FlowXFramePlayout({
   now:()=>performance.now(),requestFrame:fn=>requestAnimationFrame(fn),cancelFrame:id=>cancelAnimationFrame(id),
-  delayMs:queryDelay===null?60:Number(queryDelay),
+  delayMs:playbackMs(queryDelay,defaultPlayoutMs,200),
   present:frame=>{
     display(frame.payload);
     lastPresentedFrame=frame.frameId;stats.shown++;$('frame').textContent=frame.frameId;putStats();
@@ -207,9 +217,23 @@ const playout=new FlowXFramePlayout({
   onDrop:()=>{stats.playoutDrops++;}
 });
 delayControl.value=String(playout.delayMs);
+waitControl.value=String(restartWaitMs);
+function savePlaybackOptions(){
+  const params=new URLSearchParams(location.search);
+  params.set('playout_ms',String(playout.delayMs));
+  params.set('keyframe_wait_ms',String(restartWaitMs));
+  history.replaceState(null,'','?'+params.toString());
+}
 delayControl.addEventListener('change',()=>{
-  playout.setDelay(delayControl.value===''?60:Number(delayControl.value));
+  playout.setDelay(playbackMs(delayControl.value,defaultPlayoutMs,200));
   delayControl.value=String(playout.delayMs);
+  savePlaybackOptions();
+});
+waitControl.addEventListener('change',()=>{
+  restartWaitMs=playbackMs(waitControl.value,defaultWaitMs,1000);
+  waitControl.value=String(restartWaitMs);
+  savePlaybackOptions();
+  scheduleRestartPresentation();
 });
 function reloadFillOptions(){
   // A fresh view avoids mixing already filled reference pixels and queued frames
@@ -218,6 +242,7 @@ function reloadFillOptions(){
   params.set('fill_gaps',fillControl.checked?'1':'0');
   params.set('smooth_fill',smoothControl.checked?'1':'0');
   params.set('playout_ms',String(playout.delayMs));
+  params.set('keyframe_wait_ms',String(restartWaitMs));
   location.search=params.toString();
 }
 fillControl.addEventListener('change',reloadFillOptions);
@@ -302,9 +327,11 @@ function presentRestartKey(){
 function scheduleRestartPresentation(){
   if(!restartPresentation) return;
   if(restartPresentationTimer!==null) clearTimeout(restartPresentationTimer);
-  // No end marker is required. A quiet partial key must still become visible
-  // if the stream pauses or every following PATCH is lost.
-  restartPresentationTimer=setTimeout(presentRestartKey,restartQuietMs);
+  // A fixed deadline from the first accepted packet bounds assembly latency.
+  // Later packets and UI edits never restart the age of this keyframe.
+  const remaining=restartWaitMs-(performance.now()-restartPresentation.firstPacketAt);
+  if(remaining<=0){presentRestartKey();return;}
+  restartPresentationTimer=setTimeout(presentRestartKey,remaining);
 }
 function uploadKey(source,ow,oh,frameId,timestamp){ alloc(ow,oh); keyW=source.width; keyH=source.height; uploadBitmap(keyTex,source); renderKeyTex=keyTex;renderKey(frameId,timestamp); }
 function uploadStrips(even,odd,ow,oh,frameId,timestamp){
@@ -373,6 +400,7 @@ async function decodeRegion(bytes,width,height){
   } finally { b.close(); }
 }
 async function acceptRegion(u,frame,timestamp){
+  const receivedAt=performance.now();
   if(keyFrameId!==null && frame!==keyFrameId && !newer(frame,keyFrameId)) return;
   if(key && !newer(frame,key.frameId)) return;
   if(keyFrameId===frame && !restartAssembly) return;
@@ -392,7 +420,7 @@ async function acceptRegion(u,frame,timestamp){
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
     keyFrameId=frame;
-    restartPresentation={frameId:frame,width:a.ow,height:a.oh,timestamp};
+    restartPresentation={frameId:frame,width:a.ow,height:a.oh,timestamp,firstPacketAt:receivedAt};
   } else if(result.fullUpload){
     restartTextureDirty=true;
   } else {

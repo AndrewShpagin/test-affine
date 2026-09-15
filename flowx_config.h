@@ -74,9 +74,15 @@ struct HttpConfig {
     std::string status_endpoint = "/status.json";
 };
 
+struct PlaybackConfig {
+    int keyframe_wait_ms = 100; // Max assembly wait from the first accepted key packet.
+    int playout_ms = 60;        // Browser capture-time buffer; MJPEG has no playout queue.
+};
+
 struct ReceiverConfig {
     UdpListenConfig udp;
     HttpConfig http;
+    PlaybackConfig playback;
     struct DecodeOptions {
         bool fill_gaps = true;
         bool smooth_fill = true;

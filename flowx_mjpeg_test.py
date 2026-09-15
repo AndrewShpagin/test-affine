@@ -28,7 +28,7 @@ def wait_for(fn, timeout=5):
         time.sleep(.01)
 
 
-def run(receiver, fixture, mode):
+def run(receiver, fixture, mode, playback=None):
     udp_port, http_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     config = {'udp': {'bind': '127.0.0.1', 'port': udp_port},
               'http': {'bind': '127.0.0.1', 'port': http_port, 'jpeg_quality': 85},
@@ -36,6 +36,8 @@ def run(receiver, fixture, mode):
     # Omitted options must enable smoothing in existing receiver configs.
     if mode == 'smooth':
         del config['decoder']
+    if playback is not None:
+        config['playback'] = playback
     with tempfile.TemporaryDirectory() as temp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         path = Path(temp) / 'receiver.json'
         path.write_text(json.dumps(config))
@@ -102,17 +104,51 @@ def run(receiver, fixture, mode):
                     conn.close()
             try:
                 wait_for(started)
+                expected_playback = playback or {'keyframe_wait_ms': 100, 'playout_ms': 60}
+                assert status()['playback'] == expected_playback
+                code, script = request('/flowx.js')
+                assert code == 200
+                defaults = script.split(b'\n', 1)[0]
+                assert defaults.startswith(b'globalThis.FLOWX_PLAYBACK_DEFAULTS=')
+                assert json.loads(defaults.split(b'=', 1)[1].rstrip(b';')) == expected_playback
                 assert request('/frame.jpg')[0] == 503
+                if playback is not None:
+                    delay = playback['keyframe_wait_ms'] / 1000
+                    first_at = time.monotonic()
+                    region(0); drained()
+                    if delay == 0:
+                        assert frame_is(100), 'zero wait failed to publish first packet'
+                    else:
+                        assert status()['frame'] is None
+                        time.sleep(delay*.55)
+                        region(1); drained()
+                        time.sleep(delay*.2)
+                        assert status()['frame'] is None, 'configured assembly wait ended too early'
+                        # The later real packet must not push the deadline back.
+                        wait_for(lambda: frame_is(100), max(.01, first_at+delay+.08-time.monotonic()))
+                    assert status()['decode']['frames'] == 1
+                    region(2); drained()
+                    assert status()['decode']['frames'] == 1, 'late packet replayed key'
+                    patch(101, 100); wait_for(lambda: frame_is(101))
+                    region(0, 110); patch(111, 110)
+                    wait_for(lambda: frame_is(111), .2)
+                    for i in range(len(fixture['regions'])):
+                        region(i, 120)
+                    drained()
+                    assert frame_is(120), 'complete key did not bypass configured delay'
+                    print(f"PASS: receiver playback {playback}, first-packet deadline, zero wait, "
+                          'HTTP browser defaults, PATCH/completion bypass')
+                    return
                 samples = [s for s in fixture['concealment'] if s['mode'] == mode]
                 region(0); drained()
                 assert status()['frame'] is None, 'first region flashed a partial key'
-                # Keep delivering duplicates across the deadline; they must not
-                # keep the reference hidden or create extra presentations.
+                # Keep delivering duplicates across the first-packet deadline;
+                # they cannot keep the reference hidden or create extra presentations.
                 end = time.monotonic() + .18
                 while time.monotonic() < end:
                     region(0); time.sleep(.015)
                 state = frame_is(100)
-                assert state, 'duplicate traffic extended the quiet timeout'
+                assert state, 'duplicate traffic extended the assembly deadline'
                 assert state['decode']['frames'] == 1
                 code, first = request('/frame.jpg')
                 assert code == 200 and first == bytes(samples[0]['jpeg']), 'HTTP concealment mismatch'
@@ -156,7 +192,7 @@ def run(receiver, fixture, mode):
                 region(0, 0xfffffffe, 9); patch(1, 0xfffffffe, 9)
                 wait_for(lambda: frame_is(1, 9))
                 print(f"PASS: MJPEG {mode}, shuffle={bool(fixture['tile_map'])}, UDP/HTTP bytes, "
-                      'quiet/PATCH/next-key/completion, duplicates, late recovery, streams, wrap')
+                      'deadline/PATCH/next-key/completion, duplicates, late recovery, streams, wrap')
             except Exception:
                 log.flush(); log.seek(0)
                 print(log.read(), file=sys.stderr)
@@ -171,5 +207,17 @@ def run(receiver, fixture, mode):
 
 if __name__ == '__main__':
     fixture = json.loads(Path(sys.argv[2]).read_text())
+    receiver = str(Path(sys.argv[1]).resolve())
     for mode in ('raw', 'nearest', 'smooth'):
-        run(str(Path(sys.argv[1]).resolve()), fixture, mode)
+        run(receiver, fixture, mode)
+    for playback in ({'keyframe_wait_ms': 0, 'playout_ms': 0}, {'keyframe_wait_ms': 300, 'playout_ms': 120}):
+        run(receiver, fixture, 'smooth', playback)
+    # Reject invalid timing settings before opening network listeners.
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / 'invalid.json'
+        for playback in (None, {'keyframe_wait_ms': -1}, {'keyframe_wait_ms': 1001},
+                         {'keyframe_wait_ms': 1.5}, {'keyframe_wait_ms': '100'},
+                         {'keyframe_wait_ms': True}, {'playout_ms': 201}, {'playout_ms': -1}):
+            path.write_text(json.dumps({'udp': {}, 'http': {}, 'playback': playback}))
+            result = subprocess.run([receiver, str(path)], capture_output=True, text=True, timeout=5)
+            assert result.returncode != 0 and 'playback' in result.stderr, 'invalid playback accepted'

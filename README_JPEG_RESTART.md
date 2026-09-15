@@ -103,11 +103,12 @@ receiving its first region does not display a mostly black keyframe. It presents
 a fully received key for playback immediately. The first matching PATCH closes
 the key burst and queues both the partial key and PATCH at their respective
 capture times. A newer key also closes the prior burst.
-If the stream pauses, 100 ms without a newly decoded region presents the partial
-key, so missing packets cannot make it wait forever. Duplicates do not extend
-this timeout. Canvas resizing is deferred until presentation as well.
+The configured assembly deadline presents a partial key even if the stream pauses:
+by default 100 ms from the first accepted packet, not from the last region.
+Neither new regions nor duplicates extend this timeout. Canvas resizing is
+deferred until presentation as well.
 Nearest-neighbour filling runs before the released key is rendered, whether
-release is caused by the quiet timeout, a matching PATCH, or the next key.
+release is caused by the assembly timeout, a matching PATCH, or the next key.
 The received mask remains unchanged. Late real packets overwrite estimates;
 before a subsequent PATCH, remaining holes are refilled from the updated valid
 pixels. Already rendered/queued pictures stay unchanged.
@@ -217,8 +218,13 @@ renders cannot overwrite an image that is still waiting to be shown. The queue
 uses at most five reusable snapshot textures including a staging texture;
 each RGBA texture consumes approximately `width * height * 4` bytes.
 
-**Playback delay** in the browser header defaults to **60 ms**, adjustable from
-0 to 200 ms. It can also be initialized using `/flowx.html?playout_ms=80`.
+**Playback buffer** in the browser header defaults to **60 ms**, adjustable from
+0 to 200 ms. It can also be initialized using `/flowx.html?playout_ms=80` or the
+receiver's `playback.playout_ms` setting. **Keyframe wait** separately controls
+assembly from the first accepted packet (default 100 ms, range 0–1000), configured
+with `playback.keyframe_wait_ms` or the browser's `keyframe_wait_ms` URL parameter.
+Zero disables the respective wait. Both browser controls apply live and save
+their overrides in the URL. See `README_FLOWX_RECEIVER.md` for timing semantics.
 This is additional buffering, not a measurement of total end-to-end latency.
 If a high frame rate needs more than four queued images, queue pressure shortens
 the effective delay and drops older images so playback cannot stall waiting for

@@ -25,7 +25,8 @@ public:
                const FrameStore& frames,
                const RawFrameStore& raw_frames,
                const ReceiverStatusStore& status,
-               std::string& error);
+               std::string& error,
+               const PlaybackConfig& playback = {});
     void stop();
     bool isRunning() const;
 
