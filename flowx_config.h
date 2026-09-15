@@ -33,6 +33,7 @@ struct CodecConfig {
     KeyframeCodec keyframe_codec = KeyframeCodec::Jpeg;
     bool grayscale = false;
     bool strips = true;
+    bool jpeg_tile_shuffle = false;
     bool homography = true;
     bool mesh = true;
     int mesh_grid_x = 6;

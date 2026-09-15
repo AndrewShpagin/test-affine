@@ -1075,7 +1075,7 @@ bool Encoder::emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gra
             cv::Mat small;
             if (layers[parity].size() == size) small = layers[parity];
             else cv::resize(layers[parity], small, size, 0, 0, cv::INTER_AREA);
-            if (!encodeJpegRestartLayer(small, parity, regions[parity])) return false;
+            if (!encodeJpegRestartLayer(small, parity, regions[parity], nullptr, jpeg_tile_shuffle_)) return false;
             for (const auto& r : regions[parity]) wire_bytes += kRestartWireHeaderBytes + r.entropy.size();
         }
         if (pass + 1 == kJpegMaxEncodePasses ||
@@ -1105,7 +1105,7 @@ bool Encoder::emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gra
                                frame_id, frame_id, image.size());
             appendU16(packet, r.layer_width); appendU16(packet, r.layer_height);
             appendU16(packet, r.x); appendU16(packet, r.y); appendU16(packet, r.width);
-            appendU8(packet, r.profile); appendU8(packet, 0);
+            appendU8(packet, r.profile); appendU8(packet, r.layout);
             packet.insert(packet.end(), r.entropy.begin(), r.entropy.end());
             if (packet.size() > kMaxUdpPacketBytes) return false;
             last_timing_.jpeg_layer_bytes[parity] += r.entropy.size();

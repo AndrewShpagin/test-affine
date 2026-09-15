@@ -18,8 +18,8 @@ void Decoder::acceptRestartRegion(const std::vector<u_char>& data,
     JpegRestartRegion r;
     r.layer_width = u16(data, 20); r.layer_height = u16(data, 22);
     r.x = u16(data, 24); r.y = u16(data, 26); r.width = u16(data, 28);
-    r.profile = data[30];
-    if (data[31] || !validRestartGeometry(r, original)) return;
+    r.profile = data[30]; r.layout = data[31];
+    if (!validRestartGeometry(r, original)) return;
     r.entropy.assign(data.begin() + kRestartHeaderBytes, data.end());
     if (!validRestartEntropy(r.entropy)) return;
     if (have_keyframe_ && frame_id != keyframe_id_ && !newer(frame_id, keyframe_id_)) return;
@@ -30,15 +30,16 @@ void Decoder::acceptRestartRegion(const std::vector<u_char>& data,
     auto& a = pending_restart_;
     const bool new_keyframe = !a.active || a.frame_id != frame_id;
     if (a.active && new_keyframe && !newer(frame_id, a.frame_id)) return;
-    if (!new_keyframe && (a.original_size != original || a.profile != r.profile ||
+    if (!new_keyframe && (a.original_size != original || a.profile != r.profile || a.layout != r.layout ||
         a.layer_size != cv::Size(r.layer_width, r.layer_height))) return;
     const unsigned columns = r.layer_width / 8;
     const unsigned first = (r.y / 8) * columns + r.x / 16;
     const unsigned count = r.width / 8;
     const unsigned parity = r.x & 1;
+    const auto spatial = [&](unsigned index) { return a.tile_map.empty() ? index : a.tile_map[index]; };
     if (!new_keyframe) {
         bool missing = false;
-        for (unsigned i = 0; i < count; ++i) missing |= !a.received_blocks[2 * (first + i) + parity];
+        for (unsigned i = 0; i < count; ++i) missing |= !a.received_blocks[2 * spatial(first + i) + parity];
         if (!missing) return;
     }
     cv::Mat decoded;
@@ -51,6 +52,8 @@ void Decoder::acceptRestartRegion(const std::vector<u_char>& data,
         a = RestartAssembly{};
         a.active = true; a.frame_id = frame_id; a.original_size = original;
         a.layer_size = cv::Size(r.layer_width, r.layer_height); a.profile = r.profile;
+        a.layout = r.layout;
+        if (a.layout == kRestartTileShuffle) a.tile_map = restartTilePermutation(r.layer_width, r.layer_height);
         a.assembled = cv::Mat(r.layer_height, 2 * r.layer_width, decoded.type(), cv::Scalar::all(0));
         a.received_blocks.assign(2u * columns * (r.layer_height / 8), 0);
         pending_keyframe_ = KeyframeAssembly{};
@@ -63,15 +66,16 @@ void Decoder::acceptRestartRegion(const std::vector<u_char>& data,
     }
     const std::size_t pixel_bytes = decoded.elemSize();
     for (unsigned block = 0; block < count; ++block) {
-        const unsigned own = 2 * (first + block) + parity;
+        const unsigned target_block = spatial(first + block);
+        const unsigned own = 2 * target_block + parity;
         if (a.received_blocks[own]) continue;
         const bool fill_other = !a.received_blocks[own ^ 1];
         for (unsigned y = 0; y < 8; ++y) {
             for (unsigned x = 0; x < 8; ++x) {
                 const unsigned sample = block * 8 + x;
-                const unsigned target = r.x + 2 * sample;
+                const unsigned target = (target_block % columns) * 16 + 2 * x + parity;
                 const auto* source = decoded.ptr(y) + sample * pixel_bytes;
-                auto* row = a.assembled.ptr(r.y + y);
+                auto* row = a.assembled.ptr((target_block / columns) * 8 + y);
                 std::memcpy(row + target * pixel_bytes, source, pixel_bytes);
                 if (fill_other) std::memcpy(row + (target ^ 1u) * pixel_bytes, source, pixel_bytes);
             }

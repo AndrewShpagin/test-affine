@@ -25,7 +25,7 @@ Bytes native(const JpegRestartRegion& r, std::uint32_t id = 100) {
     put(b, 8, id, 4); put(b, 12, id, 4);
     put(b, 16, 2 * r.layer_width, 2); put(b, 18, r.layer_height, 2);
     put(b, 20, r.layer_width, 2); put(b, 22, r.layer_height, 2);
-    put(b, 24, r.x, 2); put(b, 26, r.y, 2); put(b, 28, r.width, 2); b[30] = r.profile;
+    put(b, 24, r.x, 2); put(b, 26, r.y, 2); put(b, 28, r.width, 2); b[30] = r.profile; b[31] = r.layout;
     b.insert(b.end(), r.entropy.begin(), r.entropy.end());
     return b;
 }
@@ -45,16 +45,20 @@ struct Fixture {
     std::vector<cv::Mat> decoded;
     cv::Size size;
     int type;
+    std::vector<std::uint32_t> tile_map;
 };
-Fixture fixture(unsigned channels, unsigned half_width = 256) {
+Fixture fixture(unsigned channels, unsigned half_width = 256, bool shuffle = false) {
     Fixture f; f.size = cv::Size(2 * half_width, 64); f.type = channels == 1 ? CV_8UC1 : CV_8UC3;
+    if (shuffle) f.tile_map = affinecodec::restartTilePermutation(half_width, f.size.height);
     cv::RNG random(34567);
     for (unsigned parity = 0; parity < 2; ++parity) {
         cv::Mat layer(f.size.height, half_width, f.type);
         random.fill(layer, cv::RNG::UNIFORM, 20, 230);
         std::vector<JpegRestartRegion> regions;
         unsigned interval = 0;
-        require(affinecodec::encodeJpegRestartLayer(layer, parity, regions, &interval), "encode layer");
+        const auto original = layer.clone();
+        require(affinecodec::encodeJpegRestartLayer(layer, parity, regions, &interval, shuffle), "encode layer");
+        require(cv::norm(layer, original, cv::NORM_INF) == 0, "shuffle mutated source/motion reference");
         require(interval && (half_width / 8) % interval == 0, "restart crosses an MCU row");
         require(regions.size() > 4, "fixture needs many regions");
         for (auto& r : regions) {
@@ -81,7 +85,11 @@ cv::Mat expected(const Fixture& f, const std::vector<unsigned>& selected) {
     for (unsigned i : selected) {
         const auto& r = f.regions[i];
         for (unsigned y = 0; y < 8; ++y) for (unsigned x = 0; x < r.width; ++x) {
-            const int dest_x = r.x + 2 * x, dest_y = r.y + y;
+            const unsigned columns = r.layer_width / 8;
+            const unsigned encoded = (r.y / 8) * columns + r.x / 16 + x / 8;
+            const unsigned target = f.tile_map.empty() ? encoded : f.tile_map[encoded];
+            const int dest_x = (target % columns) * 16 + 2 * (x % 8) + (r.x & 1);
+            const int dest_y = (target / columns) * 8 + y;
             f.decoded[i](cv::Rect(x, y, 1, 1)).copyTo(actual(cv::Rect(dest_x, dest_y, 1, 1)));
             mask.at<unsigned char>(dest_y, dest_x) = 1;
         }
@@ -151,8 +159,11 @@ void lossTest(const Fixture& f) {
     require(!flowx::unwrapCodecPacket(bad_wire, parsed), "oversize packet accepted");
     bad_wire = f.wires.front(); bad_wire[28] = 2;
     require(!flowx::unwrapCodecPacket(bad_wire, parsed), "unaligned coordinate accepted");
-    bad_wire = f.wires.front(); bad_wire[35] = 1;
-    require(!flowx::unwrapCodecPacket(bad_wire, parsed), "reserved field accepted");
+    bad_wire = f.wires.front(); bad_wire[35] = 2;
+    require(!flowx::unwrapCodecPacket(bad_wire, parsed), "unknown layout accepted");
+    auto mixed = fresh; mixed[31] ^= 1;
+    only.pushData(mixed);
+    same(render(only), before, "mixed layout changed same-key reference");
     bad_wire = f.wires.front(); bad_wire[36] = 255; bad_wire[37] = 217;
     require(!flowx::unwrapCodecPacket(bad_wire, parsed), "in-band JPEG marker accepted");
     affinecodec::Decoder wrapped;
@@ -196,24 +207,61 @@ void rawStoreTest(const Fixture& f) {
     require(store.latestKeyframe()->stream_id == 8 && store.latestKeyframe()->frame_id == 1, "stream reset");
     store.close();
 }
-void encoderTest() {
+void encoderTest(bool shuffle) {
     cv::Mat image(256, 512, CV_8UC3); cv::RNG(876).fill(image, cv::RNG::UNIFORM, 0, 256);
     affinecodec::Encoder encoder; encoder.setStripsKeyframes(true);
+    encoder.setJpegTileShuffle(shuffle);
     encoder.pushImage(image, 18000, 10);
     Bytes b; unsigned count = 0; affinecodec::Decoder decoder;
     while (encoder.getNextChunk(b)) {
         require(b.size() > 32 && b[5] == 5, "STRIPS JPEG used fragile chunks");
+        require(b[31] == unsigned(shuffle), "encoder omitted shuffle mode");
         require(wire(b).size() <= 1300, "integrated encoder exceeded MTU");
         decoder.pushData(b); ++count;
     }
     require(count > 4 && decoder.originalSize() == image.size(), "integrated encode failed");
     require(render(decoder).size() == image.size(), "scaled reference render size");
+    encoder.setJpegTileShuffle(!shuffle);
+    encoder.pushImage(image, 18000, 1);
+    while (encoder.getNextChunk(b)) {
+        require(b[5] == 5 && b[31] == unsigned(!shuffle), "runtime shuffle switch not applied to next key");
+        decoder.pushData(b);
+    }
+    require(render(decoder).size() == image.size(), "decoder failed a layout transition");
+}
+void shuffleTest(unsigned channels) {
+    const auto plain = fixture(channels), shuffled = fixture(channels, 256, true);
+    std::vector<unsigned> a(plain.packets.size()), b(shuffled.packets.size());
+    std::iota(a.begin(), a.end(), 0u); std::iota(b.begin(), b.end(), 0u);
+    same(expected(plain, a), expected(shuffled, b), "shuffle changed no-loss JPEG pixels");
+    affinecodec::Decoder decoder;
+    for (const auto& packet : shuffled.packets) decoder.pushData(packet);
+    same(render(decoder), expected(plain, a), "decoder did not undo permutation");
+    // A lost encoded row must spread across several spatial rows.
+    const auto& r = shuffled.regions.front();
+    std::vector<unsigned> rows;
+    for (unsigned i = 0; i < r.width / 8; ++i) rows.push_back(shuffled.tile_map[i] / (r.layer_width / 8));
+    std::sort(rows.begin(), rows.end());
+    require(rows.front() != rows.back(), "packet stayed in a single spatial row");
+}
+void permutationTest() {
+    require(affinecodec::restartTilePermutation(32, 16) ==
+            std::vector<std::uint32_t>({0, 6, 5, 7, 2, 1, 3, 4}), "shuffle v1 wire vector changed");
+    for (const auto size : {cv::Size(8, 8), cv::Size(8, 248), cv::Size(56, 24),
+                            cv::Size(232, 64), cv::Size(32760, 8)}) {
+        auto map = affinecodec::restartTilePermutation(size.width, size.height);
+        require(map.size() == unsigned(size.area() / 64), "shuffle size wrong");
+        std::sort(map.begin(), map.end());
+        for (unsigned i = 0; i < map.size(); ++i) require(map[i] == i, "shuffle is not a bijection");
+    }
+    require(affinecodec::restartTilePermutation(0, 8).empty(), "invalid shuffle dimensions");
 }
 void exportFixture(const Fixture& f, const std::string& path) {
     nlohmann::json j;
     j["headers"]["1"] = affinecodec::restartJpegHeader(1, 8);
     j["headers"]["2"] = affinecodec::restartJpegHeader(2, 8);
     j["width"] = f.size.width; j["height"] = f.size.height;
+    j["tile_map"] = f.tile_map;
     for (unsigned i = 0; i < f.regions.size(); ++i) {
         Bytes jpeg; require(affinecodec::makeRestartJpeg(f.regions[i], jpeg), "fixture jpeg");
         j["regions"].push_back({{"wire", f.wires[i]}, {"jpeg", jpeg}, {"rgba", rgba(f.decoded[i])}});
@@ -230,9 +278,12 @@ int main(int argc, char** argv) {
         cv::setNumThreads(2);
         auto color = fixture(3);
         if (argc == 3 && std::string(argv[1]) == "--export") { exportFixture(color, argv[2]); return 0; }
+        if (argc == 3 && std::string(argv[1]) == "--export-shuffled") { exportFixture(fixture(3, 256, true), argv[2]); return 0; }
         lossTest(color); lossTest(fixture(1)); lossTest(fixture(3, 232));
-        rawStoreTest(color); encoderTest();
-        std::cout << "PASS: JPEG regions, 1300-byte MTU, 35% loss (36 shuffled trials), late/duplicate/stale packets, PATCH reference, HTTP catchup\n";
+        lossTest(fixture(3, 256, true)); lossTest(fixture(1, 256, true)); lossTest(fixture(3, 232, true));
+        rawStoreTest(color); rawStoreTest(fixture(3, 256, true));
+        encoderTest(false); encoderTest(true); permutationTest(); shuffleTest(1); shuffleTest(3);
+        std::cout << "PASS: JPEG regions, 1300-byte MTU, 35% loss (72 trials), tile shuffle/no-loss equivalence, late/duplicate/stale packets, PATCH reference, HTTP catchup\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

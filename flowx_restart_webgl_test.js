@@ -66,10 +66,11 @@ globalThis.flowxTest={processDatagram,stats,
       check(queued&&equal(queued.pixels,displayed),'queued GPU snapshot differs from rendered PATCH');
       for(const i of order.slice(kept)) await send(f.regions[i].wire);
       check(t.stats.renders===renders&&equal(displayed,t.pixels(false)),'late key rewound display');
+      // Shuffled late tiles are uploaded together just before the next render.
+      await send(patch(102));check(!equal(displayed,t.pixels(false)),'next PATCH did not use restored key');
       const key=t.pixels(true);
       let maxError=0;for(let i=0;i<key.length;i++) maxError=Math.max(maxError,Math.abs(key[i]-f.complete[i]));
       check(maxError<=3,'browser JPEG/RGBA differs from native: '+maxError);
-      await send(patch(102));check(!equal(displayed,t.pixels(false)),'next PATCH did not use restored key');
       const completed=t.pixels(false);
       await send(patch(101));await send(f.regions[0].wire);
       check(t.state().frame===102&&equal(completed,t.pixels(false)),'duplicate/stale display changed');

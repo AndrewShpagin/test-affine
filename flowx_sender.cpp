@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
 
         flowx::Encoder encoder;
         encoder.setStripsKeyframes(cfg.codec.strips);
+        encoder.setJpegTileShuffle(cfg.codec.jpeg_tile_shuffle);
         encoder.setKeyframeCodec(cfg.codec.keyframe_codec);
         encoder.setHomographyTransform(cfg.codec.homography);
 
@@ -145,6 +146,7 @@ int main(int argc, char** argv) {
                   << cfg.codec.keyframe_period << " frames"
                   << ", grayscale=" << (cfg.codec.grayscale ? "yes" : "no")
                   << ", strips=" << (cfg.codec.strips ? "yes" : "no")
+                  << ", tile shuffle=" << (cfg.codec.jpeg_tile_shuffle ? "yes" : "no")
                   << ", H=" << (cfg.codec.homography ? "yes" : "no");
         if (cfg.codec.mesh)
             std::cout << ", mesh=" << cfg.codec.mesh_grid_x << 'x' << cfg.codec.mesh_grid_y;
@@ -224,6 +226,7 @@ int main(int argc, char** argv) {
 
             const flowx::CodecConfig codec = codec_params.snapshot();
             encoder.setStripsKeyframes(codec.strips);
+            encoder.setJpegTileShuffle(codec.jpeg_tile_shuffle);
             encoder.setKeyframeCodec(codec.keyframe_codec);
             encoder.setHomographyTransform(codec.homography);
 

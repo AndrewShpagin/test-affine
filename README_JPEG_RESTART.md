@@ -43,6 +43,43 @@ The low bit of `x` selects even or odd columns. See
 The complete FlowX UDP payload, including its 36-byte header, is at most
 1300 bytes. IP and UDP transport headers are additional.
 
+## Optional 16x8 tile shuffle
+
+Set `codec.jpeg_tile_shuffle: true` on the sender to scatter a lost segment
+across the image instead of losing a continuous 8-pixel-high strip. The default
+is `false`. This setting applies to JPEG + STRIPS; other keyframe formats ignore
+it. C++ applications can call `Encoder::setJpegTileShuffle(true)`.
+
+The encoder first selects the encoded resolution and scales both half-images.
+It then applies the same deterministic permutation to their 8x8 blocks, which
+is equivalent to moving paired 16x8 tiles in the combined encoded raster. Pixels
+inside each tile retain their order. Motion estimation keeps the original,
+unshuffled image. Quantization and fixed JPEG tables are unchanged; no-loss
+decoded pixels match unshuffled encoding at the same dimensions. DC coding and
+packet sizes can change, so the existing byte-budget controller may select a
+different resolution or restart interval.
+
+Every region carries its layout mode in byte 35: `0` for spatial order, `1` for
+shuffle v1. Both the native and browser decoders automatically restore spatial
+coordinates from that mode; there is no matching receiver setting to maintain.
+No seed packet or coordinate list is needed. The first received region can
+initialize the permutation even if all earlier packets were lost. Layout must
+remain constant within a keyframe; changes take effect on the next encoded key.
+
+Decoded pixels and receipt masks are placed directly in their original spatial
+positions before counterpart filling, nearest-neighbour filling, output scaling,
+or PATCH warping. Late packets replace the corresponding real samples. The
+browser batches scattered GPU updates until the next render; queued pictures
+remain unchanged. The **Fill missing pixels** debug option works with both modes.
+
+When sender HTTP control is enabled, change the option through `/codec.json`
+with `{"jpeg_tile_shuffle":true}`, or GET `/setparam/jpeg_tile_shuffle/true`.
+HTTP changes are in memory; edit the config file to keep the setting on restart.
+Update the receiver and hard-refresh the browser before enabling shuffle:
+older versions reject the new layout. Disabling shuffle retains the prior wire
+representation. This disperses losses; it does not recover lost data or guarantee
+that missing tiles cannot be adjacent.
+
 ## Loss, late data, and rendering
 
 The first successfully decoded region creates a reference with black holes.
@@ -127,7 +164,10 @@ The native test covers grayscale and color, difficult MCU-row widths, the
 late recovery, stale frames, frame-ID wrap, malformed metadata, subsequent
 PATCH rendering, the configured encoder, and HTTP catchup. With Node installed,
 CTest also exports native JPEG/RGBA fixtures and checks browser assembly against
-the same bytes, including asynchronous decode reordering.
+the same bytes, including asynchronous decode reordering. Both layout modes
+are tested with shuffled packet delivery and 35% loss, duplicates, late recovery,
+and receipt masks. Shuffle checks include a fixed cross-language permutation
+vector, no-loss equality with ordinary JPEG, and runtime layout changes.
 The browser presentation regression test also executes the shipped JavaScript
 with a virtual clock and a canvas/WebGL stub, checking that partial keys and
 resolution changes preserve the displayed frame until presentation. Playout
@@ -175,6 +215,9 @@ installed:
 ```bash
 ./build/jpeg_restart_test --export build/restart-fixtures.json
 node flowx_restart_webgl_test.js build/restart-fixtures.json
+# Same GPU integration checks with shuffled tiles:
+./build/jpeg_restart_test --export-shuffled build/shuffle-fixtures.json
+node flowx_restart_webgl_test.js build/shuffle-fixtures.json
 ```
 
 An optional third argument supplies the Chromium executable path. This test

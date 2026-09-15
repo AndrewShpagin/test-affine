@@ -112,6 +112,7 @@ CodecConfig parseCodec(const json& j) {
         j.value("keyframe_codec", std::string("jpeg")));
     cfg.grayscale = j.value("grayscale", cfg.grayscale);
     cfg.strips = j.value("strips", cfg.strips);
+    cfg.jpeg_tile_shuffle = j.value("jpeg_tile_shuffle", cfg.jpeg_tile_shuffle);
     cfg.homography = j.value("homography", cfg.homography);
     cfg.mesh = j.value("mesh", cfg.mesh);
     cfg.mesh_grid_x = j.value("mesh_grid_x", cfg.mesh_grid_x);

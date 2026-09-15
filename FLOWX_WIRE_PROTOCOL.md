@@ -200,20 +200,40 @@ region of one half-image. All offsets below include the common 20-byte header.
 | 22 | 2 | Original output height |
 | 24 | 2 | Encoded half-image width |
 | 26 | 2 | Encoded half-image height |
-| 28 | 2 | X coordinate in the assembled encoded keyframe |
-| 30 | 2 | Y coordinate in the assembled encoded keyframe |
+| 28 | 2 | X coordinate in the encoded layout |
+| 30 | 2 | Y coordinate in the encoded layout |
 | 32 | 2 | Region width in half-image samples |
 | 34 | 1 | Fixed JPEG profile: 1 = gray Q85, 2 = YCbCr 4:4:4 Q85 |
-| 35 | 1 | Reserved, zero |
+| 35 | 1 | Layout: 0 = spatial order, 1 = shared 16x8 tile shuffle v1 |
 | 36 | 1–1264 | JPEG entropy data, without restart markers |
 
 The assembled keyframe dimensions are `2 * half_width` by `half_height`,
-and are scaled to the original output size when rendered. A decoded sample
+and are scaled to the original output size when rendered. For layout 0, a decoded sample
 `(i,j)` is placed at `(x + 2*i, y + j)`; `x & 1` selects the column half.
 Half dimensions and region width are positive multiples of 8.
 `floor(x/2)` and `y` are multiples of 8; the full region must fit the half.
 Original width must be even; original dimensions cannot be smaller than
 the assembled raster. Maximum original area is 16 megapixels.
+
+For layout 1, `(x,y)` describes the shuffled encoded raster. Let
+`C = half_width / 8`, `N = C * (half_height / 8)`. Construct the same permutation
+for both parities:
+
+1. Initialize `P[i] = i` for `0 <= i < N`.
+2. Set the unsigned 32-bit state to `0x46584a31 XOR half_width XOR (half_height << 16)`.
+3. For `i = N-1` down to `1`, update the state with xorshift32:
+   `s ^= s << 13; s ^= s >> 17; s ^= s << 5`, truncating to 32 bits after each
+   operation and using a logical right shift. Swap `P[i]` and `P[s % (i+1)]`.
+
+`P` maps encoded block indices to spatial block indices. For decoded sample
+`(u,v)`, compute `b = P[(y/8)*C + floor(x/16) + floor(u/8)]`, then place it at
+`((b % C)*16 + 2*(u % 8) + (x & 1), floor(b/C)*8 + v)`.
+Update the receipt mask for spatial block `b` and parity `x & 1`. Apply filling
+and PATCH transforms only in spatial coordinates. At half size 32x16, the
+permutation is `[0,6,5,7,2,1,3,4]`. Frame ID and arrival order do not affect it.
+All packets of a keyframe must agree on layout, profile, and dimensions.
+Unknown layouts are rejected. Header size and entropy capacity remain unchanged;
+the internal AFC1 representation uses byte 31 for the same layout value.
 
 Payload bytes retain JPEG FF00 stuffing and end padding, but contain no raw
 markers. The receiver reconstructs an ordinary baseline JPEG using the fixed
@@ -222,6 +242,8 @@ table packet, or end marker is required. See
 [JPEG restart assembly](README_JPEG_RESTART.md) for sizing and mask rules.
 
 Older v4 receivers reject type 4; deploy sender and receiver together.
+Receivers with the original type-4 implementation accept layout 0 but reject
+layout 1, which previously occupied a reserved-zero byte.
 
 ## Loss behavior
 

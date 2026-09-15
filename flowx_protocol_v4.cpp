@@ -217,11 +217,10 @@ float dequantizeMesh(std::int16_t value) {
 
 bool readRestartRegion(const std::vector<u_char>& data, std::size_t pos,
                        cv::Size original, affinecodec::JpegRestartRegion& r) {
-    std::uint8_t reserved = 0;
     if (!readU16(data, pos, r.layer_width) || !readU16(data, pos, r.layer_height) ||
         !readU16(data, pos, r.x) || !readU16(data, pos, r.y) ||
         !readU16(data, pos, r.width) || !readU8(data, pos, r.profile) ||
-        !readU8(data, pos, reserved) || reserved ||
+        !readU8(data, pos, r.layout) ||
         !affinecodec::validRestartGeometry(r, original)) return false;
     r.entropy.assign(data.begin() + pos, data.end());
     return affinecodec::validRestartEntropy(r.entropy);

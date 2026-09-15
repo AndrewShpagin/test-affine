@@ -11,6 +11,7 @@
     "keyframe_codec": "jpeg",
     "grayscale": true,
     "strips": true,
+    "jpeg_tile_shuffle": false,
     "homography": true,
     "mesh": true,
     "mesh_grid_x": 6,

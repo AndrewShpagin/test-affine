@@ -2,7 +2,7 @@
 // Run against fixtures exported by jpeg_restart_test: tests the actual native
 // entropy/header bytes and expected RGBA, without requiring a DOM in CTest.
 const assert=require('node:assert/strict'),fs=require('node:fs');
-const {RestartAssembler,parseRegion,makeJpeg}=require('./flowx_restart_browser.js');
+const {RestartAssembler,parseRegion,makeJpeg,tilePermutation}=require('./flowx_restart_browser.js');
 const f=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const packets=f.regions.map(r=>Uint8Array.from(r.wire));
 const decoded=new Map(f.regions.map(r=>[Buffer.from(r.jpeg).toString('base64'),Uint8Array.from(r.rgba)]));
@@ -17,7 +17,9 @@ function expected(indices,fillGaps=true) {
   for(const i of indices) {
     const r=parseRegion(packets[i]),source=f.regions[i].rgba;
     for(let y=0;y<8;y++) for(let x=0;x<r.width;x++) {
-      const dest=(r.y+y)*f.width+r.x+2*x,src=(y*r.width+x)*4;
+      const columns=r.lw/8,index=(r.y/8)*columns+(r.x>>4)+(x>>3);
+      const target=r.layout===1?f.tile_map[index]:index;
+      const dest=(Math.floor(target/columns)*8+y)*f.width+(target%columns)*16+2*(x%8)+(r.x&1),src=(y*r.width+x)*4;
       pixels.set(source.slice(src,src+4),dest*4);mask[dest]=1;
     }
   }
@@ -31,6 +33,9 @@ function frame(packet,id) {
   const u=packet.slice();new DataView(u.buffer).setUint32(8,id,true);return u;
 }
 (async()=>{
+  assert.deepEqual(Array.from(tilePermutation(32,16)),[0,6,5,7,2,1,3,4],'shuffle v1 wire vector changed');
+  assert.deepEqual(Array.from(tilePermutation(8,8)),[0]);
+  if(f.tile_map.length)assert.deepEqual(Array.from(tilePermutation(f.width/2,f.height)),f.tile_map,'C++/JS shuffle mismatch');
   for(let seed=1;seed<=12;seed++) {
     let state=seed;
     const rand=()=>{state=(Math.imul(state,1664525)+1013904223)>>>0;return state;};
@@ -72,6 +77,10 @@ function frame(packet,id) {
     assert.equal(await a.accept(packets[1]),null);
     const bad=frame(packets[1],111);bad[34]=99;
     await assert.rejects(a.accept(bad),/geometry/);assert.equal(a.frameId,110);
+    const mixed=frame(packets[1],110);mixed[35]^=1;
+    await assert.rejects(a.accept(mixed),/metadata/);
+    const unknown=frame(packets[1],111);unknown[35]=2;
+    await assert.rejects(a.accept(unknown),/geometry/);assert.equal(a.frameId,110);
   }
   // Either parity can arrive first. With concealment off, only its actual
   // samples exist; absent columns and regions stay opaque black even after fill.
@@ -103,5 +112,5 @@ function frame(packet,id) {
   pending[1]();await fresh;pending[0]();assert.equal(await old,null);assert.equal(racing.frameId,101);
   for(const i of [0,Math.floor(packets.length/2),packets.length-1])
     assert.deepEqual(Array.from(makeJpeg(parseRegion(packets[i]),f.headers)),f.regions[i].jpeg);
-  console.log('PASS: browser/native JPEG bytes, 35% loss (12 trials), fills on/off, black odd/even columns, duplicates, late restore, frame wrap, async reorder');
+  console.log('PASS: browser/native JPEG bytes and tile layout, 35% loss (12 trials), fills on/off, black odd/even columns, duplicates, late restore, frame wrap, async reorder');
 })().catch(e=>{console.error(e);process.exitCode=1;});

@@ -89,6 +89,11 @@ public:
         if (enabled) mosaic_keyframes_ = false;
     }
     bool stripsKeyframes() const { return strips_keyframes_; }
+    void setJpegTileShuffle(bool enabled) {
+        if (jpeg_tile_shuffle_ != enabled) strips_jpeg_bytes_per_pixel_ = 0.0;
+        jpeg_tile_shuffle_ = enabled;
+    }
+    bool jpegTileShuffle() const { return jpeg_tile_shuffle_; }
     void setKeyframeCodec(KeyframeCodec codec) { keyframe_codec_ = codec; }
     KeyframeCodec keyframeCodec() const { return keyframe_codec_; }
     void setHomographyTransform(bool enabled) { homography_transform_ = enabled; }
@@ -123,6 +128,7 @@ private:
     KeyframeCodec keyframe_codec_ = KeyframeCodec::Jpeg;
     bool mosaic_keyframes_ = false;
     bool strips_keyframes_ = false;
+    bool jpeg_tile_shuffle_ = false;
     bool homography_transform_ = false;
     std::uint32_t next_frame_id_ = 0;
     std::uint32_t keyframe_id_ = 0;
@@ -180,6 +186,8 @@ private:
         cv::Size original_size;
         cv::Size layer_size;
         std::uint8_t profile = 0;
+        std::uint8_t layout = 0;
+        std::vector<std::uint32_t> tile_map;
         cv::Mat assembled;
         // One bit-valued byte per actual 8x8 block and parity. Concealed pixels
         // never set these entries, so late real data can always replace them.

@@ -32,6 +32,7 @@ json codecToJson(const CodecConfig& codec) {
         {"keyframe_codec", keyframeCodecName(codec.keyframe_codec)},
         {"grayscale", codec.grayscale},
         {"strips", codec.strips},
+        {"jpeg_tile_shuffle", codec.jpeg_tile_shuffle},
         {"homography", codec.homography},
         {"mesh", codec.mesh},
         {"mesh_grid_x", codec.mesh_grid_x},
@@ -96,6 +97,7 @@ bool applyPatch(const CodecConfig& current, const json& body,
         !readInt(body, "keyframe_period", candidate.keyframe_period, error) ||
         !readBool(body, "grayscale", candidate.grayscale, error) ||
         !readBool(body, "strips", candidate.strips, error) ||
+        !readBool(body, "jpeg_tile_shuffle", candidate.jpeg_tile_shuffle, error) ||
         !readBool(body, "homography", candidate.homography, error) ||
         !readBool(body, "mesh", candidate.mesh, error) ||
         !readInt(body, "mesh_grid_x", candidate.mesh_grid_x, error) ||
@@ -115,7 +117,7 @@ bool assignPathField(json& patch, const std::string& name, const std::string& va
                      std::string& error) {
     static const char* kIntFields[] = {"keyframe_bytes", "keyframe_period",
                                        "mesh_grid_x", "mesh_grid_y"};
-    static const char* kBoolFields[] = {"grayscale", "strips", "homography", "mesh"};
+    static const char* kBoolFields[] = {"grayscale", "strips", "jpeg_tile_shuffle", "homography", "mesh"};
 
     for (const char* field : kIntFields) {
         if (name == field) {

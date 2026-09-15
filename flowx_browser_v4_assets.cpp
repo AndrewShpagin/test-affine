@@ -157,6 +157,7 @@ if(!fillGaps){
 }
 let outW=0,outH=0,keyW=0,keyH=0,current=0,keyFrameId=null,streamId=0,key=null;
 let restartAssembly=null,lastRenderedFrame=null,lastPresentedFrame=null;
+let restartTextureDirty=false;
 let restartPresentation=null,restartPresentationTimer=null;
 const restartQuietMs=100;
 const newer=(a,b)=>((a-b)|0)>0;
@@ -223,18 +224,21 @@ function cancelRestartPresentation(){
   if(restartPresentationTimer!==null) clearTimeout(restartPresentationTimer);
   restartPresentationTimer=null;restartPresentation=null;
 }
-function refreshRestartFill(){
+function refreshRestartReference(){
   const a=restartAssembly;
-  if(!a||a.frameId!==keyFrameId||!a.fillMissing())return;
+  if(!a||a.frameId!==keyFrameId)return;
+  const filled=a.fillMissing();
+  if(!filled&&!restartTextureDirty)return;
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,keyTex);
   gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,a.width,a.height,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
+  restartTextureDirty=false;
 }
 function presentRestartKey(){
   const pending=restartPresentation;
   if(!pending) return;
   cancelRestartPresentation();
   if(pending.frameId!==keyFrameId || (lastRenderedFrame!==null&&!newer(pending.frameId,lastRenderedFrame))) return;
-  refreshRestartFill();
+  refreshRestartReference();
   alloc(pending.width,pending.height);
   renderKey(pending.frameId,pending.timestamp);
 }
@@ -279,7 +283,7 @@ function renderPatch(p){
   }
   // Late real regions can change the nearest source for other missing areas.
   // Refill once before rendering, without modifying already queued snapshots.
-  refreshRestartFill();
+  refreshRestartReference();
   const next=1-current; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[next]); gl.viewport(0,0,outW,outH); gl.useProgram(patchProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(patchProg,'uPrev'),1);
@@ -325,11 +329,14 @@ async function acceptRegion(u,frame,timestamp){
     // Another key also closes a burst (e.g. keyframe-only streams with loss).
     presentRestartKey();
     restartAssembly=a;
+    restartTextureDirty=false;
     key=null;keyW=a.width;keyH=a.height;
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
     keyFrameId=frame;
     restartPresentation={frameId:frame,width:a.ow,height:a.oh,timestamp};
+  } else if(result.fullUpload){
+    restartTextureDirty=true;
   } else {
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texSubImage2D(gl.TEXTURE_2D,0,result.x,result.y,result.width,8,gl.RGBA,gl.UNSIGNED_BYTE,result.pixels);
@@ -366,7 +373,7 @@ async function processDatagram(d){
     if(streamId) retiredStreams.add(streamId);
     if(retiredStreams.size>16) retiredStreams.delete(retiredStreams.values().next().value);
     cancelRestartPresentation();playout.reset();
-    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;lastRenderedFrame=null;lastPresentedFrame=null;$('stream').textContent=sid;
+    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;restartTextureDirty=false;lastRenderedFrame=null;lastPresentedFrame=null;$('stream').textContent=sid;
   }
   const timestamp=captureMs(v);
   playout.observe(frame,timestamp);

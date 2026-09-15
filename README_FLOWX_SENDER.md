@@ -72,6 +72,7 @@ Any subset of fields may be sent; omitted fields keep their current value. Suppo
 | `keyframe_codec` | string | `"jpeg"` or `"jpeg2000"` (`jpeg2000` requires an OpenCV JP2 writer) |
 | `grayscale` | boolean | Convert frames to grayscale before encoding |
 | `strips` | boolean | Strip-based keyframes |
+| `jpeg_tile_shuffle` | boolean | Shuffle paired 16x8 tiles for JPEG + STRIPS; default false, applied at the next keyframe; decoders restore automatically |
 | `homography` | boolean | Homography transform stage |
 | `mesh` | boolean | Emit the mesh residual field |
 | `mesh_grid_x` | integer | Transmitted mesh grid width, 2..8 |

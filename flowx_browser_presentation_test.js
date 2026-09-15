@@ -132,6 +132,7 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   assert.equal(raw.uploads.length,0,'timeout uploaded estimates in debug mode');
   await raw.processDatagram(region(1));await raw.processDatagram(patch(101,100));
   checkMissingBlack(raw.reference());
+  if(fixture.tile_map.length)assert.deepEqual(raw.uploads.at(-1).pixels,raw.reference().pixels,'raw shuffled PATCH used a stale texture');
   assert.equal(raw.uniforms.findLast(u=>u.name==='uFillGaps').value,0,'PATCH retained border filling');
   await raw.processDatagram(region(0,110));await raw.processDatagram(patch(111,110));
   checkMissingBlack(raw.reference());
@@ -148,6 +149,8 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
 
   const h=harness();
   for(let i=0;i<count;i++)await h.processDatagram(region(i));
+  assert.deepEqual(h.reference().pixels,Uint8Array.from(fixture.complete),'complete key not in spatial order');
+  if(fixture.tile_map.length)assert.deepEqual(h.uploads.at(-1).pixels,h.reference().pixels,'complete shuffled key used a stale texture');
   assert.equal(h.stats.renders,1,'complete key not rendered immediately');assert.equal(h.state().pending,false);
   h.advance(16);assert.equal(h.state().shown,100);
   await h.processDatagram(patch(101,100));

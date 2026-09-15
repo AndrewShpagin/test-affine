@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 #include <jpeglib.h>
 
 namespace affinecodec {
@@ -134,7 +135,8 @@ bool validRestartGeometry(const JpegRestartRegion& r, cv::Size original) {
         r.layer_height <= original.height && r.width >= 8 && !(r.width % 8) &&
         !((r.x / 2) % 8) && !(r.y % 8) &&
         r.x / 2u + r.width <= r.layer_width && r.y + 8u <= r.layer_height &&
-        (r.profile == kRestartGray85 || r.profile == kRestartColor44485);
+        (r.profile == kRestartGray85 || r.profile == kRestartColor44485) &&
+        r.layout <= kRestartTileShuffle;
 }
 
 bool validRestartEntropy(const std::vector<unsigned char>& bytes) {
@@ -145,20 +147,48 @@ bool validRestartEntropy(const std::vector<unsigned char>& bytes) {
     return true;
 }
 
+std::vector<std::uint32_t> restartTilePermutation(unsigned width, unsigned height) {
+    if (width < 8 || height < 8 || width > 32760 || height > 65528 ||
+        width % 8 || height % 8 || std::uint64_t(width) * height * 2 > kRestartMaxImagePixels)
+        return {};
+    std::vector<std::uint32_t> map((width / 8) * (height / 8));
+    std::iota(map.begin(), map.end(), 0u);
+    // Wire-defined Fisher-Yates with xorshift32; do not use std::shuffle,
+    // whose exact permutation is not portable between C++ libraries and JS.
+    std::uint32_t state = 0x46584a31u ^ width ^ (height << 16);
+    for (std::size_t i = map.size() - 1; i > 0; --i) {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        std::swap(map[i], map[state % (i + 1)]);
+    }
+    return map;
+}
+
 bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
-                            std::vector<JpegRestartRegion>& regions, unsigned* used_interval) {
+                            std::vector<JpegRestartRegion>& regions, unsigned* used_interval,
+                            bool tile_shuffle) {
     regions.clear();
     if (image.empty() || parity > 1 || image.cols % 8 || image.rows % 8 ||
         image.cols > 32760 || image.rows > 65528 ||
         image.total() * 2 > kRestartMaxImagePixels ||
         (image.type() != CV_8UC1 && image.type() != CV_8UC3)) return false;
     const unsigned columns = image.cols / 8;
+    cv::Mat input = image;
+    if (tile_shuffle) {
+        const auto map = restartTilePermutation(image.cols, image.rows);
+        // Allocate separately: the original pixels also drive motion estimation.
+        input = cv::Mat(image.size(), image.type());
+        for (unsigned i = 0; i < map.size(); ++i) {
+            const unsigned source = map[i];
+            image(cv::Rect((source % columns) * 8, (source / columns) * 8, 8, 8))
+                .copyTo(input(cv::Rect((i % columns) * 8, (i / columns) * 8, 8, 8)));
+        }
+    }
     unsigned interval = rowDivisor(columns,
         static_cast<unsigned>(kRestartMaxEntropyBytes / (64.0 * 0.35)));
     std::vector<unsigned char> jpeg;
     std::vector<std::vector<unsigned char>> segments;
     for (;;) {
-        if (!encode(image, interval, jpeg) || !split(jpeg, segments)) return false;
+        if (!encode(input, interval, jpeg) || !split(jpeg, segments)) return false;
         if (segments.size() != image.total() / (64u * interval)) return false;
         std::size_t largest = 0;
         for (const auto& segment : segments) largest = std::max(largest, segment.size());
@@ -179,6 +209,7 @@ bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
         r.y = static_cast<std::uint16_t>((block / columns) * 8);
         r.width = static_cast<std::uint16_t>(interval * 8);
         r.profile = image.channels() == 1 ? kRestartGray85 : kRestartColor44485;
+        r.layout = tile_shuffle ? kRestartTileShuffle : 0;
         r.entropy = std::move(segments[i]);
         if (!validRestartEntropy(r.entropy)) return false;
         result.push_back(std::move(r));

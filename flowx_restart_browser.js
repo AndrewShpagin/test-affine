@@ -7,8 +7,8 @@
     if(u.length<=36 || u.length>1300) throw new Error('bad JPEG region size');
     const v=new DataView(u.buffer,u.byteOffset,u.byteLength),get=p=>v.getUint16(p,true);
     if(get(0)!==0x5846 || u[2]!==0x44 || u[3] || !v.getUint32(4,true)) throw new Error('bad JPEG region header');
-    const r={frameId:v.getUint32(8,true),ow:get(20),oh:get(22),lw:get(24),lh:get(26),x:get(28),y:get(30),width:get(32),profile:u[34],entropy:u.slice(36)};
-    if(u[35] || r.ow<16 || (r.ow&1) || r.oh<8 || r.ow*r.oh>16*1024*1024 ||
+    const r={frameId:v.getUint32(8,true),ow:get(20),oh:get(22),lw:get(24),lh:get(26),x:get(28),y:get(30),width:get(32),profile:u[34],layout:u[35],entropy:u.slice(36)};
+    if(r.layout>1 || r.ow<16 || (r.ow&1) || r.oh<8 || r.ow*r.oh>16*1024*1024 ||
        r.lw<8 || r.lh<8 || r.lw%8 || r.lh%8 || 2*r.lw>r.ow || r.lh>r.oh ||
        r.width<8 || r.width%8 || ((r.x>>1)%8) || r.y%8 ||
        (r.x>>1)+r.width>r.lw || r.y+8>r.lh || (r.profile!==1 && r.profile!==2))
@@ -16,6 +16,19 @@
     for(let p=0;p<r.entropy.length;p++)
       if(r.entropy[p]===255 && (++p===r.entropy.length || r.entropy[p]!==0)) throw new Error('unexpected JPEG marker');
     return r;
+  }
+  function tilePermutation(width,height) {
+    if(!Number.isInteger(width)||!Number.isInteger(height)||width<8||height<8||
+       width>32760||height>65528||width%8||height%8||2*width*height>16*1024*1024)
+      throw new Error('bad shuffle dimensions');
+    const map=new Uint32Array((width/8)*(height/8));
+    for(let i=0;i<map.length;i++)map[i]=i;
+    let state=(0x46584a31^width^(height<<16))>>>0;
+    for(let i=map.length-1;i>0;i--) {
+      state^=state<<13;state^=state>>>17;state^=state<<5;state>>>=0;
+      const j=state%(i+1),v=map[i];map[i]=map[j];map[j]=v;
+    }
+    return map;
   }
   function makeJpeg(r,headers) {
     const source=headers[r.profile];
@@ -100,7 +113,8 @@
     constructor(headers,decode,{fillGaps=true}={}) {
       this.headers=headers;this.decode=decode;this.fillGaps=fillGaps;this.frameId=null;this.fillDirty=false;
     }
-    matching(r) { return this.ow===r.ow && this.oh===r.oh && this.lw===r.lw && this.lh===r.lh && this.profile===r.profile; }
+    matching(r) { return this.ow===r.ow && this.oh===r.oh && this.lw===r.lw && this.lh===r.lh && this.profile===r.profile && this.layout===r.layout; }
+    spatial(index) { return this.tileMap?this.tileMap[index]:index; }
     fillMissing() {
       if(!this.fillGaps||this.frameId===null||!this.fillDirty)return false;
       const changed=fillMissingPixels(this.pixels,this.received,this.width,this.height);
@@ -114,7 +128,7 @@
         if(r.frameId===this.frameId) {
           if(!this.matching(r)) throw new Error('JPEG region metadata changed');
           let missing=false;
-          for(let i=0;i<count;i++) missing=missing || !this.received[2*(first+i)+parity];
+          for(let i=0;i<count;i++) missing=missing || !this.received[2*this.spatial(first+i)+parity];
           if(!missing) return null;
         }
       }
@@ -125,6 +139,7 @@
       const newKeyframe=this.frameId!==r.frameId;
       if(newKeyframe) {
         this.frameId=r.frameId;this.ow=r.ow;this.oh=r.oh;this.lw=r.lw;this.lh=r.lh;this.profile=r.profile;
+        this.layout=r.layout;this.tileMap=r.layout===1?tilePermutation(r.lw,r.lh):null;
         this.width=r.lw*2;this.height=r.lh;
         this.received=new Uint8Array(2*columns*(r.lh/8));
         this.receivedCount=0;
@@ -133,20 +148,24 @@
       } else if(!this.matching(r)) throw new Error('JPEG region metadata changed during decode');
       let changed=false;
       for(let b=0;b<count;b++) {
-        const own=2*(first+b)+parity;
+        const target=this.spatial(first+b),own=2*target+parity;
+        const tx=(target%columns)*16+parity,ty=Math.floor(target/columns)*8;
         if(this.received[own]) continue;
         const fill=this.fillGaps&&!this.received[own^1];
         for(let y=0;y<8;y++) for(let x=0;x<8;x++) {
-          const sx=8*b+x,dx=r.x+2*sx,src=(y*r.width+sx)*4,dst=((r.y+y)*this.width+dx)*4;
+          const sx=8*b+x,dx=tx+2*x,src=(y*r.width+sx)*4,dst=((ty+y)*this.width+dx)*4;
           for(let c=0;c<4;c++) {
             this.pixels[dst+c]=rgba[src+c];
-            if(fill) this.pixels[((r.y+y)*this.width+(dx^1))*4+c]=rgba[src+c];
+            if(fill) this.pixels[((ty+y)*this.width+(dx^1))*4+c]=rgba[src+c];
           }
         }
         this.received[own]=1;this.receivedCount++;changed=true;
       }
       if(!changed) return null;
       this.fillDirty=true;
+      // Shuffled blocks are scattered in the reference. The view batches their
+      // GPU upload until rendering instead of issuing a call per 16x8 tile.
+      if(this.layout===1)return {newKeyframe,fullUpload:true};
       const x=r.x&~1,width=2*r.width,patch=new Uint8Array(width*8*4);
       for(let y=0;y<8;y++) {
         const begin=((r.y+y)*this.width+x)*4;
@@ -156,5 +175,5 @@
     }
   }
   root.FlowXRestartAssembler=RestartAssembler;
-  if(typeof module!=='undefined' && module.exports) module.exports={RestartAssembler,parseRegion,makeJpeg,fillMissingPixels};
+  if(typeof module!=='undefined' && module.exports) module.exports={RestartAssembler,parseRegion,makeJpeg,fillMissingPixels,tilePermutation};
 })(globalThis);
