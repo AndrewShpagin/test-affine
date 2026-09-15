@@ -21,6 +21,13 @@ port **8002**:
 - Browser decoder: http://127.0.0.1:8002/flowx.html
 - MJPEG stream: http://127.0.0.1:8002/stream.mjpg
 - Status: http://127.0.0.1:8002/status.json
+- Live MJPEG filling/smoothing controls and preview: http://127.0.0.1:8002/mjpg.html
+
+On the receiver, `/decoder.json` supports GET and POST/PUT with boolean
+`fill_gaps`/`smooth_fill`. Quick switches include `/setparam/fill_gaps/0` and
+`/setparam/smooth_fill/1`. These changes affect all JPEG/MJPEG viewers immediately
+when the displayed keyframe is available, and last until restart. The sender
+console also reports `jpeg-chunk-avg` in bytes, including FlowX packet headers.
 
 Edit `config/flowx_receiver.json` to change ports, assembly/playout delays, gap
 filling, or simulated jitter, then restart the receiver. Point the sender at this

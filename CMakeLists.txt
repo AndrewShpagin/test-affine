@@ -155,6 +155,9 @@ if(BUILD_TESTING)
             PROPERTIES FIXTURES_REQUIRED shuffle_fixtures)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME flowx_sender_stats COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/flowx_sender_stats_test.py" "$<TARGET_FILE:flowx_sender>")
+            set_tests_properties(flowx_sender_stats PROPERTIES TIMEOUT 60)
             add_test(NAME flowx_mjpeg COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/flowx_mjpeg_test.py" "$<TARGET_FILE:flowx_receiver>"
                 "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")

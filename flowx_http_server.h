@@ -4,6 +4,7 @@
 #include "flowx_frame_store.h"
 #include "flowx_raw_store.h"
 #include "flowx_receiver_status.h"
+#include "flowx_mjpeg_controls.h"
 
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ public:
                const FrameStore& frames,
                const RawFrameStore& raw_frames,
                const ReceiverStatusStore& status,
+               MjpegControls& controls,
                std::string& error,
                const PlaybackConfig& playback = {});
     void stop();

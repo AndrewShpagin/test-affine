@@ -28,7 +28,7 @@ def wait_for(fn, timeout=5):
         time.sleep(.01)
 
 
-def run(receiver, fixture, mode, playback=None, jitter=None):
+def run(receiver, fixture, mode, playback=None, jitter=None, live=False):
     udp_port, http_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     config = {'udp': {'bind': '127.0.0.1', 'port': udp_port},
               'http': {'bind': '127.0.0.1', 'port': http_port, 'jpeg_quality': 85},
@@ -45,10 +45,10 @@ def run(receiver, fixture, mode, playback=None, jitter=None):
         path.write_text(json.dumps(config))
         with (Path(temp) / 'receiver.log').open('w+') as log:
             process = subprocess.Popen([receiver, str(path)], stdout=log, stderr=log)
-            def request(path):
+            def request(path, method='GET', body=None):
                 conn = http.client.HTTPConnection('127.0.0.1', http_port, timeout=3)
                 try:
-                    conn.request('GET', path)
+                    conn.request(method, path, body, {'Content-Type': 'application/json'} if body is not None else {})
                     response = conn.getresponse()
                     return response.status, response.read()
                 finally:
@@ -115,6 +115,107 @@ def run(receiver, fixture, mode, playback=None, jitter=None):
                 assert defaults.startswith(b'globalThis.FLOWX_PLAYBACK_DEFAULTS=')
                 assert json.loads(defaults.split(b'=', 1)[1].rstrip(b';')) == expected_playback
                 assert request('/frame.jpg')[0] == 503
+                if live:
+                    def controls():
+                        code, body = request('/decoder.json')
+                        assert code == 200
+                        return json.loads(body)
+
+                    def change(patch=None, path='/decoder.json', method='POST'):
+                        code, body = request(path, method, json.dumps(patch) if patch is not None else None)
+                        assert code == 200, body
+                        result = json.loads(body)
+                        wait_for(lambda: controls()['applied_revision'] >= result['revision'])
+                        return controls()
+
+                    initial = controls()
+                    assert initial['fill_gaps'] and initial['smooth_fill']
+                    assert initial['revision'] == initial['applied_revision'] == 0
+                    page = request('/mjpg.html')
+                    assert page[0] == 200 and b'/decoder.json' in page[1] and b'<img' in page[1]
+                    original_browser = request('/flowx.js')[1]
+
+                    # Settings take effect before any data and keep the smoothing preference.
+                    off = change({'fill_gaps': False})
+                    assert not off['fill_gaps'] and off['smooth_fill'] and not off['smooth_fill_active']
+                    assert status()['frame'] is None
+                    references = {m: [s for s in fixture['concealment'] if s['mode'] == m][1]
+                                  for m in ('raw', 'nearest', 'smooth')}
+                    for i in references['raw']['indices']:
+                        region(i)
+                    drained(); wait_for(lambda: frame_is(100))
+                    assert request('/frame.jpg')[1] == bytes(references['raw']['jpeg'])
+                    count = status()['decode']['frames']
+
+                    # Keep one real MJPEG connection open across all setting changes.
+                    connection = http.client.HTTPConnection('127.0.0.1', http_port, timeout=4)
+                    try:
+                        connection.request('GET', '/stream.mjpg')
+                        stream = connection.getresponse()
+                        assert stream.status == 200
+
+                        def next_jpeg():
+                            while True:
+                                line = stream.readline()
+                                assert line, 'MJPEG connection closed during live update'
+                                if line.strip() == b'--flowxframe':
+                                    break
+                            headers = {}
+                            while True:
+                                line = stream.readline().strip()
+                                if not line:
+                                    break
+                                key, value = line.split(b':', 1)
+                                headers[key.lower()] = value.strip()
+                            return headers, stream.read(int(headers[b'content-length']))
+
+                        assert next_jpeg()[1] == bytes(references['raw']['jpeg'])
+                        for target in ('nearest', 'smooth', 'raw', 'smooth'):
+                            before = status()['frame']
+                            change({'fill_gaps': target != 'raw', 'smooth_fill': target == 'smooth'})
+                            after = status()['frame']
+                            assert after['frame_id'] == before['frame_id'] == 100
+                            assert after['sequence'] > before['sequence']
+                            assert status()['decode']['frames'] == count, 'redraw counted as a new video frame'
+                            wanted = bytes(references[target]['jpeg'])
+                            assert request('/frame.jpg')[1] == wanted, 'live concealment/cache mismatch'
+                            headers, jpeg = next_jpeg()
+                            assert headers[b'x-flowx-frame-id'] == b'100' and jpeg == wanted
+                    finally:
+                        connection.close()
+
+                    # A no-op does not redraw. Reject the whole request on any bad field.
+                    before = status()['frame']['sequence']; same = controls()
+                    change({'fill_gaps': True})
+                    assert controls()['revision'] == same['revision']
+                    assert status()['frame']['sequence'] == before
+                    for body in ('broken', '[]', '{"fill_gaps":0}', '{"smooth_fill":"false"}',
+                                 '{"fill_gaps":false,"unknown":true}'):
+                        assert request('/decoder.json', 'POST', body)[0] == 400
+                        assert controls() == same
+                    for path in ('/setparam/fill_gaps/maybe', '/setparam/fill_gaps',
+                                 '/setparam/fill_gaps/false/unknown/true'):
+                        assert request(path)[0] == 400
+                        assert controls() == same
+                    change(path='/setparam/fill_gaps/0/smooth_fill/1', method='GET')
+                    assert not controls()['fill_gaps'] and controls()['smooth_fill']
+                    change({'fill_gaps': True}, method='PUT')
+                    assert controls()['smooth_fill_active']
+                    assert status()['decoder'] == controls()
+                    assert request('/flowx.js')[1] == original_browser, 'native controls changed browser defaults'
+
+                    # Redrawing a PATCH keeps its ID; restarting the stream keeps live options.
+                    patch(101, 100); wait_for(lambda: frame_is(101))
+                    change({'fill_gaps': False})
+                    assert frame_is(101) and status()['frame']['keyframe_id'] == 100
+                    assert request('/frame.jpg')[1] == bytes(references['raw']['jpeg'])
+                    region(0, 1, 8); wait_for(lambda: frame_is(1, 8))
+                    raw_first = next(s for s in fixture['concealment'] if s['mode'] == 'raw')
+                    assert request('/frame.jpg')[1] == bytes(raw_first['jpeg'])
+                    assert not controls()['fill_gaps']
+                    print(f"PASS: live MJPEG controls, shuffle={bool(fixture['tile_map'])}, "
+                          'idle redraw, persistent stream, validation, PATCH IDs, stream reset')
+                    return
                 if jitter is not None:
                     begin = time.monotonic()
                     region(0)
@@ -256,6 +357,7 @@ if __name__ == '__main__':
     receiver = str(Path(sys.argv[1]).resolve())
     for mode in ('raw', 'nearest', 'smooth'):
         run(receiver, fixture, mode)
+    run(receiver, fixture, 'smooth', live=True)
     for playback in ({'keyframe_wait_ms': 0, 'playout_ms': 0}, {'keyframe_wait_ms': 300, 'playout_ms': 120}):
         run(receiver, fixture, 'smooth', playback)
     for jitter in ({'jitter_min_ms':80,'jitter_max_ms':80,'jitter_seed':1},

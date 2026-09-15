@@ -75,6 +75,8 @@ int main(int argc, char** argv) {
 
     try {
         const flowx::ReceiverConfig cfg = flowx::loadReceiverConfig(config_file);
+        flowx::MjpegControls mjpeg_controls(cfg.decoder.fill_gaps, cfg.decoder.smooth_fill);
+        auto applied_options = mjpeg_controls.snapshot();
 
         flowx::UdpReceiver udp;
         std::string error;
@@ -87,6 +89,7 @@ int main(int argc, char** argv) {
         std::vector<flowx::u_char> current_jpeg;
         flowx::FrameStore frame_store;
         flowx::RawFrameStore raw_frame_store;
+        std::vector<flowx::PatchData> displayed_patch;
 
         std::uint32_t active_stream_id = 0;
         std::unordered_set<std::uint32_t> retired_streams;
@@ -107,8 +110,9 @@ int main(int argc, char** argv) {
 
         auto clearDecoderState = [&] {
             decoder = std::make_unique<flowx::Decoder>();
-            decoder->setRestartFillOptions(cfg.decoder.fill_gaps, cfg.decoder.smooth_fill);
-            decoder->setReusePreviousFrameBorders(cfg.decoder.fill_gaps);
+            decoder->setRestartFillOptions(applied_options.fill_gaps, applied_options.smooth_fill);
+            decoder->setReusePreviousFrameBorders(applied_options.fill_gaps);
+            displayed_patch.clear();
             current_jpeg.clear();
             frame_arrivals.clear();
             frame_arrival_order.clear();
@@ -200,13 +204,14 @@ int main(int argc, char** argv) {
             published.receive_timestamp_us = arrival.receive_timestamp_us;
             published.keyframe = true;
             frame_store.publish(std::move(image), published);
+            displayed_patch.clear();
             last_published_frame_id = frame_id;
             have_published_frame = true;
             ++decoded_frames; ++decoded_keyframes;
         };
 
         flowx::HttpServer http_server;
-        if (!http_server.start(cfg.http, frame_store, raw_frame_store, status_store, error, cfg.playback))
+        if (!http_server.start(cfg.http, frame_store, raw_frame_store, status_store, mjpeg_controls, error, cfg.playback))
             throw std::runtime_error("HTTP server start failed: " + error);
 
         std::cout << "FlowX receiver\n"
@@ -218,6 +223,7 @@ int main(int argc, char** argv) {
                   << " @ " << cfg.http.stream_fps << " fps\n"
                   << "  status: " << cfg.http.status_endpoint << '\n'
                   << "  browser: /flowx.html  raw: /flowx.bin\n"
+                  << "  MJPEG controls: /mjpg.html  API: /decoder.json\n"
                   << "  HTTP JPEG quality: " << cfg.http.jpeg_quality << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n"
@@ -238,6 +244,24 @@ int main(int argc, char** argv) {
         bool fatal_error = false;
 
         while (!g_stop.load(std::memory_order_relaxed)) {
+            const auto options = mjpeg_controls.snapshot();
+            if (options.revision != applied_options.revision) {
+                decoder->setRestartFillOptions(options.fill_gaps, options.smooth_fill);
+                decoder->setReusePreviousFrameBorders(options.fill_gaps);
+                applied_options = options;
+                // Redraw the displayed frame without consuming UDP or replaying
+                // a keyframe over a newer PATCH. A pending replacement key keeps
+                // its assembly deadline and the previous display until ready.
+                const auto latest = frame_store.latest();
+                if (latest && !pending_restart_key &&
+                    latest->metadata.stream_id == active_stream_id &&
+                    latest->metadata.keyframe_id == decoder->keyframeId()) {
+                    cv::Mat image;
+                    decoder->render(image, displayed_patch, current_jpeg);
+                    if (!image.empty()) frame_store.publish(std::move(image), latest->metadata);
+                }
+                mjpeg_controls.applied(options.revision);
+            }
             // Check even under continuous packet traffic. The first accepted
             // packet fixes the deadline; subsequent regions cannot extend it.
             if (pending_restart_key && std::chrono::steady_clock::now() >= key_wait_deadline) {
@@ -358,6 +382,7 @@ int main(int argc, char** argv) {
                 published.receive_timestamp_us = arrival.receive_timestamp_us;
                 published.keyframe = false;
                 frame_store.publish(std::move(image), published);
+                displayed_patch = patch;
                 last_published_frame_id = last.frame_id;
                 have_published_frame = true;
                 ++decoded_frames;

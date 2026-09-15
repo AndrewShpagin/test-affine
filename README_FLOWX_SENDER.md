@@ -121,6 +121,18 @@ Each datagram has an independent 10% drop probability in this example. The seed 
 
 `--loss` is accepted as a short alias for `--loss-percent`.
 
+## JPEG datagram statistics
+
+The periodic console report (every two seconds while encoding) and final report
+include, for example, `jpeg-chunks=320 jpeg-chunk-avg=1158.4B`.
+These are the cumulative JPEG chunk count and mean complete UDP payload size
+since sender startup. They include FlowX v4 headers and JPEG data, and exclude
+IP/UDP headers, PATCH packets, layer-end markers, and JPEG 2000 chunks.
+Both restart-region and classic JPEG chunk packets count. Measurement happens
+before simulated loss and socket sends, so deliberately dropped packets and
+send failures do not bias the codec size statistic. Before the first JPEG chunk,
+the count and average are zero.
+
 ## Build dependencies
 
 Besides OpenCV and nlohmann-json, the sender uses cpp-httplib and threads. On Debian/Raspberry Pi OS the development package is `libcpp-httplib-dev`.
