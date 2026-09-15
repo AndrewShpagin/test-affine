@@ -2,8 +2,8 @@
   "udp": {
     "bind": "0.0.0.0",
     "port": 5000,
-    "jitter_min_ms": 0,
-    "jitter_max_ms": 0,
+    "jitter_min_ms": 5,
+    "jitter_max_ms": 40,
     "jitter_seed": 1
   },
   "decoder": {
@@ -11,8 +11,8 @@
     "smooth_fill": true
   },
   "playback": {
-    "keyframe_wait_ms": 30,
-    "playout_ms": 40
+    "keyframe_wait_ms": 40,
+    "playout_ms": 50
   },
   "http": {
     "bind": "0.0.0.0",
