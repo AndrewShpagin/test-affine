@@ -46,8 +46,9 @@ jobs:
         id: image
         run: '"version=$env:ImageVersion" >> $env:GITHUB_OUTPUT'
 
-      - name: Cache compiled dependencies
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+      - name: Restore compiled dependencies
+        id: vcpkg-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: .vcpkg-cache
           key: windows-receiver-v1-${{ steps.image.outputs.version }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('.github/workflows/windows-receiver.yml') }}
@@ -64,6 +65,14 @@ jobs:
             'opencv4[core,calib3d,fs,intrinsics,jpeg,openjpeg,png,thread]' `
             libjpeg-turbo nlohmann-json cpp-httplib
           if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+
+      # Save before compilation/tests, so later failures do not discard OpenCV.
+      - name: Save compiled dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Configure MSVC
         run: |
