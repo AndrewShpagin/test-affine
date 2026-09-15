@@ -1,4 +1,4 @@
-name: Windows receiver
+name: Windows sender and receiver
 
 on:
   push:
@@ -84,21 +84,21 @@ jobs:
             "-DPython3_EXECUTABLE=$((Get-Command python).Source)"
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
-      - name: Build receiver and regression tests
+      - name: Build sender, receiver, and regression tests
         run: |
           cmake --build build-win --config Release --parallel 4 --target `
-            flowx_receiver flowx_protocol_test jpeg_restart_test `
+            flowx_sender flowx_receiver flowx_protocol_test jpeg_restart_test `
             jpeg_restart_fill_test flowx_packet_jitter_test
           if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
       - name: Test native and browser decoding
         run: ctest --test-dir build-win -C Release --output-on-failure --no-tests=error
 
-      - name: Assemble portable receiver
+      - name: Assemble portable sender and receiver
         run: |
-          cmake --install build-win --config Release --prefix dist/flowx-receiver-windows-x64
+          cmake --install build-win --config Release --prefix dist/flowx-windows-x64
           if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
-          $package = 'dist/flowx-receiver-windows-x64'
+          $package = 'dist/flowx-windows-x64'
           $share = "$env:VCPKG_ROOT/installed/x64-windows/share"
           Get-ChildItem $share -Directory | ForEach-Object {
             $copyright = Join-Path $_.FullName 'copyright'
@@ -111,21 +111,24 @@ jobs:
           @("Commit: $env:GITHUB_SHA", "vcpkg: $env:VCPKG_COMMIT", "Runner: $env:ImageVersion") |
             Set-Content "$package/build-info.txt"
 
-      - name: Test packaged executable
+      - name: Test packaged executables
         run: |
           # Do not let PATH hide DLLs missing from the download.
           $env:PATH = ($env:PATH -split ';' | Where-Object {
             $_ -notmatch 'vcpkg|build-win'
           }) -join ';'
-          $receiver = (Resolve-Path 'dist/flowx-receiver-windows-x64/flowx_receiver.exe').Path
+          $receiver = (Resolve-Path 'dist/flowx-windows-x64/flowx_receiver.exe').Path
+          $sender = (Resolve-Path 'dist/flowx-windows-x64/flowx_sender.exe').Path
           python flowx_mjpeg_test.py $receiver build-win/restart-fixtures.json
           if ($LASTEXITCODE -ne 0) { throw "Packaged receiver regression failed" }
+          python flowx_http_pipeline_test.py $sender $receiver
+          if ($LASTEXITCODE -ne 0) { throw "Packaged HTTP-to-UDP pipeline failed" }
 
-      - name: Upload Windows receiver
+      - name: Upload Windows sender and receiver
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: flowx-receiver-windows-x64
-          path: dist/flowx-receiver-windows-x64/
+          name: flowx-windows-x64
+          path: dist/flowx-windows-x64/
           if-no-files-found: error
           retention-days: 30
 

@@ -178,14 +178,16 @@ foreach(target affine_test mesh_test keyframe_test codec_test flowx_protocol_tes
 endforeach()
 
 # vcpkg copies dependent DLLs beside the executable during the build. Include
-# those and the MSVC runtime in a receiver-only, relocatable Windows package.
+# those and the MSVC runtime in a relocatable Windows sender/receiver package.
 if(WIN32)
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ".")
     include(InstallRequiredSystemLibraries)
-    install(TARGETS flowx_receiver RUNTIME DESTINATION ".")
+    install(TARGETS flowx_receiver flowx_sender RUNTIME DESTINATION ".")
     install(DIRECTORY "${CMAKE_BINARY_DIR}/bin/" DESTINATION "."
         FILES_MATCHING PATTERN "*.dll")
-    install(FILES config/flowx_receiver.json DESTINATION config)
-    install(FILES packaging/windows/run-receiver.cmd DESTINATION ".")
+    install(FILES config/flowx_receiver.json config/flowx_sender_windows.json
+        DESTINATION config)
+    install(FILES packaging/windows/run-receiver.cmd packaging/windows/run-sender.cmd
+        DESTINATION ".")
     install(FILES README_WINDOWS.md DESTINATION "." RENAME README.md)
 endif()

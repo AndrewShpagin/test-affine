@@ -10,6 +10,9 @@
 
 Example configs are in `config/flowx_sender.json`, `config/flowx_sender_folder.json`, and `config/flowx_sender_http.json`.
 
+For both programs on Windows with a Raspberry Pi HTTP image source, use the
+portable [Windows package](README_WINDOWS.md) and `config/flowx_sender_windows.json`.
+
 ## Grayscale encoding
 
 Set `codec.grayscale=true` to convert every source frame to one-channel grayscale immediately before FlowX encoding:
