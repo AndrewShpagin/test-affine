@@ -2,6 +2,9 @@
 
 `flowx_receiver` receives compact FlowX v4 UDP datagrams. The transport adapter reconstructs the internal AFC1 representation for the existing C++ decoder, while the browser path parses v4 directly.
 
+For a downloadable Windows x64 build, GitHub Actions, and Visual Studio 2022
+instructions, see [Windows receiver](README_WINDOWS.md).
+
 ## HTTP endpoints
 
 The default receiver config listens on HTTP port 8080 and exposes:
@@ -55,10 +58,57 @@ blend narrow black lines, so `/flowx.html?fill_gaps=0` remains the direct view o
 missing samples without another JPEG compression step.
 
 These settings apply to `/frame.jpg`, `/stream.mjpg`, and `--dump-last` for all
-clients; restart the receiver after editing the config. The browser's checkboxes
+clients; restart the receiver after editing the config, or use the live controls
+below. The browser's checkboxes
 and URL options control `/flowx.html` independently. MJPEG retains its existing
 latest-frame publication and `http.stream_fps` limit; it does not use the browser's
 capture-time playout queue.
+
+## Live MJPEG filling controls
+
+Open **http://127.0.0.1:8002/mjpg.html** (use your configured HTTP port).
+The page shows the MJPEG stream and checkboxes for **Fill missing pixels** and
+**Smooth filled pixels**. Changes apply globally to all native JPEG/MJPEG clients;
+the direct `/flowx.html` decoder keeps its independent controls.
+
+| Endpoint | Method | Behavior |
+| --- | --- | --- |
+| `/mjpg.html` | GET | Interactive MJPEG preview and controls. |
+| `/decoder.json` | GET | Current requested settings, effective smoothing flag, and revision acknowledgement. |
+| `/decoder.json` | POST or PUT | Merge boolean `fill_gaps` and/or `smooth_fill` fields. |
+| `/setparam/fill_gaps/0` | GET | Disable all gap filling, including odd/even copying and PATCH border reuse. |
+| `/setparam/fill_gaps/1` | GET | Enable filling. |
+| `/setparam/smooth_fill/0` | GET | Disable smoothing; filling uses nearest neighbours if enabled. |
+| `/setparam/smooth_fill/1` | GET | Enable smoothing while filling is enabled. |
+
+Path values also accept `true`/`false`, and multiple pairs can be updated together,
+for example `/setparam/fill_gaps/1/smooth_fill/0`.
+
+```bash
+curl -X POST http://127.0.0.1:8002/decoder.json \
+  -H 'Content-Type: application/json' \
+  -d '{"fill_gaps":true,"smooth_fill":false}'
+```
+
+JSON accepts booleans only. Unknown fields, malformed JSON, or invalid values
+return HTTP 400 without changing either setting. Partial requests merge atomically.
+Turning filling off preserves the smoothing preference; `smooth_fill_active`
+reports whether both are enabled. `/status.json` also includes this `decoder` state.
+
+The receive thread applies a changed revision at its next iteration (normally
+within the 250 ms idle receive timeout, plus processing time). If the displayed
+frame still has the active keyframe reference, it is redrawn immediately, even
+without another UDP packet. Its frame ID/timestamps remain the same, the image
+sequence advances to invalidate the JPEG cache, and open MJPEG connections receive
+the new image. A redraw does not increment the decoded video-frame counters.
+Old border-reuse pixels are discarded on a setting change.
+
+If a replacement keyframe is still assembling, the previous display stays visible
+until normal keyframe release; controls do not bypass or extend that deadline.
+`revision == applied_revision` means the decoder has accepted the options. With a
+pending replacement or no frame yet, their visible effect waits for publication.
+Live settings survive stream changes but are not written to the config file.
+Restarting restores the configured defaults.
 
 ## Playback timing settings
 

@@ -1,0 +1,145 @@
+name: Windows sender and receiver
+
+on:
+  push:
+    branches: [main, JPEG-RESTART-ASSEMBLY]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-receiver-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Update this deliberately to upgrade the compiler-independent dependencies.
+      VCPKG_COMMIT: 9e44ec0e9f247d77c230ced0ee66c76296837807
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite
+      VCPKG_MAX_CONCURRENCY: 4
+
+    steps:
+      - name: Check out FlowX
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check out pinned vcpkg
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: .vcpkg
+          persist-credentials: false
+
+      - name: Identify runner image
+        id: image
+        run: '"version=$env:ImageVersion" >> $env:GITHUB_OUTPUT'
+
+      - name: Restore compiled dependencies
+        id: vcpkg-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .vcpkg-cache
+          key: windows-receiver-v1-${{ steps.image.outputs.version }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('.github/workflows/windows-receiver.yml') }}
+          restore-keys: |
+            windows-receiver-v1-${{ steps.image.outputs.version }}-${{ env.VCPKG_COMMIT }}-
+            windows-receiver-v1-
+
+      - name: Install dependencies
+        run: |
+          New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows `
+            'opencv4[core,calib3d,fs,intrinsics,jpeg,openjpeg,png,thread]' `
+            libjpeg-turbo nlohmann-json cpp-httplib
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+
+      # Save before compilation/tests, so later failures do not discard OpenCV.
+      - name: Save compiled dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Configure MSVC
+        run: |
+          cmake -S . -B build-win -G 'Visual Studio 17 2022' -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_APPLOCAL_DEPS=ON `
+            -DBUILD_TESTING=ON `
+            "-DFLOWX_NODE_EXECUTABLE=$((Get-Command node).Source)" `
+            "-DPython3_EXECUTABLE=$((Get-Command python).Source)"
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+
+      - name: Build sender, receiver, and regression tests
+        run: |
+          cmake --build build-win --config Release --parallel 4 --target `
+            flowx_sender flowx_receiver flowx_protocol_test jpeg_restart_test `
+            jpeg_restart_fill_test flowx_packet_jitter_test
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+      - name: Test native and browser decoding
+        run: ctest --test-dir build-win -C Release --output-on-failure --no-tests=error
+
+      - name: Assemble portable sender and receiver
+        run: |
+          cmake --install build-win --config Release --prefix dist/flowx-windows-x64
+          if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
+          $package = 'dist/flowx-windows-x64'
+          $share = "$env:VCPKG_ROOT/installed/x64-windows/share"
+          Get-ChildItem $share -Directory | ForEach-Object {
+            $copyright = Join-Path $_.FullName 'copyright'
+            if (Test-Path $copyright) {
+              $target = Join-Path "$package/licenses" $_.Name
+              New-Item -ItemType Directory -Force $target | Out-Null
+              Copy-Item $copyright "$target/copyright.txt"
+            }
+          }
+          @("Commit: $env:GITHUB_SHA", "vcpkg: $env:VCPKG_COMMIT", "Runner: $env:ImageVersion") |
+            Set-Content "$package/build-info.txt"
+
+      - name: Test packaged executables
+        run: |
+          # Do not let PATH hide DLLs missing from the download.
+          $env:PATH = ($env:PATH -split ';' | Where-Object {
+            $_ -notmatch 'vcpkg|build-win'
+          }) -join ';'
+          $receiver = (Resolve-Path 'dist/flowx-windows-x64/flowx_receiver.exe').Path
+          $sender = (Resolve-Path 'dist/flowx-windows-x64/flowx_sender.exe').Path
+          python flowx_mjpeg_test.py $receiver build-win/restart-fixtures.json
+          if ($LASTEXITCODE -ne 0) { throw "Packaged receiver regression failed" }
+          python flowx_http_pipeline_test.py $sender $receiver
+          if ($LASTEXITCODE -ne 0) { throw "Packaged HTTP-to-UDP pipeline failed" }
+
+      - name: Upload Windows sender and receiver
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: flowx-windows-x64
+          path: dist/flowx-windows-x64/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-receiver-build-logs
+          path: |
+            build-win/Testing/Temporary/
+            build-win/CMakeFiles/CMakeConfigureLog.yaml
+            .vcpkg/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7

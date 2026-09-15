@@ -2,6 +2,7 @@
 
 #include "flowx_browser_assets.h"
 #include "flowx_protocol.h"
+#include "flowx_mjpeg_control_page.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -28,6 +29,8 @@ constexpr const char* kMjpegBoundary = "flowxframe";
 constexpr const char* kBrowserPageEndpoint = "/flowx.html";
 constexpr const char* kBrowserScriptEndpoint = "/flowx.js";
 constexpr const char* kBrowserStreamEndpoint = "/flowx.bin";
+constexpr const char* kDecoderEndpoint = "/decoder.json";
+constexpr const char* kMjpegControlEndpoint = "/mjpg.html";
 constexpr std::uint32_t kBrowserRecordMagic = 0x31425846u; // little-endian "FXB1"
 constexpr std::uint16_t kBrowserRecordVersion = 1;
 constexpr std::uint16_t kBrowserRecordHeaderBytes = 28;
@@ -97,6 +100,7 @@ struct HttpServer::Impl {
     const FrameStore* frames = nullptr;
     const RawFrameStore* raw_frames = nullptr;
     const ReceiverStatusStore* status = nullptr;
+    MjpegControls* controls = nullptr;
 
     httplib::Server server;
     std::thread server_thread;
@@ -135,6 +139,32 @@ struct HttpServer::Impl {
         return true;
     }
 
+    json optionsJson(const MjpegOptions& options) const {
+        return {{"fill_gaps", options.fill_gaps}, {"smooth_fill", options.smooth_fill},
+                {"smooth_fill_active", options.fill_gaps && options.smooth_fill},
+                {"revision", options.revision}, {"applied_revision", options.applied_revision},
+                {"frame_endpoint", config.frame_endpoint}, {"stream_endpoint", config.stream_endpoint}};
+    }
+
+    void updateOptions(const json& patch, httplib::Response& res) {
+        std::optional<bool> fill, smooth;
+        if (!patch.is_object()) {
+            res.status = 400;
+            res.set_content(json{{"error", "expected a JSON object"}}.dump(), "application/json");
+            return;
+        }
+        for (const auto& item : patch.items()) {
+            if ((item.key() != "fill_gaps" && item.key() != "smooth_fill") || !item.value().is_boolean()) {
+                res.status = 400;
+                res.set_content(json{{"error", "only boolean fill_gaps and smooth_fill are accepted"}}.dump(), "application/json");
+                return;
+            }
+            (item.key() == "fill_gaps" ? fill : smooth) = item.value().get<bool>();
+        }
+        // Merge and store under one lock; concurrent partial requests compose.
+        res.set_content(optionsJson(controls->update(fill, smooth)).dump(2), "application/json");
+    }
+
     std::string statusJson() const {
         const ReceiverStatus s = status->snapshot();
         const auto latest = frames->latest();
@@ -143,6 +173,7 @@ struct HttpServer::Impl {
         json root;
         root["flowx_version"] = kProtocolVersion;
         root["active_stream_id"] = s.active_stream_id;
+        root["decoder"] = optionsJson(controls->snapshot());
         root["playback"] = {{"keyframe_wait_ms", playback.keyframe_wait_ms}, {"playout_ms", playback.playout_ms}};
         root["uptime_ms"] = s.started_timestamp_us > 0 && now_us >= s.started_timestamp_us
             ? static_cast<double>(now_us - s.started_timestamp_us) / 1000.0
@@ -171,6 +202,7 @@ struct HttpServer::Impl {
             {"frame_endpoint", config.frame_endpoint}, {"stream_endpoint", config.stream_endpoint},
             {"status_endpoint", config.status_endpoint},
             {"browser_page", kBrowserPageEndpoint}, {"browser_stream", kBrowserStreamEndpoint},
+            {"mjpeg_controls", kMjpegControlEndpoint}, {"decoder_endpoint", kDecoderEndpoint},
             {"browser_records", browser_records.load(std::memory_order_relaxed)},
             {"browser_bytes", browser_bytes.load(std::memory_order_relaxed)}
         };
@@ -195,6 +227,43 @@ struct HttpServer::Impl {
     }
 
     void registerRoutes() {
+        server.Get(kMjpegControlEndpoint, [](const httplib::Request&, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            res.set_content(kMjpegControlPage, "text/html; charset=utf-8");
+        });
+        server.Get(kDecoderEndpoint, [this](const httplib::Request&, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            res.set_content(optionsJson(controls->snapshot()).dump(2), "application/json");
+        });
+        const auto update = [this](const httplib::Request& req, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            const auto patch = json::parse(req.body, nullptr, false);
+            updateOptions(patch, res);
+        };
+        server.Post(kDecoderEndpoint, update);
+        server.Put(kDecoderEndpoint, update);
+        server.Get(R"(/setparam/(.*))", [this](const httplib::Request& req, httplib::Response& res) {
+            addNoCacheHeaders(res);
+            std::istringstream path(req.matches[1].str());
+            std::string name, value;
+            json patch = json::object();
+            while (std::getline(path, name, '/')) {
+                if (name.empty() || !std::getline(path, value, '/') ||
+                    (value != "0" && value != "1" && value != "false" && value != "true") ||
+                    patch.contains(name)) {
+                    res.status = 400;
+                    res.set_content(json{{"error", "expected unique name/boolean pairs"}}.dump(), "application/json");
+                    return;
+                }
+                patch[name] = value == "1" || value == "true";
+            }
+            if (patch.empty()) {
+                res.status = 400;
+                res.set_content(json{{"error", "expected name/boolean pairs"}}.dump(), "application/json");
+                return;
+            }
+            updateOptions(patch, res);
+        });
         server.Get(config.frame_endpoint, [this](const httplib::Request&, httplib::Response& res) {
             addNoCacheHeaders(res);
             const auto frame = frames->latest();
@@ -300,6 +369,7 @@ bool HttpServer::start(const HttpConfig& config,
                        const FrameStore& frames,
                        const RawFrameStore& raw_frames,
                        const ReceiverStatusStore& status,
+                       MjpegControls& controls,
                        std::string& error,
                        const PlaybackConfig& playback) {
     error.clear();
@@ -312,8 +382,13 @@ bool HttpServer::start(const HttpConfig& config,
     }
     const std::vector<std::string> endpoints{
         config.frame_endpoint, config.stream_endpoint, config.status_endpoint,
-        kBrowserPageEndpoint, kBrowserScriptEndpoint, kBrowserStreamEndpoint
+        kBrowserPageEndpoint, kBrowserScriptEndpoint, kBrowserStreamEndpoint,
+        kDecoderEndpoint, kMjpegControlEndpoint
     };
+    for (const auto& endpoint : endpoints)
+        if (endpoint == "/setparam" || endpoint.rfind("/setparam/", 0) == 0) {
+            error = "HTTP endpoint paths must not use the reserved /setparam prefix"; return false;
+        }
     for (std::size_t i = 0; i < endpoints.size(); ++i)
         for (std::size_t j = i + 1; j < endpoints.size(); ++j)
             if (endpoints[i] == endpoints[j]) { error = "HTTP endpoint paths must be unique"; return false; }
@@ -323,6 +398,7 @@ bool HttpServer::start(const HttpConfig& config,
     impl_->frames = &frames;
     impl_->raw_frames = &raw_frames;
     impl_->status = &status;
+    impl_->controls = &controls;
     impl_->stopping.store(false, std::memory_order_relaxed);
     impl_->registerRoutes();
 

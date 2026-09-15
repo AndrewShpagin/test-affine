@@ -16,9 +16,11 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <iomanip>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -211,6 +213,15 @@ int main(int argc, char** argv) {
         std::uint64_t simulated_lost_bytes = 0;
         std::uint64_t failed_packets = 0;
         std::uint64_t failed_bytes = 0;
+        std::uint64_t jpeg_chunk_datagrams = 0, jpeg_chunk_bytes = 0;
+        const auto jpegStats = [&] {
+            std::ostringstream text;
+            text << " jpeg-chunks=" << jpeg_chunk_datagrams
+                 << " jpeg-chunk-avg=" << std::fixed << std::setprecision(1)
+                 << (jpeg_chunk_datagrams ? double(jpeg_chunk_bytes) / jpeg_chunk_datagrams : 0.0)
+                 << "B";
+            return text.str();
+        };
         std::string last_udp_error;
         auto last_udp_error_time = std::chrono::steady_clock::time_point{};
         auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -266,6 +277,16 @@ int main(int argc, char** argv) {
                     break;
                 }
 
+                // Count JPEG key data before loss simulation/send failures. The
+                // size includes FlowX framing, but not IP/UDP headers or PATCHes.
+                const auto type = static_cast<flowx::WirePacketType>(datagram[2] & 0x0f);
+                if (type == flowx::WirePacketType::JpegRestartRegion ||
+                    (type == flowx::WirePacketType::KeyframeChunk &&
+                     codec.keyframe_codec == flowx::KeyframeCodec::Jpeg)) {
+                    ++jpeg_chunk_datagrams;
+                    jpeg_chunk_bytes += datagram.size();
+                }
+
                 // Drop after the final FlowX v4 datagram has been built, immediately before
                 // the socket send. This simulates loss of complete UDP datagrams and
                 // therefore exercises the same recovery path as real network loss.
@@ -305,7 +326,7 @@ int main(int argc, char** argv) {
                           << " packets=" << sent_packets
                           << " sim-loss=" << simulated_lost_packets
                           << " failed=" << failed_packets
-                          << " bytes=" << sent_bytes << '\n';
+                          << " bytes=" << sent_bytes << jpegStats() << std::endl;
                 next_report = now + std::chrono::seconds(2);
             }
         }
@@ -325,7 +346,7 @@ int main(int argc, char** argv) {
             std::cout << " sim-loss-bytes=" << simulated_lost_bytes;
         if (failed_bytes > 0)
             std::cout << " failed-bytes=" << failed_bytes;
-        std::cout << '\n';
+        std::cout << jpegStats() << '\n';
         return fatal_error ? 1 : 0;
     } catch (const std::exception& e) {
         std::cerr << "flowx_sender: " << e.what() << '\n';

@@ -1,0 +1,30 @@
+{
+  "source": {
+    "type": "http",
+    "url": "http://192.168.2.140:8081/current.jpg",
+    "fps": 20,
+    "timeout_ms": 500
+  },
+  "codec": {
+    "keyframe_bytes": 40000,
+    "keyframe_period": 5,
+    "keyframe_codec": "jpeg",
+    "grayscale": true,
+    "strips": true,
+    "jpeg_tile_shuffle": true,
+    "homography": true,
+    "mesh": true,
+    "mesh_grid_x": 6,
+    "mesh_grid_y": 6
+  },
+  "udp": {
+    "host": "127.0.0.1",
+    "port": 5000
+  },
+  "control": {
+    "enabled": true,
+    "bind": "127.0.0.1",
+    "port": 8090,
+    "codec_endpoint": "/codec.json"
+  }
+}

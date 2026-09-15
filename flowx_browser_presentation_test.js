@@ -60,8 +60,10 @@ function harness(delayMs=0,extraQuery='',defaults={}) {
       assert.ok(rgba,'unexpected JPEG bytes');assert.equal(rgba.length,width*height*4);return rgba;
     }
   });
-  const hook='\nreconnectLoop();\n';
-  assert.ok(source.includes(hook));
+  // The native fixture exporter uses text mode, which emits CRLF on Windows.
+  // Match either spelling without changing the browser source under test.
+  const hook=/\r?\nreconnectLoop\(\);\r?\n/;
+  assert.match(source,hook,'browser reconnect hook missing');
   vm.runInContext(source.replace(hook,`
 decodeRegion=globalThis.fixtureDecode;
 globalThis.testBrowser={processDatagram,stats,filterProgram:smoothFillProg,state:()=>({
