@@ -1,0 +1,1 @@
+./build/bin/flowx_sender ./config/flowx_sender_folder.json --loss-percent 40

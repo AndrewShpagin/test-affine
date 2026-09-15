@@ -1,0 +1,1 @@
+ ./build/bin/flowx_receiver ./config/flowx_receiver.json
