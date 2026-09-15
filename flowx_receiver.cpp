@@ -9,6 +9,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -81,7 +82,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("UDP open failed: " + error);
 
         auto decoder = std::make_unique<flowx::Decoder>();
-        decoder->setReusePreviousFrameBorders(true);
+        decoder->setRestartFillOptions(cfg.decoder.fill_gaps, cfg.decoder.smooth_fill);
+        decoder->setReusePreviousFrameBorders(cfg.decoder.fill_gaps);
         std::vector<flowx::u_char> current_jpeg;
         flowx::FrameStore frame_store;
         flowx::RawFrameStore raw_frame_store;
@@ -97,15 +99,22 @@ int main(int argc, char** argv) {
 
         bool have_published_frame = false;
         std::uint32_t last_published_frame_id = 0;
+        bool pending_restart_key = false;
+        flowx::PacketMetadata pending_key_metadata;
+        std::uint64_t pending_key_receive_us = 0;
+        auto key_wait_deadline = std::chrono::steady_clock::time_point{};
+        constexpr auto key_quiet_wait = std::chrono::milliseconds(100);
 
         auto clearDecoderState = [&] {
             decoder = std::make_unique<flowx::Decoder>();
-            decoder->setReusePreviousFrameBorders(true);
+            decoder->setRestartFillOptions(cfg.decoder.fill_gaps, cfg.decoder.smooth_fill);
+            decoder->setReusePreviousFrameBorders(cfg.decoder.fill_gaps);
             current_jpeg.clear();
             frame_arrivals.clear();
             frame_arrival_order.clear();
             have_published_frame = false;
             last_published_frame_id = 0;
+            pending_restart_key = false;
         };
 
         auto retireStream = [&](std::uint32_t stream_id) {
@@ -176,6 +185,25 @@ int main(int argc, char** argv) {
         };
         publishStatus();
 
+        auto publishKey = [&] {
+            pending_restart_key = false;
+            cv::Mat image;
+            decoder->render(image, {}, current_jpeg);
+            if (image.empty()) return;
+            const std::uint32_t frame_id = decoder->keyframeId();
+            const FrameArrival arrival = takeArrival(frame_id, pending_key_metadata, pending_key_receive_us);
+            flowx::FrameMetadata published;
+            published.stream_id = active_stream_id;
+            published.frame_id = published.keyframe_id = frame_id;
+            published.capture_timestamp_us = arrival.capture_timestamp_us;
+            published.receive_timestamp_us = arrival.receive_timestamp_us;
+            published.keyframe = true;
+            frame_store.publish(std::move(image), published);
+            last_published_frame_id = frame_id;
+            have_published_frame = true;
+            ++decoded_frames; ++decoded_keyframes;
+        };
+
         flowx::HttpServer http_server;
         if (!http_server.start(cfg.http, frame_store, raw_frame_store, status_store, error))
             throw std::runtime_error("HTTP server start failed: " + error);
@@ -192,7 +220,8 @@ int main(int argc, char** argv) {
                   << "  HTTP JPEG quality: " << cfg.http.jpeg_quality << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n"
-                  << "  decoder border reuse: yes\n";
+                  << "  decoder fill gaps: " << cfg.decoder.fill_gaps
+                  << ", smooth fill: " << (cfg.decoder.fill_gaps && cfg.decoder.smooth_fill) << '\n';
         if (!dump_last_file.empty())
             std::cout << "  debug dump on exit: " << dump_last_file << '\n';
 
@@ -203,8 +232,17 @@ int main(int argc, char** argv) {
         bool fatal_error = false;
 
         while (!g_stop.load(std::memory_order_relaxed)) {
+            // Check even under continuous invalid/duplicate traffic. Only newly
+            // decoded regions extend the quiet period; UDP inactivity also releases it.
+            if (pending_restart_key && std::chrono::steady_clock::now() >= key_wait_deadline) {
+                publishKey(); publishStatus();
+            }
+            int receive_wait_ms = 250;
+            if (pending_restart_key) receive_wait_ms = std::clamp<int>(
+                int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    key_wait_deadline-std::chrono::steady_clock::now()).count())+1, 1, 100);
             std::vector<flowx::u_char> datagram;
-            const flowx::UdpReceiveResult receive_result = udp.receive(datagram, 250, error);
+            const flowx::UdpReceiveResult receive_result = udp.receive(datagram, receive_wait_ms, error);
             if (receive_result == flowx::UdpReceiveResult::Timeout) continue;
             if (receive_result == flowx::UdpReceiveResult::Error) {
                 if (g_stop.load(std::memory_order_relaxed)) break;
@@ -266,37 +304,32 @@ int main(int argc, char** argv) {
             raw_frame_store.push(datagram, metadata);
 
             rememberArrival(metadata, receive_timestamp_us);
+            // The next key burst closes the previous one before pushData can
+            // replace its reference (including keyframe-only streams with loss).
+            if (pending_restart_key && metadata.frame_id == metadata.keyframe_id &&
+                frameIdNewer(metadata.frame_id, decoder->keyframeId())) publishKey();
+            const auto previous_blocks = decoder->restartReceivedBlocks();
             decoder->pushData(packet.codec_packet);
 
             std::vector<flowx::u_char> new_jpeg;
             if (decoder->updateKeyframe(new_jpeg)) {
                 current_jpeg = std::move(new_jpeg);
-
-                cv::Mat image;
-                decoder->render(image, {}, current_jpeg);
-                if (!image.empty()) {
-                    const std::uint32_t frame_id = decoder->keyframeId();
-                    const FrameArrival arrival = takeArrival(
-                        frame_id, metadata, receive_timestamp_us);
-
-                    flowx::FrameMetadata published;
-                    published.stream_id = active_stream_id;
-                    published.frame_id = frame_id;
-                    published.keyframe_id = frame_id;
-                    published.capture_timestamp_us = arrival.capture_timestamp_us;
-                    published.receive_timestamp_us = arrival.receive_timestamp_us;
-                    published.keyframe = true;
-                    frame_store.publish(std::move(image), published);
-                    last_published_frame_id = frame_id;
-                    have_published_frame = true;
-                    ++decoded_frames;
-                    ++decoded_keyframes;
-                }
+                pending_key_metadata = metadata;
+                pending_key_receive_us = receive_timestamp_us;
+                pending_restart_key = decoder->restartTotalBlocks() != 0;
+                key_wait_deadline = std::chrono::steady_clock::now()+key_quiet_wait;
+                if (!pending_restart_key) publishKey();
+            }
+            if (pending_restart_key) {
+                if (decoder->restartReceivedBlocks() != previous_blocks)
+                    key_wait_deadline = std::chrono::steady_clock::now()+key_quiet_wait;
+                if (decoder->restartReceivedBlocks() == decoder->restartTotalBlocks()) publishKey();
             }
 
             std::vector<flowx::PatchData> patch;
             while (decoder->getNextPatch(patch)) {
                 if (patch.empty()) continue;
+                if (pending_restart_key) publishKey();
 
                 const flowx::PatchData& last = patch.back();
                 const FrameArrival arrival = takeArrival(

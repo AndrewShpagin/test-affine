@@ -149,6 +149,11 @@ public:
     cv::Size originalSize() const { return original_size_; }
     std::uint32_t keyframeId() const { return keyframe_id_; }
     double lastKeyframeImageDecodeMs() const { return last_keyframe_image_decode_ms_; }
+    // Opt in to browser-style concealment; false also disables counterpart copy.
+    // Legacy callers retain counterpart-only filling until this is configured.
+    void setRestartFillOptions(bool fill_gaps, bool smooth_fill = true);
+    std::size_t restartReceivedBlocks() const { return pending_restart_.received_count; }
+    std::size_t restartTotalBlocks() const { return pending_restart_.received_blocks.size(); }
 private:
     struct KeyframeAssembly {
         bool active = false;
@@ -192,6 +197,7 @@ private:
         // One bit-valued byte per actual 8x8 block and parity. Concealed pixels
         // never set these entries, so late real data can always replace them.
         std::vector<unsigned char> received_blocks;
+        std::size_t received_count = 0;
     };
     void acceptRestartRegion(const std::vector<u_char>& data, std::uint32_t frame_id, cv::Size original);
     cv::Mat getDecodedKeyframe(const std::vector<u_char>& jpeg_data);
@@ -207,6 +213,9 @@ private:
     KeyframeAssembly pending_keyframe_;
     MosaicAssembly pending_mosaic_;
     RestartAssembly pending_restart_;
+    bool restart_fill_gaps_ = false;
+    bool restart_fill_counterparts_ = true;
+    bool restart_smooth_fill_ = true;
     std::deque<PatchData> pending_patch_queue_;
     std::deque<PatchData> patch_queue_;
     cv::Mat dense_mesh_;

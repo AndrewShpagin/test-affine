@@ -181,6 +181,12 @@ SenderConfig loadSenderConfig(const std::string& filename) {
 ReceiverConfig loadReceiverConfig(const std::string& filename) {
     const json root = readJsonFile(filename);
     ReceiverConfig cfg;
+    const auto decode_it = root.find("decoder");
+    if (decode_it != root.end()) {
+        if (!decode_it->is_object()) throw std::runtime_error("decoder must be a JSON object");
+        cfg.decoder.fill_gaps = decode_it->value("fill_gaps", cfg.decoder.fill_gaps);
+        cfg.decoder.smooth_fill = decode_it->value("smooth_fill", cfg.decoder.smooth_fill);
+    }
 
     const json& udp = objectMember(root, "udp");
     cfg.udp.bind = udp.value("bind", cfg.udp.bind);

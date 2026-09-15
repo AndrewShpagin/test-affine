@@ -1,4 +1,5 @@
 #include "udp_image_codec.h"
+#include "jpeg_restart_fill.h"
 #include "jpeg_restart.h"
 
 #include <opencv2/opencv.hpp>
@@ -1670,6 +1671,18 @@ bool Decoder::getNextPatch(std::vector<PatchData>& patch){if(patch_queue_.empty(
 cv::Mat Decoder::getDecodedKeyframe(const std::vector<u_char>& jpeg_data){
     if(!have_keyframe_||original_size_.width<=0||original_size_.height<=0)return cv::Mat();
     if(!decoded_keyframe_.empty())return decoded_keyframe_;
+    if(pending_restart_.active){
+        const auto& a=pending_restart_;
+        if(!restart_fill_counterparts_){
+            decoded_keyframe_=a.assembled.clone();
+            const int columns=a.assembled.cols/16, channels=a.assembled.channels();
+            for(int y=0;y<a.assembled.rows;++y)for(int x=0;x<a.assembled.cols;++x)
+                if(!a.received_blocks[2*((y/8)*columns+x/16)+(x&1)])
+                    std::fill_n(decoded_keyframe_.ptr(y)+x*channels,channels,0);
+        }else decoded_keyframe_=restart_fill_gaps_
+            ?fillRestartGaps(a.assembled,a.received_blocks,restart_smooth_fill_):a.assembled;
+        return decoded_keyframe_;
+    }
     const std::vector<u_char>& bytes=jpeg_data.empty()?current_jpeg_:jpeg_data;if(bytes.empty())return cv::Mat();
     cv::Mat encoded(1,static_cast<int>(bytes.size()),CV_8U,const_cast<u_char*>(bytes.data()));
     const auto decode_start=ProfileClock::now();
@@ -1681,9 +1694,11 @@ cv::Mat Decoder::getDecodedKeyframe(const std::vector<u_char>& jpeg_data){
 void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,const std::vector<u_char>& jpeg_data){
     cv::Mat keyframe=getDecodedKeyframe(jpeg_data);
     if(keyframe.empty()){destination.release();return;}
+    const bool debug_restart=pending_restart_.active&&!restart_fill_counterparts_;
+    const int sampling=debug_restart?cv::INTER_NEAREST:cv::INTER_LINEAR;
     if(patch.empty()){
         if(keyframe.size()==original_size_)keyframe.copyTo(destination);
-        else cv::resize(keyframe,destination,original_size_,0,0,cv::INTER_LINEAR);
+        else cv::resize(keyframe,destination,original_size_,0,0,sampling);
         previous_render_=destination;
         return;
     }
@@ -1708,14 +1723,14 @@ void Decoder::render(cv::Mat& destination,const std::vector<PatchData>& patch,co
         cv::parallel_for_(cv::Range(0,original_size_.height),[&](const cv::Range&r){for(int y=r.start;y<r.end;++y){const cv::Vec2f*dr=dense_mesh_.ptr<cv::Vec2f>(y);float*mx=map_x_.ptr<float>(y);float*my=map_y_.ptr<float>(y);unsigned char*vm=valid_mask_.ptr<unsigned char>(y);for(int x=0;x<original_size_.width;++x){const float tx=x-dr[x][0],ty=y-dr[x][1],sx=i00*tx+i01*ty+i02,sy=i10*tx+i11*ty+i12;const float kx=sx*source_scale_x,ky=sy*source_scale_y;mx[x]=kx;my[x]=ky;if(kx>=0&&kx<keyframe.cols-1&&ky>=0&&ky<keyframe.rows-1)vm[x]=255;}}});
     }
 
-    if(reuse_previous_frame_borders_){
+    if(reuse_previous_frame_borders_&&!debug_restart){
         if(!previous_render_.empty()&&previous_render_.size()==original_size_&&previous_render_.type()==keyframe.type())previous_render_.copyTo(destination);
         else if(keyframe.size()==original_size_)keyframe.copyTo(destination);
         else cv::resize(keyframe,destination,original_size_,0,0,cv::INTER_LINEAR);
         cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_TRANSPARENT);
     }else{
-        cv::remap(keyframe,destination,map_x_,map_y_,cv::INTER_LINEAR,cv::BORDER_CONSTANT,cv::Scalar(0));
-        destination=fillOutside(destination,valid_mask_);
+        cv::remap(keyframe,destination,map_x_,map_y_,sampling,cv::BORDER_CONSTANT,cv::Scalar(0));
+        if(!debug_restart)destination=fillOutside(destination,valid_mask_);
     }
     previous_render_=destination;
 }

@@ -4,6 +4,7 @@
 #include "flowx_raw_store.h"
 #include "flowx_browser_assets.h"
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <fstream>
@@ -144,6 +145,24 @@ void lossTest(const Fixture& f) {
     affinecodec::Decoder only;
     only.pushData(f.packets.back());
     same(render(only), expected(f, {unsigned(f.packets.size() - 1)}), "single region placement/fill");
+    for (bool fill : {false,true}) for (bool smooth : {false,true}) {
+        affinecodec::Decoder concealed;
+        concealed.setRestartFillOptions(fill,smooth);
+        concealed.pushData(f.packets.front());
+        const auto count = concealed.restartReceivedBlocks();
+        auto first = render(concealed), frozen = first.clone();
+        require(concealed.restartReceivedBlocks()==count && count==f.regions.front().width/8,
+                "concealment changed receipt count");
+        same(render(concealed),first,"repeated render accumulated blur");
+        concealed.pushData(f.packets.front());
+        require(concealed.restartReceivedBlocks()==count,"duplicate extended receipt count");
+        for (const auto& packet : f.packets) concealed.pushData(packet);
+        same(first,frozen,"late data changed published frame");
+        same(render(concealed),complete,"late native concealment recovery failed");
+        require(concealed.restartReceivedBlocks()==concealed.restartTotalBlocks(),"completion count failed");
+        concealed.setRestartFillOptions(true,true);
+        same(render(concealed),complete,"option change altered complete key");
+    }
     // Newer frames replace masks. Old regions cannot resurrect a previous reference.
     auto fresh = native(f.regions.front(), 110);
     only.pushData(fresh); Bytes jpeg;
@@ -268,6 +287,19 @@ void exportFixture(const Fixture& f, const std::string& path) {
     }
     std::vector<unsigned> all(f.packets.size()); std::iota(all.begin(), all.end(), 0u);
     j["complete"] = rgba(expected(f, all));
+    // Native outputs before HTTP re-encoding, for browser and receiver checks.
+    std::vector<unsigned> scattered;
+    for (unsigned i=0;i<all.size();++i) if ((i*37+11)%100<65) scattered.push_back(i);
+    for (const auto& selected : {std::vector<unsigned>{0}, scattered}) {
+        for (const std::string mode : {"raw","nearest","smooth"}) {
+            affinecodec::Decoder decoder;
+            decoder.setRestartFillOptions(mode!="raw",mode=="smooth");
+            for (auto i : selected) decoder.pushData(f.packets[i]);
+            auto image = render(decoder); Bytes jpeg;
+            require(cv::imencode(".jpg",image,jpeg,{cv::IMWRITE_JPEG_QUALITY,85}),"encode fill fixture");
+            j["concealment"].push_back({{"mode",mode},{"indices",selected},{"rgba",rgba(image)},{"jpeg",jpeg}});
+        }
+    }
     std::ofstream out(path); out << j.dump(); require(out.good(), "write fixtures");
     std::ofstream js(path + ".js"); js << flowx::browserJs(); require(js.good(), "write browser JS");
     std::ofstream html(path + ".html"); html << flowx::browserHtml(); require(html.good(), "write browser HTML");

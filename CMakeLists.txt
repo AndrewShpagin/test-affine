@@ -31,7 +31,7 @@ target_link_libraries(keyframe_test PRIVATE ${OpenCV_LIBS})
 
 # Stable codec implementation. Keep the historical target name as an alias while
 # product-facing code uses FlowX naming.
-add_library(flowx_codec udp_image_codec.cpp motion_refine.cpp jpeg_restart.cpp jpeg_restart_assembly.cpp)
+add_library(flowx_codec udp_image_codec.cpp motion_refine.cpp jpeg_restart.cpp jpeg_restart_assembly.cpp jpeg_restart_fill.cpp)
 add_library(udp_image_codec ALIAS flowx_codec)
 target_include_directories(flowx_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(flowx_codec PUBLIC ${OpenCV_LIBS} JPEG::JPEG)
@@ -115,7 +115,14 @@ if(BUILD_TESTING)
         add_test(NAME flowx_nearest_fill COMMAND "${FLOWX_NODE_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/flowx_nearest_fill_test.js")
         add_test(NAME flowx_smooth_fill COMMAND "${FLOWX_NODE_EXECUTABLE}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_smooth_fill_test.js")
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_smooth_fill_test.js" --export
+            "${CMAKE_CURRENT_BINARY_DIR}/smooth-fill-cases.json")
+        set_tests_properties(flowx_smooth_fill PROPERTIES FIXTURES_SETUP smooth_fill_cases)
+        add_executable(jpeg_restart_fill_test jpeg_restart_fill_test.cpp)
+        target_link_libraries(jpeg_restart_fill_test PRIVATE flowx_common)
+        add_test(NAME jpeg_restart_fill COMMAND jpeg_restart_fill_test
+            "${CMAKE_CURRENT_BINARY_DIR}/smooth-fill-cases.json")
+        set_tests_properties(jpeg_restart_fill PROPERTIES FIXTURES_REQUIRED smooth_fill_cases)
         add_test(NAME jpeg_restart_fixtures COMMAND jpeg_restart_test --export
             "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
         set_tests_properties(jpeg_restart_fixtures PROPERTIES FIXTURES_SETUP restart_fixtures)
@@ -138,6 +145,17 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_BINARY_DIR}/shuffle-fixtures.json")
         set_tests_properties(jpeg_shuffle_browser jpeg_shuffle_presentation
             PROPERTIES FIXTURES_REQUIRED shuffle_fixtures)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME flowx_mjpeg COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/flowx_mjpeg_test.py" "$<TARGET_FILE:flowx_receiver>"
+                "${CMAKE_CURRENT_BINARY_DIR}/restart-fixtures.json")
+            add_test(NAME flowx_mjpeg_shuffle COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/flowx_mjpeg_test.py" "$<TARGET_FILE:flowx_receiver>"
+                "${CMAKE_CURRENT_BINARY_DIR}/shuffle-fixtures.json")
+            set_tests_properties(flowx_mjpeg PROPERTIES FIXTURES_REQUIRED restart_fixtures TIMEOUT 45)
+            set_tests_properties(flowx_mjpeg_shuffle PROPERTIES FIXTURES_REQUIRED shuffle_fixtures TIMEOUT 45)
+        endif()
     endif()
 endif()
 

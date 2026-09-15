@@ -77,6 +77,10 @@ struct HttpConfig {
 struct ReceiverConfig {
     UdpListenConfig udp;
     HttpConfig http;
+    struct DecodeOptions {
+        bool fill_gaps = true;
+        bool smooth_fill = true;
+    } decoder;
 };
 
 const char* sourceTypeName(SourceType type);

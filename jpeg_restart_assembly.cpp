@@ -81,11 +81,19 @@ void Decoder::acceptRestartRegion(const std::vector<u_char>& data,
             }
         }
         a.received_blocks[own] = 1;
+        ++a.received_count;
     }
-    decoded_keyframe_ = a.assembled;
+    decoded_keyframe_.release(); // rebuild concealment once, at the next render
     last_keyframe_image_decode_ms_ += decode_ms;
     // Same-key updates affect subsequent PATCH rendering only. Do not re-emit
     // an old displayed frame or invalidate its border-reuse buffer.
+}
+
+void Decoder::setRestartFillOptions(bool fill_gaps, bool smooth_fill) {
+    restart_fill_gaps_ = restart_fill_counterparts_ = fill_gaps;
+    restart_smooth_fill_ = smooth_fill;
+    if (pending_restart_.active) decoded_keyframe_.release();
+    previous_render_.release();
 }
 
 } // namespace affinecodec

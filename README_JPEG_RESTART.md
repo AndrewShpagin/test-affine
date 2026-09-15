@@ -134,8 +134,11 @@ PATCH frames; they do not replay an old image or clear the previous-frame border
 buffer. The native API still signals availability on the first decoded region:
 `Decoder::updateKeyframe()` fires once and returns an empty JPEG vector;
 `render()` uses the assembled reference directly. Nearest-neighbour concealment
-described above is performed by the browser; the native codec's raw assembly
-continues to expose missing-both-half areas through black pixels.
+described above is enabled in both the browser and the C++ receiver's MJPEG path.
+The C++ implementation uses the same quantized radius/blend controls and bilinear
+kernel on the CPU, cached between reference updates. Its native API retains the
+old counterpart-only fill until `setRestartFillOptions()` is called.
+See `README_FLOWX_RECEIVER.md` for the MJPEG fill options and keyframe wait rules.
 
 The HTTP raw transport forwards late active-key packets immediately. It retains
 the accepted key packets, so a new or slow browser receives a cumulative key

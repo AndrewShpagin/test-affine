@@ -49,7 +49,7 @@ function fixture(name,holes,width=64,height=32,constant=false) {
   const repeat=expected.slice(),again=params.slice();
   fillMissingPixels(repeat,received,width,height,again);
   assert.deepEqual(repeat,pixels);assert.deepEqual(again,params);
-  return {name,width,height,pixels:Array.from(pixels),params:Array.from(params),expected:Array.from(expected)};
+  return {name,width,height,received:Array.from(received),pixels:Array.from(pixels),params:Array.from(params),expected:Array.from(expected)};
 }
 const cases=[fixture('isolated',[[1,1]]),fixture('joined_horizontal',[[1,1],[2,1]]),
   fixture('joined_vertical',[[1,1],[1,2]]),fixture('corner',[[0,0],[1,0],[0,1]]),

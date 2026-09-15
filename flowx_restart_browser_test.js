@@ -3,6 +3,7 @@
 // entropy/header bytes and expected RGBA, without requiring a DOM in CTest.
 const assert=require('node:assert/strict'),fs=require('node:fs');
 const {RestartAssembler,parseRegion,makeJpeg,tilePermutation}=require('./flowx_restart_browser.js');
+const {smoothReference}=require('./flowx_smooth_fill_test.js');
 const f=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const packets=f.regions.map(r=>Uint8Array.from(r.wire));
 const decoded=new Map(f.regions.map(r=>[Buffer.from(r.jpeg).toString('base64'),Uint8Array.from(r.rgba)]));
@@ -33,6 +34,14 @@ function frame(packet,id) {
   const u=packet.slice();new DataView(u.buffer).setUint32(8,id,true);return u;
 }
 (async()=>{
+  for(const sample of f.concealment) {
+    const a=new RestartAssembler(f.headers,decode,{fillGaps:sample.mode!=='raw',smoothFills:sample.mode==='smooth'});
+    for(const i of sample.indices)await a.accept(packets[i]);
+    a.fillMissing();
+    const output=sample.mode==='smooth'&&a.smoothing?smoothReference(a.pixels,a.smoothing,a.width,a.height):a.pixels;
+    assert.equal(output.length,sample.rgba.length);
+    for(let i=0;i<output.length;i++)assert.ok(Math.abs(output[i]-sample.rgba[i])<=1,'native decoder differs from browser '+sample.mode);
+  }
   assert.deepEqual(Array.from(tilePermutation(32,16)),[0,6,5,7,2,1,3,4],'shuffle v1 wire vector changed');
   assert.deepEqual(Array.from(tilePermutation(8,8)),[0]);
   if(f.tile_map.length)assert.deepEqual(Array.from(tilePermutation(f.width/2,f.height)),f.tile_map,'C++/JS shuffle mismatch');
