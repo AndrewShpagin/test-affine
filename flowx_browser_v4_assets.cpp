@@ -32,6 +32,7 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}header{p
   <span>playout drops <code id="playoutDrops">0</code></span>
   <label>Playback delay <input id="playoutDelay" type="number" min="0" max="200" step="10" value="60" style="width:4em"> ms</label>
   <label title="Disable to show missing data in black. Changing this reloads the view."><input id="fillGaps" type="checkbox" checked> Fill missing pixels</label>
+  <label title="Smooth the interior of filled gaps. Changing this reloads the view."><input id="smoothFills" type="checkbox" checked> Smooth filled pixels</label>
   <span>skipped <code id="skipped">0</code></span>
   <span>errors <code id="errors">0</code></span>
 </header>
@@ -58,6 +59,8 @@ if(!gl){ setState('WebGL2 unavailable', false); return; }
 const query=new URLSearchParams(location.search);
 const fillGaps=query.get('fill_gaps')!=='0';
 const fillControl=$('fillGaps');fillControl.checked=fillGaps;
+const smoothControl=$('smoothFills');smoothControl.checked=query.get('smooth_fill')!=='0';smoothControl.disabled=!fillGaps;
+const smoothFills=fillGaps&&smoothControl.checked;
 if(!fillGaps)canvas.style.imageRendering='pixelated';
 
 const vs = `#version 300 es
@@ -95,6 +98,31 @@ uniform sampler2D uTex;
 uniform vec2 uSize;
 out vec4 color;
 void main(){ color=texture(uTex,gl_FragCoord.xy/uSize); }
+`;
+const smoothFillFs = `#version 300 es
+precision highp float;
+uniform sampler2D uNearest;
+uniform sampler2D uFillParams;
+uniform vec2 uSize;
+out vec4 color;
+void main(){
+  ivec2 p=ivec2(gl_FragCoord.xy);
+  vec4 original=texelFetch(uNearest,p,0);
+  vec2 control=texelFetch(uFillParams,p,0).rg;
+  if(control.y==0.0){color=original;return;}
+  vec2 uv=(vec2(p)+vec2(0.5))/uSize;
+  vec2 r=vec2(3.0*control.x)/uSize;
+  // 13 color samples: center 4, inner axial ring 2, outer octagonal ring 1.
+  vec4 sum=original*4.0;
+  sum+=2.0*(texture(uNearest,uv+vec2(r.x*0.5,0.0))+texture(uNearest,uv-vec2(r.x*0.5,0.0))
+           +texture(uNearest,uv+vec2(0.0,r.y*0.5))+texture(uNearest,uv-vec2(0.0,r.y*0.5)));
+  sum+=texture(uNearest,uv+vec2(r.x,0.0))+texture(uNearest,uv-vec2(r.x,0.0))
+      +texture(uNearest,uv+vec2(0.0,r.y))+texture(uNearest,uv-vec2(0.0,r.y));
+  vec2 d=r*0.7071067811865476;
+  sum+=texture(uNearest,uv+d)+texture(uNearest,uv-d)
+      +texture(uNearest,uv+vec2(d.x,-d.y))+texture(uNearest,uv+vec2(-d.x,d.y));
+  color=vec4(mix(original.rgb,sum.rgb/20.0,control.y),original.a);
+}
 `;
 const patchFs = `#version 300 es
 precision highp float;
@@ -146,9 +174,12 @@ void main(){
 function sh(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
 function prog(fs){ const p=gl.createProgram(); gl.attachShader(p,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(p); if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
 const keyProg=prog(keyFs), stripsProg=prog(stripsFs), copyProg=prog(copyFs), patchProg=prog(patchFs);
+const smoothFillProg=smoothFills?prog(smoothFillFs):null;
 const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
 function tex(){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
 const keyTex=tex(), stripTex=[tex(),tex()], keyFbo=gl.createFramebuffer(), frameTex=[tex(),tex()], fbo=[gl.createFramebuffer(),gl.createFramebuffer()];
+const smoothKeyTex=smoothFills?tex():null,fillParamsTex=smoothFills?tex():null,smoothFillFbo=smoothFills?gl.createFramebuffer():null;
+let renderKeyTex=keyTex,smoothW=0,smoothH=0;
 if(!fillGaps){
   // Keep absent columns black through key scaling and PATCH warping in debug mode.
   gl.bindTexture(gl.TEXTURE_2D,keyTex);
@@ -180,14 +211,17 @@ delayControl.addEventListener('change',()=>{
   playout.setDelay(delayControl.value===''?60:Number(delayControl.value));
   delayControl.value=String(playout.delayMs);
 });
-fillControl.addEventListener('change',()=>{
+function reloadFillOptions(){
   // A fresh view avoids mixing already filled reference pixels and queued frames
   // with the new debug mode. Keep other URL options and the current delay.
   const params=new URLSearchParams(location.search);
   params.set('fill_gaps',fillControl.checked?'1':'0');
+  params.set('smooth_fill',smoothControl.checked?'1':'0');
   params.set('playout_ms',String(playout.delayMs));
   location.search=params.toString();
-});
+}
+fillControl.addEventListener('change',reloadFillOptions);
+smoothControl.addEventListener('change',reloadFillOptions);
 function queuePresentation(frameId,timestamp){
   const slot=presentationPool.pop()||{texture:tex(),width:0,height:0};
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,slot.texture);
@@ -217,7 +251,7 @@ function display(slot){
 function uploadBitmap(texture,source){ gl.bindTexture(gl.TEXTURE_2D,texture); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source); }
 function renderKey(frameId,timestamp){
   lastRenderedFrame=frameId;
-  current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); queuePresentation(frameId,timestamp);
+  current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,renderKeyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); queuePresentation(frameId,timestamp);
   keyFrameId=frameId; stats.keys++; stats.renders++; putStats();
 }
 function cancelRestartPresentation(){
@@ -227,11 +261,34 @@ function cancelRestartPresentation(){
 function refreshRestartReference(){
   const a=restartAssembly;
   if(!a||a.frameId!==keyFrameId)return;
+  const dirty=a.fillDirty||restartTextureDirty;
   const filled=a.fillMissing();
-  if(!filled&&!restartTextureDirty)return;
-  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,keyTex);
-  gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,a.width,a.height,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
+  if(!dirty)return;
+  if(filled||restartTextureDirty){
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,keyTex);
+    gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,a.width,a.height,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
+  }
   restartTextureDirty=false;
+  renderKeyTex=keyTex;
+  if(smoothFills&&filled)smoothRestartFill(a);
+}
+function smoothRestartFill(a){
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,fillParamsTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RG8,a.width,a.height,0,gl.RG,gl.UNSIGNED_BYTE,a.smoothing);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,smoothKeyTex);
+  if(smoothW!==a.width||smoothH!==a.height){
+    smoothW=a.width;smoothH=a.height;
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,smoothW,smoothH,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,smoothFillFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,smoothKeyTex,0);
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw new Error('fill framebuffer incomplete');
+  gl.viewport(0,0,a.width,a.height);gl.useProgram(smoothFillProg);
+  gl.bindTexture(gl.TEXTURE_2D,keyTex);
+  gl.uniform1i(gl.getUniformLocation(smoothFillProg,'uNearest'),0);
+  gl.uniform1i(gl.getUniformLocation(smoothFillProg,'uFillParams'),1);
+  gl.uniform2f(gl.getUniformLocation(smoothFillProg,'uSize'),a.width,a.height);draw();
+  renderKeyTex=smoothKeyTex;
 }
 function presentRestartKey(){
   const pending=restartPresentation;
@@ -249,7 +306,7 @@ function scheduleRestartPresentation(){
   // if the stream pauses or every following PATCH is lost.
   restartPresentationTimer=setTimeout(presentRestartKey,restartQuietMs);
 }
-function uploadKey(source,ow,oh,frameId,timestamp){ alloc(ow,oh); keyW=source.width; keyH=source.height; uploadBitmap(keyTex,source); renderKey(frameId,timestamp); }
+function uploadKey(source,ow,oh,frameId,timestamp){ alloc(ow,oh); keyW=source.width; keyH=source.height; uploadBitmap(keyTex,source); renderKeyTex=keyTex;renderKey(frameId,timestamp); }
 function uploadStrips(even,odd,ow,oh,frameId,timestamp){
   if(even.width!==odd.width||even.height!==odd.height) throw new Error('strip size mismatch');
   alloc(ow,oh); keyW=even.width*2; keyH=even.height;
@@ -259,7 +316,7 @@ function uploadStrips(even,odd,ow,oh,frameId,timestamp){
   gl.viewport(0,0,keyW,keyH); gl.useProgram(stripsProg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,stripTex[0]); gl.uniform1i(gl.getUniformLocation(stripsProg,'uEven'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,stripTex[1]); gl.uniform1i(gl.getUniformLocation(stripsProg,'uOdd'),1);
-  draw(); renderKey(frameId,timestamp);
+  draw(); renderKeyTex=keyTex;renderKey(frameId,timestamp);
 }
 function invH(a,p){
   const m00=a[0],m01=a[1],m02=a[2],m10=a[3],m11=a[4],m12=a[5],m20=p[0],m21=p[1],m22=1;
@@ -285,7 +342,7 @@ function renderPatch(p){
   // Refill once before rendering, without modifying already queued snapshots.
   refreshRestartReference();
   const next=1-current; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[next]); gl.viewport(0,0,outW,outH); gl.useProgram(patchProg);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,keyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,renderKeyTex); gl.uniform1i(gl.getUniformLocation(patchProg,'uKey'),0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,frameTex[current]); gl.uniform1i(gl.getUniformLocation(patchProg,'uPrev'),1);
   gl.uniform1i(gl.getUniformLocation(patchProg,'uFillGaps'),fillGaps?1:0);
   gl.uniform2f(gl.getUniformLocation(patchProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(patchProg,'uKeySize'),keyW,keyH); gl.uniformMatrix3fv(gl.getUniformLocation(patchProg,'uInvH'),false,inv); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridX'),p.gridX); gl.uniform1i(gl.getUniformLocation(patchProg,'uGridY'),p.gridY); gl.uniform2fv(gl.getUniformLocation(patchProg,'uMesh[0]'),p.mesh); draw(); current=next; queuePresentation(p.frameId,p.timestamp);
@@ -322,7 +379,7 @@ async function acceptRegion(u,frame,timestamp){
   // Keep the prior assembly available until its burst is finalized. Reusing
   // one object across frame IDs would discard its pixels before nearest fill.
   const previous=restartAssembly,previousStream=streamId;
-  const a=previous&&previous.frameId===frame?previous:new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion,{fillGaps});
+  const a=previous&&previous.frameId===frame?previous:new FlowXRestartAssembler(FLOWX_RESTART_HEADERS,decodeRegion,{fillGaps,smoothFills});
   const result=await a.accept(u);
   if(!result||restartAssembly!==previous||streamId!==previousStream)return;
   if(result.newKeyframe){
@@ -330,6 +387,7 @@ async function acceptRegion(u,frame,timestamp){
     presentRestartKey();
     restartAssembly=a;
     restartTextureDirty=false;
+    renderKeyTex=keyTex;
     key=null;keyW=a.width;keyH=a.height;
     gl.bindTexture(gl.TEXTURE_2D,keyTex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,keyW,keyH,0,gl.RGBA,gl.UNSIGNED_BYTE,a.pixels);
@@ -373,7 +431,7 @@ async function processDatagram(d){
     if(streamId) retiredStreams.add(streamId);
     if(retiredStreams.size>16) retiredStreams.delete(retiredStreams.values().next().value);
     cancelRestartPresentation();playout.reset();
-    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;restartTextureDirty=false;lastRenderedFrame=null;lastPresentedFrame=null;$('stream').textContent=sid;
+    streamId=sid; key=null; keyFrameId=null; restartAssembly=null;restartTextureDirty=false;renderKeyTex=keyTex;lastRenderedFrame=null;lastPresentedFrame=null;$('stream').textContent=sid;
   }
   const timestamp=captureMs(v);
   playout.observe(frame,timestamp);

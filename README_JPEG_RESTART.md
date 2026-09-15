@@ -112,6 +112,23 @@ The received mask remains unchanged. Late real packets overwrite estimates;
 before a subsequent PATCH, remaining holes are refilled from the updated valid
 pixels. Already rendered/queued pictures stay unchanged.
 
+The browser then smooths NN-filled interiors with one WebGL2 pass. The radius
+and blend strength grow with distance from usable pixels: the first pixel next
+to received data is unchanged, and full strength is reached at distance 4.
+The radius reaches 3 encoded pixels near the center and diagonal NN seams,
+falling toward 1.5 pixels away from those seams. Distances follow the actual
+receipt mask, so adjacent lost 16x8 tiles do not introduce artificial filter
+borders. Received pixels and even/odd counterpart copies remain unchanged.
+
+The pass uses 13 color taps with bilinear sampling, reads the unmodified NN
+texture and writes a separate reference texture. It runs only when the reference
+changes, after the existing wait; unchanged PATCH frames reuse the result.
+Late real samples trigger a fresh NN fill and smoothing before the next PATCH,
+without accumulating blur. A completely recovered reference bypasses smoothing.
+This softens NN stars; it cannot reconstruct missing texture or object edges.
+Additional storage is 2 CPU bytes and 6 GPU bytes per encoded keyframe pixel,
+plus a small block-distance table. No GPU readback is needed in playback.
+
 After presentation, late regions change only the reference used by subsequent
 PATCH frames; they do not replay an old image or clear the previous-frame border
 buffer. The native API still signals availability on the first decoded region:
@@ -128,6 +145,13 @@ images are at most 16 megapixels; use an appropriate keyframe byte budget.
 
 ## Debug without filling
 
+**Smooth filled pixels** is enabled by default. Uncheck it, or use
+`/flowx.html?smooth_fill=0`, to compare with the previous NN-only fill.
+`smooth_fill=1` enables it explicitly. The checkbox reloads the view, preserving
+other options and playback delay. This is a browser-only option; sender settings
+and JPEG bytes are unaffected. Rebuild/restart the receiver and reload the browser
+to load the updated embedded script.
+
 Uncheck **Fill missing pixels** in the browser header, or open
 `/flowx.html?fill_gaps=0`. Filling is enabled by default; `fill_gaps=1` enables it
 explicitly. Changing the checkbox reloads the view so previously filled pixels
@@ -138,7 +162,8 @@ With filling disabled, every unreceived sample stays opaque black, including
 missing odd/even columns when only the other half arrived. Areas missing both
 halves also stay black after the wait ends. Late packets still replace black
 samples with their actual decoded pixels. Receipt masks, completion detection,
-and presentation timing are unchanged.
+and presentation timing are unchanged. Smoothing is also bypassed, and its
+checkbox is disabled until filling is enabled again.
 
 Debug rendering uses nearest-pixel key sampling and pixelated canvas scaling
 to avoid blending black columns with received neighbours. PATCH areas outside
@@ -175,6 +200,10 @@ tests simulate packet bursts, missing frames, paused tabs, and clock changes.
 Nearest-fill tests compare the result to a brute-force nearest-pixel search,
 including image edges, diagonal distances, ties, valid black data, unchanged
 receipt masks, and replacement by late packets.
+Adaptive-fill tests cover fixed boundaries, merged gaps, image corners, constant
+color preservation, NN seam reduction, and recomputation from real samples.
+The presentation tests also check the smoothing toggle, one pass per changed
+reference, debug bypass, and switching back to raw pixels after full recovery.
 
 ## Browser frame timing
 
@@ -223,6 +252,18 @@ node flowx_restart_webgl_test.js build/shuffle-fixtures.json
 An optional third argument supplies the Chromium executable path. This test
 checks that late regions change the reference texture while leaving displayed
 pixels intact until the next PATCH. It is separate from the Node-only CTest.
+
+The actual smoothing GLSL can also be tested without Chromium on Linux with
+Node, Python 3, `libEGL.so.1`, and surfaceless OpenGL ES 3 (for example Mesa):
+
+```bash
+./build/jpeg_restart_test --export build/restart-fixtures.json
+python3 flowx_smooth_fill_egl_test.py build/restart-fixtures.json.js
+```
+
+This optional test compiles the shipped shader and compares rendered RGBA bytes
+to the CPU kernel reference, including exact preservation wherever blend is zero.
+It allows up to two byte levels of bilinear/rounding variation inside filled gaps.
 
 These deterministic loss tests validate reconstruction behavior. They do not
 replace throughput and visual-quality measurements on the target hardware/link.

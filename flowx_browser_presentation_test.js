@@ -21,8 +21,8 @@ function patch(frame,key,stream=7,scale=1) {
   v.setFloat32(27,1,true);v.setFloat32(43,1,true);return u;
 }
 function harness(delayMs=0,extraQuery='') {
-  let now=0,nextTimer=0,resizes=0;
-  const timers=new Map(),nodes=new Map(),uploads=[],filters=[],uniforms=[];
+  let now=0,nextTimer=0,resizes=0,program=null;
+  const timers=new Map(),nodes=new Map(),uploads=[],filters=[],uniforms=[],draws=[];
   const location={search:'?playout_ms='+delayMs+extraQuery};
   const gl=new Proxy({}, {get:(_,name)=>{
     if(/^[A-Z_0-9]+$/.test(name)) return name;
@@ -33,6 +33,8 @@ function harness(delayMs=0,extraQuery='') {
     if(name==='texParameteri')return (...a)=>filters.push(a);
     if(name==='getUniformLocation')return (_,name)=>name;
     if(name==='uniform1i')return (name,value)=>uniforms.push({name,value});
+    if(name==='useProgram')return p=>{program=p;};
+    if(name==='drawArrays')return ()=>draws.push(program);
     return ()=>{};
   }});
   const canvas={getContext:()=>gl,style:{}};
@@ -60,9 +62,9 @@ function harness(delayMs=0,extraQuery='') {
   assert.ok(source.includes(hook));
   vm.runInContext(source.replace(hook,`
 decodeRegion=globalThis.fixtureDecode;
-globalThis.testBrowser={processDatagram,stats,state:()=>({
+globalThis.testBrowser={processDatagram,stats,filterProgram:smoothFillProg,state:()=>({
   frame:lastRenderedFrame,shown:lastPresentedFrame,key:keyFrameId,pending:restartPresentation!==null,stream:streamId,
-  queued:playout.frames.length,pool:presentationPool.length
+  queued:playout.frames.length,pool:presentationPool.length,filtered:renderKeyTex===smoothKeyTex
 }),reference:()=>restartAssembly?({
   pixels:restartAssembly.pixels.slice(),received:restartAssembly.received.slice(),
   width:restartAssembly.width,height:restartAssembly.height
@@ -70,6 +72,7 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
 `),context);
   return {
     ...context.testBrowser,canvas,timers,uploads,filters,uniforms,nodes,location,resizes:()=>resizes,
+    filterPasses:()=>draws.filter(p=>p===context.testBrowser.filterProgram).length,
     advance(ms) {
       const end=now+ms;
       for(;;) {
@@ -85,6 +88,7 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   // Startup and inactivity: one valid region must not immediately flash black.
   const quiet=harness();
   assert.equal(quiet.nodes.get('fillGaps').checked,true,'filling must remain the default');
+  assert.equal(quiet.nodes.get('smoothFills').checked,true,'smoothing must be enabled by default');
   assert.ok(!quiet.filters.some(a=>a[2]==='NEAREST'),'normal rendering lost smooth sampling');
   await quiet.processDatagram(patch(101,100));
   assert.equal(quiet.stats.renders,0);assert.equal(quiet.timers.size,0);
@@ -96,22 +100,45 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   assert.equal(fillMissingPixels(filled,waiting.received,waiting.width,waiting.height),true);
   quiet.advance(99);assert.equal(quiet.stats.renders,0,'quiet timer was not extended');
   assert.deepEqual(quiet.reference().pixels,waiting.pixels,'holes filled before wait ended');
+  assert.equal(quiet.filterPasses(),0,'smoothing ran before the wait ended');
   quiet.advance(1);assert.equal(quiet.stats.renders,1);assert.equal(quiet.state().frame,100);
+  assert.equal(quiet.filterPasses(),1);assert.equal(quiet.state().filtered,true);
   assert.deepEqual(quiet.reference().pixels,filled,'timeout did not fill key holes');
   assert.deepEqual(quiet.reference().received,waiting.received);
   assert.deepEqual(quiet.uploads.at(-1).pixels,filled,'filled reference not uploaded to WebGL');
   await quiet.processDatagram(region(2));quiet.advance(1000);
   assert.equal(quiet.stats.renders,1,'late region replayed key');
+  assert.equal(quiet.filterPasses(),1,'late region ran the filter immediately');
   const late=quiet.reference(),lateExpected=late.pixels.slice();
   fillMissingPixels(lateExpected,late.received,late.width,late.height);
   await quiet.processDatagram(patch(101,100));
   assert.deepEqual(quiet.reference().pixels,lateExpected,'PATCH did not refresh late neighbour colors');
   assert.equal(quiet.uniforms.findLast(u=>u.name==='uFillGaps').value,1);
+  assert.equal(quiet.filterPasses(),2,'late data did not refresh the filtered reference');
+  await quiet.processDatagram(patch(102,100));
+  assert.equal(quiet.filterPasses(),2,'unchanged PATCH repeated the smoothing pass');
+  assert.equal(quiet.state().filtered,true,'unchanged PATCH lost the filtered texture');
+  for(let i=3;i<count;i++)await quiet.processDatagram(region(i));
+  await quiet.processDatagram(patch(103,100));
+  assert.equal(quiet.state().filtered,false,'recovered key retained stale smoothed pixels');
+  assert.equal(quiet.filterPasses(),2,'fully recovered key was filtered');
+  assert.deepEqual(quiet.reference().pixels,Uint8Array.from(fixture.complete));
+
+  const nn=harness(0,'&smooth_fill=0&keep=example');
+  assert.equal(nn.nodes.get('smoothFills').checked,false);assert.equal(nn.filterProgram,null);
+  await nn.processDatagram(region(0));nn.advance(100);
+  assert.equal(nn.filterPasses(),0);assert.equal(nn.state().filtered,false);
+  assert.deepEqual(nn.uploads.at(-1).pixels,nn.reference().pixels,'NN-only output was not uploaded');
+  const smooth=nn.nodes.get('smoothFills');smooth.checked=true;smooth.listeners.change();
+  const smoothParams=new URLSearchParams(nn.location.search);
+  assert.equal(smoothParams.get('smooth_fill'),'1');assert.equal(smoothParams.get('fill_gaps'),'1');
+  assert.equal(smoothParams.get('keep'),'example');
 
   // The shipped URL option must bypass both fill paths, including quiet/PATCH
   // release and new streams. Assert black by the actual per-parity receipt mask.
   const raw=harness(0,'&fill_gaps=0&keep=example');
   assert.equal(raw.nodes.get('fillGaps').checked,false);
+  assert.equal(raw.nodes.get('smoothFills').disabled,true);assert.equal(raw.filterProgram,null);
   assert.equal(raw.canvas.style.imageRendering,'pixelated');
   assert.deepEqual(raw.filters.filter(a=>a[2]==='NEAREST').map(a=>a[1]),['TEXTURE_MIN_FILTER','TEXTURE_MAG_FILTER']);
   function checkMissingBlack(ref) {
@@ -137,6 +164,7 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   await raw.processDatagram(region(0,110));await raw.processDatagram(patch(111,110));
   checkMissingBlack(raw.reference());
   await raw.processDatagram(region(0,1,8));raw.advance(100);checkMissingBlack(raw.reference());
+  assert.equal(raw.filterPasses(),0);
   // UI changes reload with a clean reference, preserving other options/delay.
   const delay=raw.nodes.get('playoutDelay');delay.value='80';delay.listeners.change();
   const fill=raw.nodes.get('fillGaps');fill.checked=true;fill.listeners.change();
@@ -152,6 +180,7 @@ globalThis.testBrowser={processDatagram,stats,state:()=>({
   assert.deepEqual(h.reference().pixels,Uint8Array.from(fixture.complete),'complete key not in spatial order');
   if(fixture.tile_map.length)assert.deepEqual(h.uploads.at(-1).pixels,h.reference().pixels,'complete shuffled key used a stale texture');
   assert.equal(h.stats.renders,1,'complete key not rendered immediately');assert.equal(h.state().pending,false);
+  assert.equal(h.filterPasses(),0);assert.equal(h.state().filtered,false);
   h.advance(16);assert.equal(h.state().shown,100);
   await h.processDatagram(patch(101,100));
   const before=h.stats.renders,oldResizes=h.resizes();

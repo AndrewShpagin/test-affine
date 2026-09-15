@@ -48,11 +48,42 @@
     jpeg.set(header);jpeg.set(r.entropy,header.length);jpeg.set([255,217],jpeg.length-2);
     return jpeg;
   }
-  function fillMissingPixels(pixels,received,width,height) {
+  const smoothUnit=x=>{x=Math.max(0,Math.min(1,x));return x*x*(3-2*x);};
+  function fillFaces(valid,columns,rows) {
+    // Distances to actual usable blocks along each axis. Looking beyond the
+    // current tile avoids suppressing the filter at internal lost-tile seams.
+    const faces=new Float32Array(valid.length*4);faces.fill(Infinity);
+    for(let y=0;y<rows;y++) {
+      let left=-1,right=-1;
+      for(let x=0;x<columns;x++) {
+        const b=y*columns+x;if(valid[b])left=x;
+        if(left>=0)faces[4*b]=(x-left-1)*16+1;
+      }
+      for(let x=columns-1;x>=0;x--) {
+        const b=y*columns+x;if(valid[b])right=x;
+        if(right>=0)faces[4*b+1]=(right-x)*16;
+      }
+    }
+    for(let x=0;x<columns;x++) {
+      let top=-1,bottom=-1;
+      for(let y=0;y<rows;y++) {
+        const b=y*columns+x;if(valid[b])top=y;
+        if(top>=0)faces[4*b+2]=(y-top-1)*8+1;
+      }
+      for(let y=rows-1;y>=0;y--) {
+        const b=y*columns+x;if(valid[b])bottom=y;
+        if(bottom>=0)faces[4*b+3]=(bottom-y)*8;
+      }
+    }
+    return faces;
+  }
+  function fillMissingPixels(pixels,received,width,height,smoothing=null) {
     const columns=width/16,rows=height/8;
     if(!Number.isInteger(columns)||!Number.isInteger(rows)||columns<1||rows<1||
        pixels.length!==width*height*4||received.length!==columns*rows*2)
       throw new Error('bad nearest-fill dimensions');
+    if(smoothing&&smoothing.length!==width*height*2)throw new Error('bad smoothing dimensions');
+    if(smoothing)smoothing.fill(0);
     // A received half-block makes both interleaved columns usable through the
     // existing counterpart copy. Neither that copy nor this fill changes the
     // received mask. Pixel color, including genuine black, is not a validity flag.
@@ -62,6 +93,7 @@
       valid[b]=Number(Boolean(received[2*b]||received[2*b+1]));known+=valid[b];
     }
     if(known===0||known===valid.length)return false;
+    const faces=smoothing?fillFaces(valid,columns,rows):null;
 
     // Vertical nearest-source coordinates are identical for all 16 columns
     // in a paired block. This needs 1/16 of a full per-pixel source map.
@@ -105,19 +137,35 @@
         const sx=sites[site],sy=nearestY[y*columns+(sx>>4)];
         const from=(sy*width+sx)*4,to=(y*width+x)*4;
         for(let c=0;c<4;c++)pixels[to+c]=pixels[from+c];
+        if(smoothing) {
+          // One-pixel border is untouched; strength reaches 1 at distance 4.
+          const t=smoothUnit((Math.hypot(x-sx,y-sy)-1)/3);
+          const b=((y>>3)*columns+(x>>4))*4,u=x&15,v=y&7;
+          let first=Infinity,second=Infinity;
+          for(let side=0;side<4;side++) {
+            const d=faces[b+side]+(side===0?u:side===1?-u:side===2?v:-v);
+            if(d<first){second=first;first=d;}else if(d<second)second=d;
+          }
+          const seam=Number.isFinite(second)?1-smoothUnit((second-first-1)/1.5):1;
+          // RG8 stores radius/3 and blend strength for the single GPU pass.
+          smoothing[(to>>2)*2]=Math.round(255*t*(0.5+0.5*seam));
+          smoothing[(to>>2)*2+1]=Math.round(255*t);
+        }
       }
     }
     return true;
   }
   class RestartAssembler {
-    constructor(headers,decode,{fillGaps=true}={}) {
+    constructor(headers,decode,{fillGaps=true,smoothFills=true}={}) {
       this.headers=headers;this.decode=decode;this.fillGaps=fillGaps;this.frameId=null;this.fillDirty=false;
+      this.smoothFills=smoothFills;this.smoothing=null;
     }
     matching(r) { return this.ow===r.ow && this.oh===r.oh && this.lw===r.lw && this.lh===r.lh && this.profile===r.profile && this.layout===r.layout; }
     spatial(index) { return this.tileMap?this.tileMap[index]:index; }
     fillMissing() {
       if(!this.fillGaps||this.frameId===null||!this.fillDirty)return false;
-      const changed=fillMissingPixels(this.pixels,this.received,this.width,this.height);
+      if(this.smoothFills&&!this.smoothing)this.smoothing=new Uint8Array(this.width*this.height*2);
+      const changed=fillMissingPixels(this.pixels,this.received,this.width,this.height,this.smoothing);
       this.fillDirty=false;return changed;
     }
     async accept(u) {
@@ -141,6 +189,7 @@
         this.frameId=r.frameId;this.ow=r.ow;this.oh=r.oh;this.lw=r.lw;this.lh=r.lh;this.profile=r.profile;
         this.layout=r.layout;this.tileMap=r.layout===1?tilePermutation(r.lw,r.lh):null;
         this.width=r.lw*2;this.height=r.lh;
+        this.smoothing=null;
         this.received=new Uint8Array(2*columns*(r.lh/8));
         this.receivedCount=0;
         this.pixels=new Uint8Array(this.width*this.height*4);
