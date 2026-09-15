@@ -1,4 +1,8 @@
 /build/
+/build-win/
+/dist/
+/.vcpkg/
+/.vcpkg-cache/
 /output/
 /local-data/
 

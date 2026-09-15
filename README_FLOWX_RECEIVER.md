@@ -2,6 +2,9 @@
 
 `flowx_receiver` receives compact FlowX v4 UDP datagrams. The transport adapter reconstructs the internal AFC1 representation for the existing C++ decoder, while the browser path parses v4 directly.
 
+For a downloadable Windows x64 build, GitHub Actions, and Visual Studio 2022
+instructions, see [Windows receiver](README_WINDOWS.md).
+
 ## HTTP endpoints
 
 The default receiver config listens on HTTP port 8080 and exposes:

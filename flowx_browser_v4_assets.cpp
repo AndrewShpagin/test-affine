@@ -279,7 +279,9 @@ function renderKey(frameId,timestamp){
   current=0; gl.bindFramebuffer(gl.FRAMEBUFFER,fbo[current]); gl.viewport(0,0,outW,outH); gl.useProgram(keyProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,renderKeyTex); gl.uniform1i(gl.getUniformLocation(keyProg,'uKey'),0); gl.uniform2f(gl.getUniformLocation(keyProg,'uOutSize'),outW,outH); gl.uniform2f(gl.getUniformLocation(keyProg,'uKeySize'),keyW,keyH); draw(); queuePresentation(frameId,timestamp);
   keyFrameId=frameId; stats.keys++; stats.renders++; putStats();
 }
-function cancelRestartPresentation(){
+)FLOWXJS"
+// Keep each literal below MSVC's 16,380-byte limit; concatenation preserves JS.
+R"FLOWXJS(function cancelRestartPresentation(){
   if(restartPresentationTimer!==null) clearTimeout(restartPresentationTimer);
   restartPresentationTimer=null;restartPresentation=null;
 }
