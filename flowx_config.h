@@ -62,6 +62,9 @@ struct SenderConfig {
 struct UdpListenConfig {
     std::string bind = "0.0.0.0";
     std::uint16_t port = 5000;
+    int jitter_min_ms = 0;
+    int jitter_max_ms = 0; // 0 disables simulated receive jitter.
+    std::uint32_t jitter_seed = 1;
 };
 
 struct HttpConfig {

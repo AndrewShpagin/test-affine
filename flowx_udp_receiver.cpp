@@ -1,10 +1,13 @@
 #include "flowx_udp_receiver.h"
 
 #include <array>
+#include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
 #include <mutex>
+#include <utility>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -69,6 +72,8 @@ std::string socketErrorText(const char* operation) {
 
 struct UdpReceiver::Impl {
     SocketHandle socket = kInvalidSocket;
+    PacketJitter jitter;
+    UdpReceiveResult receiveSocket(std::vector<u_char>& datagram, int timeout_ms, std::string& error);
 
     ~Impl() { closeSocket(socket); }
 };
@@ -83,6 +88,10 @@ bool UdpReceiver::open(const UdpListenConfig& config, std::string& error) {
     if (!impl_) impl_ = std::make_unique<Impl>();
     closeSocket(impl_->socket);
     impl_->socket = kInvalidSocket;
+    if (config.jitter_min_ms < 0 || config.jitter_max_ms < config.jitter_min_ms || config.jitter_max_ms > 1000) {
+        error = "UDP jitter must satisfy 0 <= min <= max <= 1000 ms"; return false;
+    }
+    impl_->jitter.reset(config.jitter_min_ms, config.jitter_max_ms, config.jitter_seed);
 
     if (!ensureSocketSystem(error)) return false;
 
@@ -144,10 +153,40 @@ UdpReceiveResult UdpReceiver::receive(std::vector<u_char>& datagram,
         error = "UDP receiver is not open";
         return UdpReceiveResult::Error;
     }
+    timeout_ms = std::max(0, timeout_ms);
+    if (!impl_->jitter.enabled()) return impl_->receiveSocket(datagram, timeout_ms, error);
+
+    using Clock = PacketJitter::Clock;
+    const auto deadline = Clock::now()+std::chrono::milliseconds(timeout_ms);
+    bool polled = false;
+    for (;;) {
+        const auto now = Clock::now();
+        if (impl_->jitter.popReady(now, datagram)) return UdpReceiveResult::Datagram;
+        if (polled && now >= deadline) return UdpReceiveResult::Timeout;
+        auto wake = deadline;
+        if (const auto due = impl_->jitter.nextDue()) wake = std::min(wake, *due);
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(wake-now).count();
+        const int wait_ms = static_cast<int>(std::clamp<decltype(remaining)>(remaining, 0, timeout_ms));
+        const auto result = impl_->receiveSocket(datagram, wait_ms, error);
+        polled = true;
+        if (result == UdpReceiveResult::Datagram) {
+            if (!impl_->jitter.enqueue(std::move(datagram), Clock::now())) {
+                datagram.clear(); error = "simulated UDP jitter queue full";
+                return UdpReceiveResult::Ignored;
+            }
+            datagram.clear();
+        } else if (result != UdpReceiveResult::Timeout) return result;
+        // Continue accepting arrivals while older packets wait. Return by the
+        // caller's deadline so key-assembly timers still run during UDP silence.
+    }
+}
+
+UdpReceiveResult UdpReceiver::Impl::receiveSocket(std::vector<u_char>& datagram,
+                                                int timeout_ms, std::string& error) {
 
     fd_set read_set;
     FD_ZERO(&read_set);
-    FD_SET(impl_->socket, &read_set);
+    FD_SET(socket, &read_set);
 
     timeval timeout{};
     timeout.tv_sec = timeout_ms / 1000;
@@ -156,7 +195,7 @@ UdpReceiveResult UdpReceiver::receive(std::vector<u_char>& datagram,
 #ifdef _WIN32
     const int ready = ::select(0, &read_set, nullptr, nullptr, &timeout);
 #else
-    const int ready = ::select(impl_->socket + 1, &read_set, nullptr, nullptr, &timeout);
+    const int ready = ::select(socket + 1, &read_set, nullptr, nullptr, &timeout);
 #endif
     if (ready == 0) return UdpReceiveResult::Timeout;
     if (ready < 0) {
@@ -170,12 +209,12 @@ UdpReceiveResult UdpReceiver::receive(std::vector<u_char>& datagram,
     // rejected explicitly rather than silently truncated to the FlowX limit.
     std::array<u_char, 65536> buffer{};
 #ifdef _WIN32
-    const int bytes = ::recvfrom(impl_->socket,
+    const int bytes = ::recvfrom(socket,
                                  reinterpret_cast<char*>(buffer.data()),
                                  static_cast<int>(buffer.size()),
                                  0, nullptr, nullptr);
 #else
-    const ssize_t bytes = ::recvfrom(impl_->socket, buffer.data(), buffer.size(),
+    const ssize_t bytes = ::recvfrom(socket, buffer.data(), buffer.size(),
                                      0, nullptr, nullptr);
 #endif
     if (bytes < 0) {
@@ -201,6 +240,10 @@ UdpReceiveResult UdpReceiver::receive(std::vector<u_char>& datagram,
 
 bool UdpReceiver::isOpen() const {
     return impl_ && impl_->socket != kInvalidSocket;
+}
+
+PacketJitterStats UdpReceiver::jitterStats() const {
+    return impl_ ? impl_->jitter.stats() : PacketJitterStats{};
 }
 
 } // namespace flowx

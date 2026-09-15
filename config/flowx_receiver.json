@@ -1,7 +1,10 @@
 {
   "udp": {
     "bind": "0.0.0.0",
-    "port": 5000
+    "port": 5000,
+    "jitter_min_ms": 0,
+    "jitter_max_ms": 0,
+    "jitter_seed": 1
   },
   "decoder": {
     "fill_gaps": true,

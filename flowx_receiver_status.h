@@ -1,5 +1,7 @@
 #pragma once
 
+#include "flowx_packet_jitter.h"
+
 #include <cstdint>
 #include <mutex>
 
@@ -16,6 +18,7 @@ struct ReceiverStatus {
     std::uint64_t ignored_other_stream = 0;
     std::uint64_t stale_frames = 0;
     std::uint64_t stream_resets = 0;
+    PacketJitterStats simulated_jitter;
 
     std::uint64_t decoded_frames = 0;
     std::uint64_t decoded_keyframes = 0;

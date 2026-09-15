@@ -54,11 +54,11 @@ void requirePositive(double value, const char* name) {
         throw std::runtime_error(std::string(name) + " must be > 0");
 }
 
-int parsePlaybackMs(const json& playback, const char* key, int fallback, int maximum) {
+int parsePlaybackMs(const json& playback, const char* key, int fallback, int maximum, const char* section = "playback") {
     const auto it = playback.find(key);
     if (it == playback.end()) return fallback;
     if (!it->is_number_integer() || it->get<double>() < 0 || it->get<double>() > maximum)
-        throw std::runtime_error(std::string("playback.")+key+" must be an integer in [0, "+std::to_string(maximum)+"]");
+        throw std::runtime_error(std::string(section)+"."+key+" must be an integer in [0, "+std::to_string(maximum)+"]");
     return it->get<int>();
 }
 
@@ -206,6 +206,16 @@ ReceiverConfig loadReceiverConfig(const std::string& filename) {
     cfg.udp.bind = udp.value("bind", cfg.udp.bind);
     cfg.udp.port = parsePort(udp, "port", cfg.udp.port);
     if (cfg.udp.bind.empty()) throw std::runtime_error("udp.bind must not be empty");
+    cfg.udp.jitter_min_ms = parsePlaybackMs(udp, "jitter_min_ms", 0, 1000, "udp");
+    cfg.udp.jitter_max_ms = parsePlaybackMs(udp, "jitter_max_ms", 0, 1000, "udp");
+    if (cfg.udp.jitter_max_ms < cfg.udp.jitter_min_ms)
+        throw std::runtime_error("udp.jitter_max_ms must be >= udp.jitter_min_ms");
+    const auto seed_it = udp.find("jitter_seed");
+    if (seed_it != udp.end()) {
+        if (!seed_it->is_number_integer() || seed_it->get<double>() < 0 || seed_it->get<double>() > 4294967295.0)
+            throw std::runtime_error("udp.jitter_seed must be an integer in [0, 4294967295]");
+        cfg.udp.jitter_seed = seed_it->get<std::uint32_t>();
+    }
 
     const json& http = objectMember(root, "http");
     cfg.http.bind = http.value("bind", cfg.http.bind);

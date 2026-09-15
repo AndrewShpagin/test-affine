@@ -154,6 +154,12 @@ struct HttpServer::Impl {
             {"other_stream", s.ignored_other_stream}, {"stale_frames", s.stale_frames},
             {"stream_resets", s.stream_resets}
         };
+        const auto& jitter = s.simulated_jitter;
+        root["udp"]["sim_jitter"] = {
+            {"min_ms", jitter.min_ms}, {"max_ms", jitter.max_ms}, {"seed", jitter.seed},
+            {"scheduled", jitter.scheduled}, {"delivered", jitter.delivered},
+            {"queued", jitter.queued}, {"overflow", jitter.overflow}
+        };
         root["decode"] = {
             {"frames", s.decoded_frames}, {"keyframes", s.decoded_keyframes},
             {"patches", s.decoded_patches}

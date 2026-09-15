@@ -81,6 +81,7 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/flowx_browser_playout.js" FLOWX_BROWSER_P
 configure_file(flowx_browser_playout_source.h.in flowx_browser_playout_source.h @ONLY)
 add_library(flowx_receiver_runtime
     flowx_udp_receiver.cpp
+    flowx_packet_jitter.cpp
     flowx_frame_store.cpp
     flowx_raw_store.cpp
     flowx_browser_v4_assets.cpp
@@ -104,6 +105,8 @@ target_link_libraries(flowx_receiver PRIVATE flowx_receiver_runtime)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(flowx_packet_jitter_test flowx_packet_jitter_test.cpp flowx_packet_jitter.cpp)
+    add_test(NAME flowx_packet_jitter COMMAND flowx_packet_jitter_test)
     add_executable(jpeg_restart_test jpeg_restart_test.cpp)
     target_link_libraries(jpeg_restart_test PRIVATE flowx_receiver_runtime)
     add_test(NAME flowx_protocol COMMAND flowx_protocol_test)

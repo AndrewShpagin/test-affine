@@ -31,6 +31,17 @@ const keyBurst=harness(60);keyBurst.q.observe(0,1000,0);
 keyBurst.arrive(0,1000,50);keyBurst.arrive(1,1050,50);
 keyBurst.tick(60);keyBurst.tick(100);keyBurst.tick(110);
 assert.deepEqual(keyBurst.shown,[{id:0,at:60},{id:1,at:110}]);
+// With the user's 30 ms assembly / 40 ms playout settings, assembly consumes
+// part of the same budget rather than starting another 40 ms delay afterward.
+const within=harness(40);within.q.observe(0,1000,0);
+within.arrive(0,1000,30);within.tick(39);assert.equal(within.shown.length,0);
+within.tick(40);within.arrive(1,1050,75);within.tick(90);
+assert.deepEqual(within.shown,[{id:0,at:40},{id:1,at:90}]);
+// If assembly/network misses that budget, preserving fixed spacing is no
+// longer guaranteed: overdue frames may be skipped to avoid a growing backlog.
+const overdue=harness(40);overdue.q.observe(0,1000,0);
+overdue.arrive(0,1000,100);overdue.arrive(1,1050,100);overdue.tick(100);
+assert.deepEqual(overdue.shown,[{id:1,at:100}]);assert.equal(overdue.drops(),1);
 // Missing source frames retain their missing time slots; do not speed up motion.
 const lost=harness();
 lost.arrive(0,1000,0);lost.tick(40);

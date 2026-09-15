@@ -178,6 +178,7 @@ int main(int argc, char** argv) {
             status.ignored_other_stream = ignored_other_stream;
             status.stale_frames = stale_frames;
             status.stream_resets = stream_resets;
+            status.simulated_jitter = udp.jitterStats();
             status.decoded_frames = decoded_frames;
             status.decoded_keyframes = decoded_keyframes;
             status.decoded_patches = decoded_patches;
@@ -224,6 +225,9 @@ int main(int argc, char** argv) {
                   << ", smooth fill: " << (cfg.decoder.fill_gaps && cfg.decoder.smooth_fill) << '\n';
         std::cout << "  keyframe assembly wait: " << cfg.playback.keyframe_wait_ms << " ms\n"
                   << "  browser playout delay: " << cfg.playback.playout_ms << " ms\n";
+        if (cfg.udp.jitter_max_ms > 0)
+            std::cout << "  simulated UDP jitter: " << cfg.udp.jitter_min_ms << ".."
+                      << cfg.udp.jitter_max_ms << " ms, seed=" << cfg.udp.jitter_seed << '\n';
         if (!dump_last_file.empty())
             std::cout << "  debug dump on exit: " << dump_last_file << '\n';
 
@@ -245,7 +249,7 @@ int main(int argc, char** argv) {
                     key_wait_deadline-std::chrono::steady_clock::now()).count())+1, 1, 250);
             std::vector<flowx::u_char> datagram;
             const flowx::UdpReceiveResult receive_result = udp.receive(datagram, receive_wait_ms, error);
-            if (receive_result == flowx::UdpReceiveResult::Timeout) continue;
+            if (receive_result == flowx::UdpReceiveResult::Timeout) { publishStatus(); continue; }
             if (receive_result == flowx::UdpReceiveResult::Error) {
                 if (g_stop.load(std::memory_order_relaxed)) break;
                 std::cerr << "UDP receive failed: " << error << '\n';
@@ -375,6 +379,10 @@ int main(int argc, char** argv) {
                           << " decoded=" << decoded_frames
                           << " (key=" << decoded_keyframes
                           << " patch=" << decoded_patches << ')';
+                if (cfg.udp.jitter_max_ms > 0) {
+                    const auto jitter = udp.jitterStats();
+                    std::cout << " jitter-queued=" << jitter.queued << " jitter-overflow=" << jitter.overflow;
+                }
                 if (latest) {
                     std::cout << " latest=" << latest->metadata.frame_id
                               << " " << latest->image.cols << 'x' << latest->image.rows;

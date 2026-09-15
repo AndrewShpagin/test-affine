@@ -15,6 +15,12 @@ The default receiver config listens on HTTP port 8080 and exposes:
 
 JPEG encoding for `/frame.jpg` and `/stream.mjpg` is lazy and cached by decoded-frame sequence.
 
+For timing tests, `udp.jitter_min_ms`, `udp.jitter_max_ms`, and `udp.jitter_seed`
+simulate independent receive delays before both decoding paths. For example,
+`0`, `80`, `1` adds 0–80 ms per packet and permits reordering. Defaults `0`, `0`
+disable this. See `README_FLOWX_LOSS_TEST.md` for limits, counters, reproducibility,
+and combining jitter with sender-side packet loss.
+
 ## MJPEG loss concealment
 
 The C++ path now fills lost JPEG restart regions like `/flowx.html`: first the

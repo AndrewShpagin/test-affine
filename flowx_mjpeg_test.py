@@ -28,7 +28,7 @@ def wait_for(fn, timeout=5):
         time.sleep(.01)
 
 
-def run(receiver, fixture, mode, playback=None):
+def run(receiver, fixture, mode, playback=None, jitter=None):
     udp_port, http_port = free_port(socket.SOCK_DGRAM), free_port(socket.SOCK_STREAM)
     config = {'udp': {'bind': '127.0.0.1', 'port': udp_port},
               'http': {'bind': '127.0.0.1', 'port': http_port, 'jpeg_quality': 85},
@@ -38,6 +38,8 @@ def run(receiver, fixture, mode, playback=None):
         del config['decoder']
     if playback is not None:
         config['playback'] = playback
+    if jitter is not None:
+        config['udp'].update(jitter)
     with tempfile.TemporaryDirectory() as temp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         path = Path(temp) / 'receiver.json'
         path.write_text(json.dumps(config))
@@ -76,6 +78,7 @@ def run(receiver, fixture, mode, playback=None):
                                  123456, (frame-key) & 65535, fixture['width'], fixture['height'], 0)
                 struct.pack_into('<6f', data, 27, 1, 0, 0, 0, 1, 0)
                 send(data)
+                return bytes(data)
             def drained():
                 return wait_for(lambda: status()['udp']['datagrams'] >= sent)
             def frame_is(frame, stream=7):
@@ -112,6 +115,49 @@ def run(receiver, fixture, mode, playback=None):
                 assert defaults.startswith(b'globalThis.FLOWX_PLAYBACK_DEFAULTS=')
                 assert json.loads(defaults.split(b'=', 1)[1].rstrip(b';')) == expected_playback
                 assert request('/frame.jpg')[0] == 503
+                if jitter is not None:
+                    begin = time.monotonic()
+                    region(0)
+                    if jitter['jitter_min_ms']:
+                        time.sleep(jitter['jitter_min_ms']/2000)
+                        assert status()['udp']['datagrams'] == 0, 'packet released before simulated latency'
+                    state = wait_for(lambda: frame_is(100))
+                    assert time.monotonic()-begin >= (jitter['jitter_min_ms']+playback['keyframe_wait_ms'])/1000-.01
+                    assert state['frame']['capture_timestamp_us'] == 123456, 'jitter changed capture timestamp'
+                    # Drain late regions, then a PATCH must use the recovered reference.
+                    for i in range(1, len(fixture['regions'])):
+                        region(i)
+                    drained()
+                    assert status()['decode']['frames'] == 1, 'jitter/late data replayed key'
+                    wire_patch = patch(101, 100); wait_for(lambda: frame_is(101)); drained()
+                    sim = status()['udp']['sim_jitter']
+                    assert sim['min_ms'] == jitter['jitter_min_ms'] and sim['max_ms'] == jitter['jitter_max_ms']
+                    assert sim['seed'] == jitter['jitter_seed'] and sim['scheduled'] == sim['delivered'] == sent
+                    assert sim['queued'] == sim['overflow'] == 0
+                    headers, body = mjpeg()
+                    assert headers[b'x-flowx-frame-id'] == b'101' and body == request('/frame.jpg')[1]
+                    # The browser transport must receive the same delayed,
+                    # unmodified packets, including their capture timestamps.
+                    conn = http.client.HTTPConnection('127.0.0.1', http_port, timeout=3)
+                    try:
+                        conn.request('GET', '/flowx.bin'); response = conn.getresponse()
+                        assert response.status == 200
+                        head = response.read(12); assert head[:4] == b'FXB1'
+                        size = struct.unpack_from('<I',head,8)[0]
+                        record = head+response.read(size-12)
+                        count = struct.unpack_from('<H',record,24)[0]
+                        packets, pos = [], 28
+                        for _ in range(count):
+                            length = struct.unpack_from('<H',record,pos)[0]; pos += 2
+                            packets.append(record[pos:pos+length]); pos += length
+                        expected = [bytes(r['wire']) for r in fixture['regions']]+[wire_patch]
+                        assert pos == len(record) and sorted(packets) == sorted(expected), 'browser packet bytes changed'
+                        if jitter['jitter_min_ms'] != jitter['jitter_max_ms']:
+                            assert packets != expected, 'receiver did not reorder random-delay packets'
+                    finally:
+                        conn.close()
+                    print(f"PASS: receive jitter {jitter}, deadlines, late recovery, MJPEG and raw browser packets")
+                    return
                 if playback is not None:
                     delay = playback['keyframe_wait_ms'] / 1000
                     first_at = time.monotonic()
@@ -212,6 +258,9 @@ if __name__ == '__main__':
         run(receiver, fixture, mode)
     for playback in ({'keyframe_wait_ms': 0, 'playout_ms': 0}, {'keyframe_wait_ms': 300, 'playout_ms': 120}):
         run(receiver, fixture, 'smooth', playback)
+    for jitter in ({'jitter_min_ms':80,'jitter_max_ms':80,'jitter_seed':1},
+                   {'jitter_min_ms':0,'jitter_max_ms':80,'jitter_seed':42}):
+        run(receiver, fixture, 'smooth', {'keyframe_wait_ms':30,'playout_ms':40}, jitter)
     # Reject invalid timing settings before opening network listeners.
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp) / 'invalid.json'
@@ -221,3 +270,8 @@ if __name__ == '__main__':
             path.write_text(json.dumps({'udp': {}, 'http': {}, 'playback': playback}))
             result = subprocess.run([receiver, str(path)], capture_output=True, text=True, timeout=5)
             assert result.returncode != 0 and 'playback' in result.stderr, 'invalid playback accepted'
+        for udp in ({'jitter_min_ms':-1}, {'jitter_max_ms':1001}, {'jitter_min_ms':20,'jitter_max_ms':10},
+                    {'jitter_max_ms':1.5}, {'jitter_max_ms':True}, {'jitter_seed':-1}, {'jitter_seed':4294967296}):
+            path.write_text(json.dumps({'udp':udp,'http':{}}))
+            result = subprocess.run([receiver,str(path)],capture_output=True,text=True,timeout=5)
+            assert result.returncode != 0 and 'udp.jitter_' in result.stderr, 'invalid jitter config accepted'

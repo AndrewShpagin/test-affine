@@ -2,6 +2,7 @@
 
 #include "flowx_config.h"
 #include "flowx_protocol.h"
+#include "flowx_packet_jitter.h"
 
 #include <memory>
 #include <string>
@@ -31,6 +32,7 @@ public:
                              int timeout_ms,
                              std::string& error);
     bool isOpen() const;
+    PacketJitterStats jitterStats() const;
 
 private:
     struct Impl;
