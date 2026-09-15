@@ -7,6 +7,10 @@
     "fill_gaps": true,
     "smooth_fill": true
   },
+  "playback": {
+    "keyframe_wait_ms": 100,
+    "playout_ms": 60
+  },
   "http": {
     "bind": "0.0.0.0",
     "port": 8002,

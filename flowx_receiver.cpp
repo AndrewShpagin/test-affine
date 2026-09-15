@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
         flowx::PacketMetadata pending_key_metadata;
         std::uint64_t pending_key_receive_us = 0;
         auto key_wait_deadline = std::chrono::steady_clock::time_point{};
-        constexpr auto key_quiet_wait = std::chrono::milliseconds(100);
+        const auto key_wait = std::chrono::milliseconds(cfg.playback.keyframe_wait_ms);
 
         auto clearDecoderState = [&] {
             decoder = std::make_unique<flowx::Decoder>();
@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
         };
 
         flowx::HttpServer http_server;
-        if (!http_server.start(cfg.http, frame_store, raw_frame_store, status_store, error))
+        if (!http_server.start(cfg.http, frame_store, raw_frame_store, status_store, error, cfg.playback))
             throw std::runtime_error("HTTP server start failed: " + error);
 
         std::cout << "FlowX receiver\n"
@@ -222,6 +222,8 @@ int main(int argc, char** argv) {
                   << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n"
                   << "  decoder fill gaps: " << cfg.decoder.fill_gaps
                   << ", smooth fill: " << (cfg.decoder.fill_gaps && cfg.decoder.smooth_fill) << '\n';
+        std::cout << "  keyframe assembly wait: " << cfg.playback.keyframe_wait_ms << " ms\n"
+                  << "  browser playout delay: " << cfg.playback.playout_ms << " ms\n";
         if (!dump_last_file.empty())
             std::cout << "  debug dump on exit: " << dump_last_file << '\n';
 
@@ -232,15 +234,15 @@ int main(int argc, char** argv) {
         bool fatal_error = false;
 
         while (!g_stop.load(std::memory_order_relaxed)) {
-            // Check even under continuous invalid/duplicate traffic. Only newly
-            // decoded regions extend the quiet period; UDP inactivity also releases it.
+            // Check even under continuous packet traffic. The first accepted
+            // packet fixes the deadline; subsequent regions cannot extend it.
             if (pending_restart_key && std::chrono::steady_clock::now() >= key_wait_deadline) {
                 publishKey(); publishStatus();
             }
             int receive_wait_ms = 250;
             if (pending_restart_key) receive_wait_ms = std::clamp<int>(
                 int(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    key_wait_deadline-std::chrono::steady_clock::now()).count())+1, 1, 100);
+                    key_wait_deadline-std::chrono::steady_clock::now()).count())+1, 1, 250);
             std::vector<flowx::u_char> datagram;
             const flowx::UdpReceiveResult receive_result = udp.receive(datagram, receive_wait_ms, error);
             if (receive_result == flowx::UdpReceiveResult::Timeout) continue;
@@ -259,6 +261,7 @@ int main(int argc, char** argv) {
             ++received_datagrams;
             received_bytes += datagram.size();
             const std::uint64_t receive_timestamp_us = systemTimestampUs();
+            const auto received_at = std::chrono::steady_clock::now();
 
             flowx::FlowXPacket packet;
             if (!flowx::unwrapCodecPacket(datagram, packet, &error)) {
@@ -308,7 +311,6 @@ int main(int argc, char** argv) {
             // replace its reference (including keyframe-only streams with loss).
             if (pending_restart_key && metadata.frame_id == metadata.keyframe_id &&
                 frameIdNewer(metadata.frame_id, decoder->keyframeId())) publishKey();
-            const auto previous_blocks = decoder->restartReceivedBlocks();
             decoder->pushData(packet.codec_packet);
 
             std::vector<flowx::u_char> new_jpeg;
@@ -317,13 +319,12 @@ int main(int argc, char** argv) {
                 pending_key_metadata = metadata;
                 pending_key_receive_us = receive_timestamp_us;
                 pending_restart_key = decoder->restartTotalBlocks() != 0;
-                key_wait_deadline = std::chrono::steady_clock::now()+key_quiet_wait;
+                key_wait_deadline = received_at+key_wait;
                 if (!pending_restart_key) publishKey();
             }
             if (pending_restart_key) {
-                if (decoder->restartReceivedBlocks() != previous_blocks)
-                    key_wait_deadline = std::chrono::steady_clock::now()+key_quiet_wait;
-                if (decoder->restartReceivedBlocks() == decoder->restartTotalBlocks()) publishKey();
+                if (decoder->restartReceivedBlocks() == decoder->restartTotalBlocks() ||
+                    std::chrono::steady_clock::now() >= key_wait_deadline) publishKey();
             }
 
             std::vector<flowx::PatchData> patch;

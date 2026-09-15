@@ -93,6 +93,7 @@ bool serializeBrowserRecord(const RawFrameBundle& bundle, std::vector<u_char>& o
 
 struct HttpServer::Impl {
     HttpConfig config;
+    PlaybackConfig playback;
     const FrameStore* frames = nullptr;
     const RawFrameStore* raw_frames = nullptr;
     const ReceiverStatusStore* status = nullptr;
@@ -142,6 +143,7 @@ struct HttpServer::Impl {
         json root;
         root["flowx_version"] = kProtocolVersion;
         root["active_stream_id"] = s.active_stream_id;
+        root["playback"] = {{"keyframe_wait_ms", playback.keyframe_wait_ms}, {"playout_ms", playback.playout_ms}};
         root["uptime_ms"] = s.started_timestamp_us > 0 && now_us >= s.started_timestamp_us
             ? static_cast<double>(now_us - s.started_timestamp_us) / 1000.0
             : 0.0;
@@ -208,9 +210,11 @@ struct HttpServer::Impl {
             addNoCacheHeaders(res);
             res.set_content(std::string(browserHtml()), "text/html; charset=utf-8");
         });
-        server.Get(kBrowserScriptEndpoint, [](const httplib::Request&, httplib::Response& res) {
+        server.Get(kBrowserScriptEndpoint, [this](const httplib::Request&, httplib::Response& res) {
             addNoCacheHeaders(res);
-            res.set_content(std::string(browserJs()), "application/javascript; charset=utf-8");
+            const json defaults = {{"keyframe_wait_ms", playback.keyframe_wait_ms}, {"playout_ms", playback.playout_ms}};
+            res.set_content("globalThis.FLOWX_PLAYBACK_DEFAULTS=" + defaults.dump() + ";\n" + std::string(browserJs()),
+                            "application/javascript; charset=utf-8");
         });
 
         server.Get(kBrowserStreamEndpoint, [this](const httplib::Request&, httplib::Response& res) {
@@ -290,7 +294,8 @@ bool HttpServer::start(const HttpConfig& config,
                        const FrameStore& frames,
                        const RawFrameStore& raw_frames,
                        const ReceiverStatusStore& status,
-                       std::string& error) {
+                       std::string& error,
+                       const PlaybackConfig& playback) {
     error.clear();
     if (!impl_) impl_ = std::make_unique<Impl>();
     if (impl_->running.load(std::memory_order_relaxed)) { error = "HTTP server is already running"; return false; }
@@ -308,6 +313,7 @@ bool HttpServer::start(const HttpConfig& config,
             if (endpoints[i] == endpoints[j]) { error = "HTTP endpoint paths must be unique"; return false; }
 
     impl_->config = config;
+    impl_->playback = playback;
     impl_->frames = &frames;
     impl_->raw_frames = &raw_frames;
     impl_->status = &status;

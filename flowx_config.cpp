@@ -54,6 +54,14 @@ void requirePositive(double value, const char* name) {
         throw std::runtime_error(std::string(name) + " must be > 0");
 }
 
+int parsePlaybackMs(const json& playback, const char* key, int fallback, int maximum) {
+    const auto it = playback.find(key);
+    if (it == playback.end()) return fallback;
+    if (!it->is_number_integer() || it->get<double>() < 0 || it->get<double>() > maximum)
+        throw std::runtime_error(std::string("playback.")+key+" must be an integer in [0, "+std::to_string(maximum)+"]");
+    return it->get<int>();
+}
+
 void requirePositive(int value, const char* name) {
     if (value <= 0)
         throw std::runtime_error(std::string(name) + " must be > 0");
@@ -181,6 +189,12 @@ SenderConfig loadSenderConfig(const std::string& filename) {
 ReceiverConfig loadReceiverConfig(const std::string& filename) {
     const json root = readJsonFile(filename);
     ReceiverConfig cfg;
+    const auto playback_it = root.find("playback");
+    if (playback_it != root.end()) {
+        if (!playback_it->is_object()) throw std::runtime_error("playback must be a JSON object");
+        cfg.playback.keyframe_wait_ms = parsePlaybackMs(*playback_it, "keyframe_wait_ms", cfg.playback.keyframe_wait_ms, 1000);
+        cfg.playback.playout_ms = parsePlaybackMs(*playback_it, "playout_ms", cfg.playback.playout_ms, 200);
+    }
     const auto decode_it = root.find("decoder");
     if (decode_it != root.end()) {
         if (!decode_it->is_object()) throw std::runtime_error("decoder must be a JSON object");

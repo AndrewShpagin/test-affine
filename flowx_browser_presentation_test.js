@@ -20,10 +20,10 @@ function patch(frame,key,stream=7,scale=1) {
   v.setUint16(20,(frame-key)>>>0,true);v.setUint16(22,fixture.width*scale,true);v.setUint16(24,fixture.height*scale,true);
   v.setFloat32(27,1,true);v.setFloat32(43,1,true);return u;
 }
-function harness(delayMs=0,extraQuery='') {
+function harness(delayMs=0,extraQuery='',defaults={}) {
   let now=0,nextTimer=0,resizes=0,program=null;
   const timers=new Map(),nodes=new Map(),uploads=[],filters=[],uniforms=[],draws=[];
-  const location={search:'?playout_ms='+delayMs+extraQuery};
+  const location={search:(delayMs===null?'?':'?playout_ms='+delayMs)+extraQuery};
   const gl=new Proxy({}, {get:(_,name)=>{
     if(/^[A-Z_0-9]+$/.test(name)) return name;
     if(name==='getShaderParameter'||name==='getProgramParameter') return ()=>true;
@@ -44,6 +44,8 @@ function harness(delayMs=0,extraQuery='') {
   nodes.set('view',canvas);
   const context=vm.createContext({
     console,Uint8Array,DataView,Float32Array,URLSearchParams,location,
+    FLOWX_PLAYBACK_DEFAULTS:defaults,
+    history:{replaceState:(_,title,url)=>{location.search=url;}},
     performance:{now:()=>now},
     requestAnimationFrame:fn=>{const id=++nextTimer;timers.set(id,{fn,at:(Math.floor(now/16)+1)*16});return id;},
     cancelAnimationFrame:id=>timers.delete(id),
@@ -98,7 +100,7 @@ globalThis.testBrowser={processDatagram,stats,filterProgram:smoothFillProg,state
   await quiet.processDatagram(region(1));
   const waiting=quiet.reference(),filled=waiting.pixels.slice();
   assert.equal(fillMissingPixels(filled,waiting.received,waiting.width,waiting.height),true);
-  quiet.advance(99);assert.equal(quiet.stats.renders,0,'quiet timer was not extended');
+  quiet.advance(0);assert.equal(quiet.stats.renders,0,'key was released before its deadline');
   assert.deepEqual(quiet.reference().pixels,waiting.pixels,'holes filled before wait ended');
   assert.equal(quiet.filterPasses(),0,'smoothing ran before the wait ended');
   quiet.advance(1);assert.equal(quiet.stats.renders,1);assert.equal(quiet.state().frame,100);
@@ -123,6 +125,41 @@ globalThis.testBrowser={processDatagram,stats,filterProgram:smoothFillProg,state
   assert.equal(quiet.state().filtered,false,'recovered key retained stale smoothed pixels');
   assert.equal(quiet.filterPasses(),2,'fully recovered key was filtered');
   assert.deepEqual(quiet.reference().pixels,Uint8Array.from(fixture.complete));
+
+  // Server defaults are shared with MJPEG; URL/UI values override per browser.
+  const defaults={keyframe_wait_ms:250,playout_ms:80};
+  const configured=harness(null,'',defaults);
+  assert.equal(configured.nodes.get('keyframeWait').value,'250');
+  assert.equal(configured.nodes.get('playoutDelay').value,'80');
+  await configured.processDatagram(region(0));configured.advance(100);
+  await configured.processDatagram(region(1));configured.advance(149);
+  assert.equal(configured.stats.renders,0,'configured wait fell back to 100 ms');
+  configured.advance(1);assert.equal(configured.stats.renders,1,'later packet extended first-packet deadline');
+  configured.advance(6);assert.equal(configured.state().shown,100,'playout and assembly waits were added serially');
+  const immediate=harness(0,'&keyframe_wait_ms=0',defaults);
+  await immediate.processDatagram(region(0));
+  assert.equal(immediate.stats.renders,1,'zero assembly wait did not release the first region');
+  const short=harness(0,'&keyframe_wait_ms=25',defaults);
+  await short.processDatagram(region(0));short.advance(24);assert.equal(short.stats.renders,0);
+  short.advance(1);assert.equal(short.stats.renders,1);
+  const live=harness(0,'&keyframe_wait_ms=100&keep=example',defaults);
+  await live.processDatagram(region(0));live.advance(50);
+  const wait=live.nodes.get('keyframeWait');wait.value='80';wait.listeners.change();
+  live.advance(29);assert.equal(live.stats.renders,0);
+  live.advance(1);assert.equal(live.stats.renders,1,'UI reset the first-packet age');
+  live.advance(100);assert.equal(live.stats.renders,1,'old timer replayed the key');
+  assert.equal(new URLSearchParams(live.location.search).get('keyframe_wait_ms'),'80');
+  assert.equal(new URLSearchParams(live.location.search).get('keep'),'example');
+  await live.processDatagram(region(0,110));live.advance(10);
+  wait.value='0';wait.listeners.change();assert.equal(live.state().frame,110,'live zero wait did not release pending key');
+  const extended=harness(0,'&keyframe_wait_ms=25');
+  await extended.processDatagram(region(0));extended.advance(20);
+  const longer=extended.nodes.get('keyframeWait');longer.value='60';longer.listeners.change();
+  extended.advance(39);assert.equal(extended.stats.renders,0);
+  extended.advance(1);assert.equal(extended.stats.renders,1);
+  for(const [value,expected] of [['-1','0'],['2000','1000'],['NaN','250'],['','250']])
+    assert.equal(harness(null,'&keyframe_wait_ms='+value,defaults).nodes.get('keyframeWait').value,expected);
+  assert.equal(harness(null,'&playout_ms=NaN',defaults).nodes.get('playoutDelay').value,'80');
 
   const nn=harness(0,'&smooth_fill=0&keep=example');
   assert.equal(nn.nodes.get('smoothFills').checked,false);assert.equal(nn.filterProgram,null);
