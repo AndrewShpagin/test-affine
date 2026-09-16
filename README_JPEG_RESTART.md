@@ -22,22 +22,30 @@ entropy budget = 1300 - 36 = 1264 bytes
 initial interval <= floor(1264 / (8 * 8 * 0.35)) = 56 MCUs
 ```
 
-The interval is a divisor of the number of MCU columns. Thus no region crosses
-a row, and every decoded region is exactly 8 pixels high. After compression the
-sender measures every segment. If any is too large, it reduces the interval
-and re-encodes the half until all fit. The 0.35 estimate is only a starting
-point, never an assumed compression guarantee. Widths with few divisors can
-produce more, smaller packets; this is a deliberate first-version tradeoff.
+The interval counts consecutive MCUs independently of row width. A segment may
+start partway through one row and continue across several rows. The last segment
+contains only the remaining blocks; the interval need not divide the image size.
+After compression, the sender measures every segment. If any is too large, it
+reduces the interval and re-encodes the half until all fit. When segments are
+small, it tries up to two larger intervals, aiming for the largest segment to
+use 90% of the entropy budget. If a growth attempt exceeds the limit, it keeps
+the last fully checked result. This bounds extra growth work and permits smooth
+images to exceed the initial 56-MCU estimate. Image size and local complexity
+still affect the mean; filling every datagram to 1300 bytes is not guaranteed.
 
 Each packet carries the bytes between restart markers, with JPEG byte stuffing
 and final bit padding preserved. Restart markers are removed. The decoder adds
-SOI, fixed DQT/DHT/SOF0/SOS, and EOI locally, with the region width and height 8.
+SOI, fixed DQT/DHT/SOF0/SOS, and EOI locally, decoding to a temporary strip whose
+width is `8 * block_count` and height is 8, regardless of the half-image width.
 DC prediction starts at zero for every region. There is no dependency on an
 earlier segment or on the segment's original RST number.
 
 Coordinates refer to the **encoded keyframe raster**, before it is scaled to
-the original output dimensions. Sample `i` is placed at `(x + 2*i, y + row)`.
-The low bit of `x` selects even or odd columns. See
+the original output dimensions. With `C = half_width / 8`, the starting block
+is `(y / 8) * C + floor(x / 16)`. Each subsequent decoded 8x8 block advances
+that index, wrapping naturally to the next row. Optional shuffle maps this
+encoded index back to its spatial index. The low bit of `x` selects even or odd
+columns. No extra coordinates or header bytes are needed. See
 [the wire layout](FLOWX_WIRE_PROTOCOL.md#type-4--jpeg_restart_region).
 
 The complete FlowX UDP payload, including its 36-byte header, is at most
@@ -46,7 +54,7 @@ The complete FlowX UDP payload, including its 36-byte header, is at most
 ## Optional 16x8 tile shuffle
 
 Set `codec.jpeg_tile_shuffle: true` on the sender to scatter a lost segment
-across the image instead of losing a continuous 8-pixel-high strip. The default
+across the image instead of losing consecutive blocks in raster order. The default
 is `false`. This setting applies to JPEG + STRIPS; other keyframe formats ignore
 it. C++ applications can call `Encoder::setJpegTileShuffle(true)`.
 
@@ -76,8 +84,8 @@ When sender HTTP control is enabled, change the option through `/codec.json`
 with `{"jpeg_tile_shuffle":true}`, or GET `/setparam/jpeg_tile_shuffle/true`.
 HTTP changes are in memory; edit the config file to keep the setting on restart.
 Update the receiver and hard-refresh the browser before enabling shuffle:
-older versions reject the new layout. Disabling shuffle retains the prior wire
-representation. This disperses losses; it does not recover lost data or guarantee
+older versions reject the new layout. Cross-row segments also require updated
+receivers, even with shuffle disabled. This disperses losses; it does not recover lost data or guarantee
 that missing tiles cannot be adjacent.
 
 ## Loss, late data, and rendering
@@ -188,12 +196,16 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The native test covers grayscale and color, difficult MCU-row widths, the
-1300-byte limit, 35% loss with shuffled delivery, paired fills, duplicates,
+The native test covers grayscale and color, narrow and prime MCU-row widths,
+cross-row segments and short tails, adaptive interval growth, exact decoded
+pixels against independently encoded 8x8 tiles, the 1300-byte limit,
+35% loss with shuffled delivery, paired fills, duplicates,
 late recovery, stale frames, frame-ID wrap, malformed metadata, subsequent
 PATCH rendering, the configured encoder, and HTTP catchup. With Node installed,
 CTest also exports native JPEG/RGBA fixtures and checks browser assembly against
-the same bytes, including asynchronous decode reordering. Both layout modes
+the same bytes, including asynchronous decode reordering and cross-row GPU
+upload bounds. Narrow fixtures also exercise browser presentation and live MJPEG
+controls. Both layout modes
 are tested with shuffled packet delivery and 35% loss, duplicates, late recovery,
 and receipt masks. Shuffle checks include a fixed cross-language permutation
 vector, no-loss equality with ordinary JPEG, and runtime layout changes.

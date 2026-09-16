@@ -22,10 +22,11 @@ struct JpegRestartRegion {
     std::uint16_t layer_width = 0;
     std::uint16_t layer_height = 0;
     // Coordinates in the encoded (possibly shuffled/downscaled) keyframe raster.
-    // x parity identifies the half; sample i goes at column x + 2*i.
+    // x parity identifies the half. The starting block is (y/8)*(layer_width/8)
+    // + x/16; subsequent blocks continue in raster order across row boundaries.
     std::uint16_t x = 0;
     std::uint16_t y = 0;
-    std::uint16_t width = 0; // decoded sample count, height is always 8
+    std::uint16_t width = 0; // decoded strip width = block count * 8, height is 8
     std::uint8_t profile = 0;
     std::uint8_t layout = 0; // 0: spatial order; 1: shuffled 16x8 tiles
     std::vector<unsigned char> entropy;

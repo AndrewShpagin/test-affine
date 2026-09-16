@@ -153,6 +153,17 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_BINARY_DIR}/shuffle-fixtures.json")
         set_tests_properties(jpeg_shuffle_browser jpeg_shuffle_presentation
             PROPERTIES FIXTURES_REQUIRED shuffle_fixtures)
+        add_test(NAME jpeg_narrow_fixtures COMMAND jpeg_restart_test --export-narrow
+            "${CMAKE_CURRENT_BINARY_DIR}/narrow-fixtures.json")
+        set_tests_properties(jpeg_narrow_fixtures PROPERTIES FIXTURES_SETUP narrow_fixtures)
+        add_test(NAME jpeg_narrow_browser COMMAND "${FLOWX_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_restart_browser_test.js"
+            "${CMAKE_CURRENT_BINARY_DIR}/narrow-fixtures.json")
+        add_test(NAME jpeg_narrow_presentation COMMAND "${FLOWX_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flowx_browser_presentation_test.js"
+            "${CMAKE_CURRENT_BINARY_DIR}/narrow-fixtures.json")
+        set_tests_properties(jpeg_narrow_browser jpeg_narrow_presentation
+            PROPERTIES FIXTURES_REQUIRED narrow_fixtures)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
             add_test(NAME flowx_sender_stats COMMAND "${Python3_EXECUTABLE}"
@@ -166,6 +177,10 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_BINARY_DIR}/shuffle-fixtures.json")
             set_tests_properties(flowx_mjpeg PROPERTIES FIXTURES_REQUIRED restart_fixtures TIMEOUT 45)
             set_tests_properties(flowx_mjpeg_shuffle PROPERTIES FIXTURES_REQUIRED shuffle_fixtures TIMEOUT 45)
+            add_test(NAME flowx_mjpeg_narrow COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/flowx_mjpeg_test.py" "$<TARGET_FILE:flowx_receiver>"
+                "${CMAKE_CURRENT_BINARY_DIR}/narrow-fixtures.json")
+            set_tests_properties(flowx_mjpeg_narrow PROPERTIES FIXTURES_REQUIRED narrow_fixtures TIMEOUT 45)
         endif()
     endif()
 endif()

@@ -11,7 +11,9 @@
     if(r.layout>1 || r.ow<16 || (r.ow&1) || r.oh<8 || r.ow*r.oh>16*1024*1024 ||
        r.lw<8 || r.lh<8 || r.lw%8 || r.lh%8 || 2*r.lw>r.ow || r.lh>r.oh ||
        r.width<8 || r.width%8 || ((r.x>>1)%8) || r.y%8 ||
-       (r.x>>1)+r.width>r.lw || r.y+8>r.lh || (r.profile!==1 && r.profile!==2))
+       (r.x>>1)>=r.lw || r.y+8>r.lh ||
+       (r.y/8)*(r.lw/8)+(r.x>>4)+r.width/8>(r.lw/8)*(r.lh/8) ||
+       (r.profile!==1 && r.profile!==2))
       throw new Error('bad JPEG region geometry/profile');
     for(let p=0;p<r.entropy.length;p++)
       if(r.entropy[p]===255 && (++p===r.entropy.length || r.entropy[p]!==0)) throw new Error('unexpected JPEG marker');
@@ -212,9 +214,9 @@
       }
       if(!changed) return null;
       this.fillDirty=true;
-      // Shuffled blocks are scattered in the reference. The view batches their
-      // GPU upload until rendering instead of issuing a call per 16x8 tile.
-      if(this.layout===1)return {newKeyframe,fullUpload:true};
+      // Shuffled and cross-row regions are not single horizontal rectangles.
+      // Batch their GPU upload until rendering instead of uploading per tile.
+      if(this.layout===1||(r.x>>1)+r.width>r.lw)return {newKeyframe,fullUpload:true};
       const x=r.x&~1,width=2*r.width,patch=new Uint8Array(width*8*4);
       for(let y=0;y<8;y++) {
         const begin=((r.y+y)*this.width+x)*4;

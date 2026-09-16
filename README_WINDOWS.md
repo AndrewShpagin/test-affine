@@ -29,6 +29,10 @@ On the receiver, `/decoder.json` supports GET and POST/PUT with boolean
 when the displayed keyframe is available, and last until restart. The sender
 console also reports `jpeg-chunk-avg` in bytes, including FlowX packet headers.
 
+JPEG restart segments can span multiple image rows, improving packet utilisation
+for narrow images. Update both sender and receiver, then reload `/flowx.html`;
+older decoders reject these segments. No new configuration option is needed.
+
 Edit `config/flowx_receiver.json` to change ports, assembly/playout delays, gap
 filling, or simulated jitter, then restart the receiver. Point the sender at this
 PC's LAN address and allow inbound UDP traffic for the receiver through Windows

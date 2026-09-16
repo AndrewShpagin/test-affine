@@ -190,7 +190,8 @@ The WebGL browser decoder does not need this packet; it knows completion from th
 ## Type 4 — JPEG_RESTART_REGION
 
 Used by JPEG + STRIPS. Each packet independently decodes to an 8-pixel-high
-region of one half-image. All offsets below include the common 20-byte header.
+temporary strip of consecutive blocks from one half-image. Those blocks may
+span multiple rows in the encoded raster. All offsets below include the common 20-byte header.
 `version_type = 0x44`, `flags = 0`, and `keyframe_id = frame_id`.
 
 | Offset | Bytes | Field |
@@ -202,21 +203,25 @@ region of one half-image. All offsets below include the common 20-byte header.
 | 26 | 2 | Encoded half-image height |
 | 28 | 2 | X coordinate in the encoded layout |
 | 30 | 2 | Y coordinate in the encoded layout |
-| 32 | 2 | Region width in half-image samples |
+| 32 | 2 | Decoded strip width: block count times 8 |
 | 34 | 1 | Fixed JPEG profile: 1 = gray Q85, 2 = YCbCr 4:4:4 Q85 |
 | 35 | 1 | Layout: 0 = spatial order, 1 = shared 16x8 tile shuffle v1 |
 | 36 | 1–1264 | JPEG entropy data, without restart markers |
 
 The assembled keyframe dimensions are `2 * half_width` by `half_height`,
-and are scaled to the original output size when rendered. For layout 0, a decoded sample
-`(i,j)` is placed at `(x + 2*i, y + j)`; `x & 1` selects the column half.
-Half dimensions and region width are positive multiples of 8.
-`floor(x/2)` and `y` are multiples of 8; the full region must fit the half.
+and are scaled to the original output size when rendered. Let
+`C = half_width / 8`, `N = C * (half_height / 8)`,
+`first = (y/8)*C + floor(x/16)`, and `count = strip_width/8`.
+`x & 1` selects the column half. Half dimensions and strip width are positive
+multiples of 8. `floor(x/2)` and `y` are multiples of 8 and identify a valid
+starting block inside the half; `first + count <= N` is required. The segment
+may cross row boundaries and its width may exceed the half-image width.
+For layout 0, decoded sample `(u,v)` belongs to block `b = first + floor(u/8)`
+and is placed at `((b % C)*16 + 2*(u % 8) + (x & 1), floor(b/C)*8 + v)`.
 Original width must be even; original dimensions cannot be smaller than
 the assembled raster. Maximum original area is 16 megapixels.
 
-For layout 1, `(x,y)` describes the shuffled encoded raster. Let
-`C = half_width / 8`, `N = C * (half_height / 8)`. Construct the same permutation
+For layout 1, `(x,y)` describes the shuffled encoded raster. Construct the same permutation
 for both parities:
 
 1. Initialize `P[i] = i` for `0 <= i < N`.
@@ -244,6 +249,10 @@ table packet, or end marker is required. See
 Older v4 receivers reject type 4; deploy sender and receiver together.
 Receivers with the original type-4 implementation accept layout 0 but reject
 layout 1, which previously occupied a reserved-zero byte.
+Row-bound type-4 receivers also reject segments that cross a row. Update native
+receivers and reload browser decoders before using the cross-row sender. Updated
+receivers continue to accept older row-bound packets; header size and layout
+values have not changed.
 
 ## Loss behavior
 

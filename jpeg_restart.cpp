@@ -109,12 +109,6 @@ bool split(const std::vector<unsigned char>& b,
     return false;
 }
 
-unsigned rowDivisor(unsigned columns, unsigned limit) {
-    unsigned n = std::min(columns, std::max(1u, limit));
-    while (columns % n) --n;
-    return n;
-}
-
 std::vector<unsigned char> fixedHeader(unsigned channels) {
     cv::Mat blank(8, 8, channels == 1 ? CV_8UC1 : CV_8UC3, cv::Scalar::all(0));
     std::vector<unsigned char> jpeg;
@@ -134,7 +128,9 @@ bool validRestartGeometry(const JpegRestartRegion& r, cv::Size original) {
         2u * r.layer_width <= static_cast<unsigned>(original.width) &&
         r.layer_height <= original.height && r.width >= 8 && !(r.width % 8) &&
         !((r.x / 2) % 8) && !(r.y % 8) &&
-        r.x / 2u + r.width <= r.layer_width && r.y + 8u <= r.layer_height &&
+        r.x / 2u < r.layer_width && r.y + 8u <= r.layer_height &&
+        (r.y / 8u) * (r.layer_width / 8u) + r.x / 16u + r.width / 8u <=
+            (r.layer_width / 8u) * (r.layer_height / 8u) &&
         (r.profile == kRestartGray85 || r.profile == kRestartColor44485) &&
         r.layout <= kRestartTileShuffle;
 }
@@ -183,21 +179,43 @@ bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
                 .copyTo(input(cv::Rect((i % columns) * 8, (i / columns) * 8, 8, 8)));
         }
     }
-    unsigned interval = rowDivisor(columns,
+    const unsigned blocks = static_cast<unsigned>(image.total() / 64);
+    // Every segment is decoded locally as one 8-pixel-high JPEG strip. Its
+    // blocks are then scattered back into the raster, including across rows.
+    const unsigned max_interval = std::min(blocks, static_cast<unsigned>(JPEG_MAX_DIMENSION / 8));
+    unsigned interval = std::min(max_interval,
         static_cast<unsigned>(kRestartMaxEntropyBytes / (64.0 * 0.35)));
+    unsigned fitted_interval = 0, growth_probes = 0;
     std::vector<unsigned char> jpeg;
     std::vector<std::vector<unsigned char>> segments;
     for (;;) {
-        if (!encode(input, interval, jpeg) || !split(jpeg, segments)) return false;
-        if (segments.size() != image.total() / (64u * interval)) return false;
+        std::vector<std::vector<unsigned char>> trial;
+        if (!encode(input, interval, jpeg) || !split(jpeg, trial)) return false;
+        if (trial.size() != (blocks + interval - 1) / interval) return false;
         std::size_t largest = 0;
-        for (const auto& segment : segments) largest = std::max(largest, segment.size());
-        if (largest <= kRestartMaxEntropyBytes) break;
+        for (const auto& segment : trial) largest = std::max(largest, segment.size());
+        if (largest <= kRestartMaxEntropyBytes) {
+            segments = std::move(trial);
+            fitted_interval = interval;
+            // A fixed bytes/pixel estimate can underfill smooth images. Try at
+            // most two larger intervals, aiming at 90% of the entropy budget.
+            // Keep the last fully checked result if a growth probe overshoots.
+            const unsigned target = static_cast<unsigned>(kRestartMaxEntropyBytes * 9 / 10);
+            if (largest >= target || interval == max_interval || growth_probes == 2) break;
+            const unsigned next = std::min(max_interval,
+                static_cast<unsigned>(interval * std::size_t(target) / largest));
+            if (next <= interval) break;
+            interval = next;
+            ++growth_probes;
+            continue;
+        }
+        if (fitted_interval) break;
         if (interval == 1) return false;
-        const unsigned limit = std::min(interval - 1,
-            static_cast<unsigned>(interval * kRestartMaxEntropyBytes / largest));
-        interval = rowDivisor(columns, limit);
+        interval = std::max(1u, std::min(interval - 1,
+            static_cast<unsigned>(interval * kRestartMaxEntropyBytes / largest)));
+        // No row alignment or row-divisor constraint: a restart counts MCUs.
     }
+    interval = fitted_interval;
     std::vector<JpegRestartRegion> result;
     result.reserve(segments.size());
     for (std::size_t i = 0; i < segments.size(); ++i) {
@@ -207,7 +225,7 @@ bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
         r.layer_height = static_cast<std::uint16_t>(image.rows);
         r.x = static_cast<std::uint16_t>(2 * (block % columns) * 8 + parity);
         r.y = static_cast<std::uint16_t>((block / columns) * 8);
-        r.width = static_cast<std::uint16_t>(interval * 8);
+        r.width = static_cast<std::uint16_t>(std::min(interval, blocks - block) * 8);
         r.profile = image.channels() == 1 ? kRestartGray85 : kRestartColor44485;
         r.layout = tile_shuffle ? kRestartTileShuffle : 0;
         r.entropy = std::move(segments[i]);

@@ -34,6 +34,34 @@ function frame(packet,id) {
   const u=packet.slice();new DataView(u.buffer).setUint32(8,id,true);return u;
 }
 (async()=>{
+  // Apply the actual upload instructions to a simulated texture. Cross-row
+  // packets must never be emitted as rectangles extending beyond its width.
+  const uploaded=new Uint8Array(f.width*f.height*4);
+  const uploadAssembler=new RestartAssembler(f.headers,decode,{fillGaps:false});
+  let crossed=false,partial=false;
+  for(let i=0;i<packets.length;i++) {
+    const r=parseRegion(packets[i]),update=await uploadAssembler.accept(packets[i]);
+    crossed=crossed||((r.x>>1)+r.width>r.lw);
+    partial=partial||r.width<parseRegion(packets[0]).width;
+    if(update.newKeyframe||update.fullUpload)uploaded.set(uploadAssembler.pixels);
+    else {
+      assert.ok(update.x>=0&&update.x+update.width<=f.width&&update.y+update.height<=f.height,
+        'GPU rectangle exceeds reference bounds');
+      for(let y=0;y<update.height;y++)uploaded.set(update.pixels.subarray(y*update.width*4,(y+1)*update.width*4),
+        ((update.y+y)*f.width+update.x)*4);
+    }
+    assert.deepEqual(uploaded,uploadAssembler.pixels,'GPU update omitted wrapped blocks');
+  }
+  assert.deepEqual(uploaded,Uint8Array.from(f.complete));
+  if(f.width===80) {
+    assert.ok(crossed,'narrow fixture never crossed a row');
+    assert.ok(partial,'narrow fixture never tested the final short segment');
+  }
+  for(const [x,y,width] of [[f.width,0,8],[f.width-16,f.height-8,16]]) {
+    const bad=packets[0].slice(),v=new DataView(bad.buffer);
+    v.setUint16(28,x,true);v.setUint16(30,y,true);v.setUint16(32,width,true);
+    assert.throws(()=>parseRegion(bad),/geometry/,'out-of-raster block range accepted');
+  }
   for(const sample of f.concealment) {
     const a=new RestartAssembler(f.headers,decode,{fillGaps:sample.mode!=='raw',smoothFills:sample.mode==='smooth'});
     for(const i of sample.indices)await a.accept(packets[i]);
