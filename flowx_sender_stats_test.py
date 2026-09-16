@@ -45,15 +45,24 @@ def run(sender, folder, strips, codec='jpeg', loss=0):
         match = re.search(r'jpeg-chunks=(\d+) jpeg-chunk-avg=([\d.]+)B', line)
         assert match, line
         count, average = int(match[1]), float(match[2])
+        sizes = re.search(r'jpeg-chunk-max=(\d+)B jpeg-chunk-over-target=(\d+) jpeg-hard-dropped=(\d+)', line)
+        assert sizes, line
+        maximum, overshoots, hard_drops = map(int, sizes.groups())
+        assert hard_drops == 0, line
         if loss == 100:
-            assert not packets and count > 0 and 0 < average <= 1300, line
+            assert not packets and count > 0 and 0 < average <= maximum <= 65507, line
+            assert overshoots > 0, 'fixture never exceeded soft target'
         elif codec != 'jpeg':
-            assert packets and count == 0 and average == 0, line
+            assert packets and count == 0 and average == maximum == overshoots == 0, line
         else:
             chunks = [p for p in packets if (p[2] & 15) in (1, 4)]
             assert any((p[2] & 15) == 2 for p in packets), 'test did not produce PATCH datagrams'
             assert count == len(chunks) and count > 0, (line, len(chunks))
             assert abs(average - sum(map(len, chunks)) / len(chunks)) <= .051, line
+            assert maximum == max(map(len, chunks)), line
+            assert overshoots == sum(len(p) > 1300 for p in chunks), line
+            if strips:
+                assert overshoots > 0, 'fixture never exceeded soft target'
         print(f'PASS: JPEG datagram mean, strips={strips}, codec={codec}, loss={loss}: {count}, {average}B')
 
 

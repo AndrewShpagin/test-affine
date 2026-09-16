@@ -133,6 +133,19 @@ before simulated loss and socket sends, so deliberately dropped packets and
 send failures do not bias the codec size statistic. Before the first JPEG chunk,
 the count and average are zero.
 
+The same reports include `jpeg-chunk-max=...B`, `jpeg-chunk-over-target=...`,
+and `jpeg-hard-dropped=...`. Maximum and overshoot count are cumulative;
+`over-target` counts sizes above 1300 bytes. This is a soft target for restart
+JPEG regions: they are sent even above 1400/1472 bytes, with IP fragmentation
+allowed on Linux/Windows. Only a region above UDP's absolute 65,507-byte payload
+limit is omitted. Its would-be wire size still contributes to these statistics,
+and the omission is counted in both `jpeg-hard-dropped` and `failed`.
+
+JPEG + STRIPS compresses each half exactly once, with resolution and restart
+interval estimated from the previous keyframe. Measurements adjust the next key,
+never re-encode the current one. Classic JPEG/MOSAIC/JPEG2000 retain their existing
+encoding paths. Update the receiver and reload `/flowx.html` to accept overshoots.
+
 ## Build dependencies
 
 Besides OpenCV and nlohmann-json, the sender uses cpp-httplib and threads. On Debian/Raspberry Pi OS the development package is `libcpp-httplib-dev`.

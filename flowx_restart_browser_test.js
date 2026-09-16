@@ -34,6 +34,9 @@ function frame(packet,id) {
   const u=packet.slice();new DataView(u.buffer).setUint32(8,id,true);return u;
 }
 (async()=>{
+  assert.ok(packets.some(p=>p.length>1300),'fixture never exceeded the soft target');
+  const tooBig=new Uint8Array(65508);tooBig.set(packets[0]);
+  assert.throws(()=>parseRegion(tooBig),/size/,'absolute UDP limit ignored');
   // Apply the actual upload instructions to a simulated texture. Cross-row
   // packets must never be emitted as rectangles extending beyond its width.
   const uploaded=new Uint8Array(f.width*f.height*4);

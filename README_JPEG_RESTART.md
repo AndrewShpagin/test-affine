@@ -25,13 +25,23 @@ initial interval <= floor(1264 / (8 * 8 * 0.35)) = 56 MCUs
 The interval counts consecutive MCUs independently of row width. A segment may
 start partway through one row and continue across several rows. The last segment
 contains only the remaining blocks; the interval need not divide the image size.
-After compression, the sender measures every segment. If any is too large, it
-reduces the interval and re-encodes the half until all fit. When segments are
-small, it tries up to two larger intervals, aiming for the largest segment to
-use 90% of the entropy budget. If a growth attempt exceeds the limit, it keeps
-the last fully checked result. This bounds extra growth work and permits smooth
-images to exceed the initial 56-MCU estimate. Image size and local complexity
-still affect the mean; filling every datagram to 1300 bytes is not guaranteed.
+Each half-image is compressed exactly once. Resolution is chosen from the
+previous keyframe's total wire bytes per pixel. Each parity's restart interval
+is chosen from its previous keyframe's largest observed entropy bytes per MCU
+(including short tails). The first key uses the 0.35 bytes/pixel estimate.
+Current measurements are saved only for the next keyframe: neither segment
+overshoot nor the whole-keyframe byte budget triggers a retry. Color-profile,
+codec, and shuffle changes reset the relevant estimates. `EncoderTiming` exposes
+`jpeg_encode_calls`; a successful restart keyframe uses exactly two calls.
+
+1300 bytes is a **soft target**, not a maximum. Scene changes can temporarily
+increase both datagram and whole-keyframe sizes before the next key adapts.
+There is no drop threshold at 1400, 1472, or the network MTU. The sender permits
+IP fragmentation on Linux and Windows; network delivery of fragments still
+depends on the path. Both native and browser receivers accept larger regions.
+Only regions above the absolute 65,507-byte UDP payload limit are skipped, with
+their would-be wire sizes counted in `jpeg-hard-dropped` and `failed`. They still
+contribute to the next-keyframe estimates; the other regions remain usable.
 
 Each packet carries the bytes between restart markers, with JPEG byte stuffing
 and final bit padding preserved. Restart markers are removed. The decoder adds
@@ -48,8 +58,9 @@ encoded index back to its spatial index. The low bit of `x` selects even or odd
 columns. No extra coordinates or header bytes are needed. See
 [the wire layout](FLOWX_WIRE_PROTOCOL.md#type-4--jpeg_restart_region).
 
-The complete FlowX UDP payload, including its 36-byte header, is at most
-1300 bytes. IP and UDP transport headers are additional.
+The complete FlowX UDP payload includes its 36-byte header. IP and UDP transport
+headers are additional. Update sender and receiver together and reload the
+browser: previous versions reject packets above 1300 bytes.
 
 ## Optional 16x8 tile shuffle
 
@@ -198,7 +209,8 @@ ctest --test-dir build -C Release --output-on-failure
 
 The native test covers grayscale and color, narrow and prime MCU-row widths,
 cross-row segments and short tails, adaptive interval growth, exact decoded
-pixels against independently encoded 8x8 tiles, the 1300-byte limit,
+pixels against independently encoded 8x8 tiles, one-pass scene/budget changes,
+next-keyframe feedback, overshoots above 1300 bytes and the absolute UDP limit,
 35% loss with shuffled delivery, paired fills, duplicates,
 late recovery, stale frames, frame-ID wrap, malformed metadata, subsequent
 PATCH rendering, the configured encoder, and HTTP catchup. With Node installed,

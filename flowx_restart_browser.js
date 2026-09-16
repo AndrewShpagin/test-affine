@@ -4,7 +4,7 @@
   'use strict';
   const newer = (a,b) => ((a-b)|0)>0;
   function parseRegion(u) {
-    if(u.length<=36 || u.length>1300) throw new Error('bad JPEG region size');
+    if(u.length<=36 || u.length>65507) throw new Error('bad JPEG region size');
     const v=new DataView(u.buffer,u.byteOffset,u.byteLength),get=p=>v.getUint16(p,true);
     if(get(0)!==0x5846 || u[2]!==0x44 || u[3] || !v.getUint32(4,true)) throw new Error('bad JPEG region header');
     const r={frameId:v.getUint32(8,true),ow:get(20),oh:get(22),lw:get(24),lh:get(26),x:get(28),y:get(30),width:get(32),profile:u[34],layout:u[35],entropy:u.slice(36)};

@@ -1062,34 +1062,30 @@ bool Encoder::emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gra
     if (strips_jpeg_model_channels_ != layers[0].channels()) {
         strips_jpeg_model_channels_ = layers[0].channels();
         strips_jpeg_bytes_per_pixel_ = 0.0;
+        restart_entropy_bytes_per_mcu_ = {};
     }
     const auto start = ProfileClock::now();
     const double target = std::max(1, desired_jpeg_size) * kJpegTargetFill;
     const double bpp = strips_jpeg_bytes_per_pixel_ > 0.0 ? strips_jpeg_bytes_per_pixel_ : 0.35;
-    cv::Size size = scaledSize8(layers[0].size(),
+    const cv::Size size = scaledSize8(layers[0].size(),
         std::sqrt(target / (2.0 * bpp * layers[0].total())));
     std::array<std::vector<JpegRestartRegion>, 2> regions;
     std::size_t wire_bytes = 0;
-    for (int pass = 0; pass < kJpegMaxEncodePasses; ++pass) {
-        wire_bytes = 0;
-        for (unsigned parity = 0; parity < 2; ++parity) {
-            cv::Mat small;
-            if (layers[parity].size() == size) small = layers[parity];
-            else cv::resize(layers[parity], small, size, 0, 0, cv::INTER_AREA);
-            if (!encodeJpegRestartLayer(small, parity, regions[parity], nullptr, jpeg_tile_shuffle_)) return false;
-            for (const auto& r : regions[parity]) wire_bytes += kRestartWireHeaderBytes + r.entropy.size();
+    std::array<double, 2> measured_cost{};
+    for (unsigned parity = 0; parity < 2; ++parity) {
+        cv::Mat small;
+        if (layers[parity].size() == size) small = layers[parity];
+        else cv::resize(layers[parity], small, size, 0, 0, cv::INTER_AREA);
+        if (!encodeJpegRestartLayer(small, parity, regions[parity], nullptr, jpeg_tile_shuffle_,
+                                   restart_entropy_bytes_per_mcu_[parity], &last_timing_.jpeg_encode_calls)) return false;
+        for (const auto& r : regions[parity]) {
+            wire_bytes += kRestartWireHeaderBytes + r.entropy.size();
+            measured_cost[parity] = std::max(measured_cost[parity], r.entropy.size() / double(r.width / 8));
         }
-        if (pass + 1 == kJpegMaxEncodePasses ||
-            (wire_bytes >= target * (1.0 - kJpegSizeTolerance) &&
-             wire_bytes <= target * (1.0 + kJpegSizeTolerance))) break;
-        const double scale = std::min(double(size.width) / layers[0].cols,
-                                      double(size.height) / layers[0].rows);
-        const cv::Size next = scaledSize8(layers[0].size(), scale * std::sqrt(target / wire_bytes));
-        if (next == size) break;
-        size = next;
     }
     last_timing_.jpeg_ms += profileMs(start);
     strips_jpeg_bytes_per_pixel_ = wire_bytes / (2.0 * size.area());
+    restart_entropy_bytes_per_mcu_ = measured_cost; // only the next key uses these measurements
     last_timing_.keyframe = true;
     last_timing_.strips_keyframe = true;
     last_timing_.keyframe_codec = KeyframeCodec::Jpeg;
@@ -1100,6 +1096,14 @@ bool Encoder::emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gra
     for (unsigned parity = 0; parity < 2; ++parity) {
         for (const auto& r : regions[parity]) {
             if (!validRestartGeometry(r, image.size())) return false;
+            last_timing_.jpeg_layer_bytes[parity] += r.entropy.size();
+            const auto bytes = kRestartWireHeaderBytes + r.entropy.size();
+            if (bytes > kRestartMaxDatagramBytes) {
+                ++last_timing_.jpeg_unsendable_chunks;
+                last_timing_.jpeg_unsendable_bytes += bytes;
+                last_timing_.jpeg_unsendable_max = std::max(last_timing_.jpeg_unsendable_max, bytes);
+                continue; // one lost region; never re-encode or discard the whole key
+            }
             std::vector<u_char> packet;
             packet.reserve(kRestartHeaderBytes + r.entropy.size());
             appendCommonHeader(packet, kRestartPacketType, kRestartHeaderBytes,
@@ -1108,8 +1112,6 @@ bool Encoder::emitRestartStripsKeyframe(const cv::Mat& image, const cv::Mat& gra
             appendU16(packet, r.x); appendU16(packet, r.y); appendU16(packet, r.width);
             appendU8(packet, r.profile); appendU8(packet, r.layout);
             packet.insert(packet.end(), r.entropy.begin(), r.entropy.end());
-            if (packet.size() > kMaxUdpPacketBytes) return false;
-            last_timing_.jpeg_layer_bytes[parity] += r.entropy.size();
             packets.push_back(std::move(packet));
         }
     }
@@ -1552,7 +1554,7 @@ void Decoder::pushData(const std::vector<u_char>& data){
     if (data.size() > 5 && data[5] == kRestartPacketType) {
         CommonHeader h;
         std::size_t offset = 0;
-        if (data.size() <= kMaxUdpPacketBytes && readCommonHeader(data, offset, h) &&
+        if (data.size() <= kRestartHeaderBytes + kRestartMaxEntropyBytes && readCommonHeader(data, offset, h) &&
             h.header_bytes == kRestartHeaderBytes && h.keyframe_id == h.frame_id)
             acceptRestartRegion(data, h.frame_id, h.original_size);
         return;

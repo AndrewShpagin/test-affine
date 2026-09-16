@@ -11,6 +11,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -157,7 +158,8 @@ int main(int argc, char** argv) {
         std::cout << '\n'
                   << "  UDP target: " << cfg.udp.host << ':' << cfg.udp.port << '\n'
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
-                  << ", max datagram=" << flowx::kMaxUdpDatagramBytes << " B\n";
+                  << ", target datagram=" << flowx::kTargetUdpDatagramBytes
+                  << " B, UDP hard limit=" << flowx::kMaxUdpDatagramBytes << " B\n";
         if (cfg.control.enabled) {
             std::cout << "  control HTTP: " << cfg.control.bind << ':' << cfg.control.port
                       << cfg.control.codec_endpoint << " (GET/POST)\n";
@@ -214,12 +216,15 @@ int main(int argc, char** argv) {
         std::uint64_t failed_packets = 0;
         std::uint64_t failed_bytes = 0;
         std::uint64_t jpeg_chunk_datagrams = 0, jpeg_chunk_bytes = 0;
+        std::uint64_t jpeg_chunk_max = 0, jpeg_chunk_over_target = 0, jpeg_hard_dropped = 0;
         const auto jpegStats = [&] {
             std::ostringstream text;
             text << " jpeg-chunks=" << jpeg_chunk_datagrams
                  << " jpeg-chunk-avg=" << std::fixed << std::setprecision(1)
                  << (jpeg_chunk_datagrams ? double(jpeg_chunk_bytes) / jpeg_chunk_datagrams : 0.0)
-                 << "B";
+                 << "B jpeg-chunk-max=" << jpeg_chunk_max << "B"
+                 << " jpeg-chunk-over-target=" << jpeg_chunk_over_target
+                 << " jpeg-hard-dropped=" << jpeg_hard_dropped;
             return text.str();
         };
         std::string last_udp_error;
@@ -253,6 +258,16 @@ int main(int argc, char** argv) {
                               codec.keyframe_bytes,
                               codec.keyframe_period);
             ++encoded_frames;
+            const auto& timing = encoder.lastTiming();
+            // These regions cannot be represented as UDP datagrams. Include
+            // their would-be wire sizes in the pre-loss codec statistics.
+            jpeg_chunk_datagrams += timing.jpeg_unsendable_chunks;
+            jpeg_chunk_bytes += timing.jpeg_unsendable_bytes;
+            jpeg_chunk_max = std::max(jpeg_chunk_max, std::uint64_t(timing.jpeg_unsendable_max));
+            jpeg_chunk_over_target += timing.jpeg_unsendable_chunks;
+            jpeg_hard_dropped += timing.jpeg_unsendable_chunks;
+            failed_packets += timing.jpeg_unsendable_chunks;
+            failed_bytes += timing.jpeg_unsendable_bytes;
 
             std::vector<flowx::u_char> codec_packet;
             while (encoder.getNextChunk(codec_packet)) {
@@ -285,6 +300,8 @@ int main(int argc, char** argv) {
                      codec.keyframe_codec == flowx::KeyframeCodec::Jpeg)) {
                     ++jpeg_chunk_datagrams;
                     jpeg_chunk_bytes += datagram.size();
+                    jpeg_chunk_max = std::max(jpeg_chunk_max, std::uint64_t(datagram.size()));
+                    jpeg_chunk_over_target += datagram.size() > flowx::kTargetUdpDatagramBytes;
                 }
 
                 // Drop after the final FlowX v4 datagram has been built, immediately before

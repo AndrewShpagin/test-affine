@@ -32,6 +32,10 @@ console also reports `jpeg-chunk-avg` in bytes, including FlowX packet headers.
 JPEG restart segments can span multiple image rows, improving packet utilisation
 for narrow images. Update both sender and receiver, then reload `/flowx.html`;
 older decoders reject these segments. No new configuration option is needed.
+Restart JPEG encoding also uses one compression per half-image: 1300 bytes is a
+soft target, with statistics feeding the next keyframe instead of retrying the
+current one. The sender permits IP fragmentation and sends packets above
+1400/1472 bytes. Updated receivers accept them up to the 65,507-byte UDP limit.
 
 Edit `config/flowx_receiver.json` to change ports, assembly/playout delays, gap
 filling, or simulated jitter, then restart the receiver. Point the sender at this

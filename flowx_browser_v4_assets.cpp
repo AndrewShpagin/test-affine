@@ -455,7 +455,7 @@ async function processDatagram(d){
   const u=new Uint8Array(d.buffer,d.byteOffset,d.byteLength),v=new DataView(d.buffer,d.byteOffset,d.byteLength);
   if(u.length<20||u16(v,0)!==0x5846) throw new Error('bad FlowX magic');
   const vt=u[2],version=vt>>4,type=vt&15,flags=u[3],sid=u32(v,4),frame=u32(v,8);
-  if(version!==4||sid===0||type<1||type>4||u.length>1300) throw new Error('bad FlowX v4 header');
+  if(version!==4||sid===0||type<1||type>4||u.length>(type===4?65507:1300)) throw new Error('bad FlowX v4 header');
   if(streamId!==sid){
     if(retiredStreams.has(sid)||type===2) return;
     if(streamId) retiredStreams.add(streamId);

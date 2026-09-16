@@ -32,7 +32,7 @@ Bytes native(const JpegRestartRegion& r, std::uint32_t id = 100) {
 }
 Bytes wire(const Bytes& b, std::uint32_t stream = 7) {
     Bytes out; std::string error;
-    require(flowx::wrapCodecPacket(b, stream, 123456, out, &error), error.c_str());
+    if (!flowx::wrapCodecPacket(b, stream, 123456, out, &error)) throw std::runtime_error(error);
     return out;
 }
 Bytes rgba(const cv::Mat& bgr) {
@@ -74,7 +74,7 @@ Fixture fixture(unsigned channels, unsigned half_width = 256, bool shuffle = fal
             require(cv::mean(decoded)[0] > 50, "independent JPEG lost DC state");
             f.packets.push_back(native(r));
             f.wires.push_back(wire(f.packets.back()));
-            require(f.wires.back().size() <= 1300, "datagram exceeds 1300 bytes");
+            require(f.wires.back().size() <= flowx::kMaxUdpDatagramBytes, "datagram exceeds UDP hard limit");
             flowx::FlowXPacket restored;
             require(flowx::unwrapCodecPacket(f.wires.back(), restored), "unwrap region");
             require(restored.codec_packet == f.packets.back(), "region wire roundtrip");
@@ -179,7 +179,7 @@ void lossTest(const Fixture& f) {
     only.pushData(bad);
     require(only.keyframeId() == 110, "malformed key poisoned reference");
     flowx::FlowXPacket parsed;
-    auto bad_wire = f.wires.front(); bad_wire.resize(1301);
+    auto bad_wire = f.wires.front(); bad_wire.resize(flowx::kMaxUdpDatagramBytes + 1);
     require(!flowx::unwrapCodecPacket(bad_wire, parsed), "oversize packet accepted");
     bad_wire = f.wires.front(); bad_wire[28] = 2;
     require(!flowx::unwrapCodecPacket(bad_wire, parsed), "unaligned coordinate accepted");
@@ -246,10 +246,11 @@ void encoderTest(bool shuffle) {
     while (encoder.getNextChunk(b)) {
         require(b.size() > 32 && b[5] == 5, "STRIPS JPEG used fragile chunks");
         require(b[31] == unsigned(shuffle), "encoder omitted shuffle mode");
-        require(wire(b).size() <= 1300, "integrated encoder exceeded MTU");
+        require(wire(b).size() <= flowx::kMaxUdpDatagramBytes, "integrated encoder exceeded UDP limit");
         decoder.pushData(b); ++count;
     }
     require(count > 4 && decoder.originalSize() == image.size(), "integrated encode failed");
+    require(encoder.lastTiming().jpeg_encode_calls == 2, "keyframe compressed more than once per half");
     require(render(decoder).size() == image.size(), "scaled reference render size");
     encoder.setJpegTileShuffle(!shuffle);
     encoder.pushImage(image, 18000, 1);
@@ -298,8 +299,13 @@ void packingTest() {
         const unsigned columns = layer.cols / 8, blocks = static_cast<unsigned>(layer.total() / 64);
         const auto map = affinecodec::restartTilePermutation(layer.cols, layer.rows);
         std::vector<JpegRestartRegion> regions;
-        unsigned interval = 0;
-        require(affinecodec::encodeJpegRestartLayer(layer, 1, regions, &interval, shuffle), "narrow encode");
+        unsigned interval = 0, calls = 0;
+        require(affinecodec::encodeJpegRestartLayer(layer, 1, regions, &interval, shuffle, 0, &calls), "narrow encode");
+        require(calls == 1, "first narrow encode retried");
+        double cost = 0;
+        for (const auto& r : regions) cost = std::max(cost, r.entropy.size() / double(r.width / 8));
+        require(affinecodec::encodeJpegRestartLayer(layer, 1, regions, &interval, shuffle, cost, &calls), "next narrow encode");
+        require(calls == 2, "feedback encode retried");
         require(interval > columns, "narrow image still capped by row width");
         std::size_t bytes = 0;
         unsigned seen = 0;
@@ -328,8 +334,54 @@ void packingTest() {
     cv::Mat flat(512, 40, CV_8UC1, cv::Scalar(100));
     std::vector<JpegRestartRegion> regions;
     unsigned interval = 0;
-    require(affinecodec::encodeJpegRestartLayer(flat, 0, regions, &interval) && interval > 56 && regions.size() == 1,
-            "low-entropy interval never grew beyond initial estimate");
+    unsigned calls = 0;
+    require(affinecodec::encodeJpegRestartLayer(flat, 0, regions, &interval, false, 0, &calls) && interval == 56,
+            "first flat frame changed initial estimate");
+    double cost = 0;
+    for (const auto& r : regions) cost = std::max(cost, r.entropy.size() / double(r.width / 8));
+    require(affinecodec::encodeJpegRestartLayer(flat, 0, regions, &interval, false, cost, &calls) &&
+            calls == 2 && interval > 56 && regions.size() == 1, "next flat frame did not use feedback");
+}
+void singlePassTest() {
+    affinecodec::Encoder encoder;
+    encoder.setStripsKeyframes(true);
+    cv::Mat flat(512, 512, CV_8UC3, cv::Scalar::all(128)), noise(flat.size(), flat.type());
+    cv::RNG(91827).fill(noise, cv::RNG::UNIFORM, 0, 256);
+    auto encodeFrame = [&](cv::Mat& source, int budget) {
+        encoder.pushImage(source, budget, 1);
+        require(encoder.lastTiming().jpeg_encode_calls == 2, "scene/budget change triggered JPEG retry");
+        std::size_t maximum = 0, packets = 0;
+        Bytes b;
+        while (encoder.getNextChunk(b)) {
+            maximum = std::max(maximum, wire(b).size());
+            ++packets;
+        }
+        require(packets || encoder.lastTiming().jpeg_unsendable_chunks, "one-pass encoder emitted nothing");
+        return maximum;
+    };
+    encodeFrame(flat, 1000000);
+    const auto changed_max = encodeFrame(noise, 1000000);
+    require(changed_max > 1300 || encoder.lastTiming().jpeg_unsendable_chunks, "scene cut never exceeded target");
+    const auto hard_drops = encoder.lastTiming().jpeg_unsendable_chunks;
+    const auto recovered_max = encodeFrame(noise, 1000000);
+    require(!encoder.lastTiming().jpeg_unsendable_chunks && recovered_max < changed_max,
+            "next keyframe failed to adapt after scene cut");
+    const auto old_size = encoder.lastTiming().jpeg_size;
+    encodeFrame(noise, 4000);
+    require(encoder.lastTiming().jpeg_size.area() < old_size.area(), "budget change did not resize next key");
+    std::cout << "  scene cut max=" << changed_max << " B hard-drops=" << hard_drops
+              << " next-max=" << recovered_max << " B, exactly two JPEG calls/key\n";
+
+    // Deliberately stale, extremely optimistic feedback can exceed even UDP's
+    // absolute limit. It still consumes just one compression and is rejected
+    // by wire validation without truncating an entropy stream.
+    std::vector<JpegRestartRegion> large;
+    unsigned calls = 0;
+    require(affinecodec::encodeJpegRestartLayer(noise, 0, large, nullptr, false, .1, &calls) && calls == 1,
+            "absolute oversize retried compression");
+    require(large.front().entropy.size() > affinecodec::kRestartMaxEntropyBytes, "hard-limit fixture too small");
+    Bytes datagram;
+    require(!flowx::wrapCodecPacket(native(large.front()), 7, 0, datagram), "unsendable segment accepted");
 }
 void exportFixture(const Fixture& f, const std::string& path) {
     nlohmann::json j;
@@ -367,13 +419,13 @@ int main(int argc, char** argv) {
         auto color = fixture(3);
         if (argc == 3 && std::string(argv[1]) == "--export") { exportFixture(color, argv[2]); return 0; }
         if (argc == 3 && std::string(argv[1]) == "--export-shuffled") { exportFixture(fixture(3, 256, true), argv[2]); return 0; }
-        if (argc == 3 && std::string(argv[1]) == "--export-narrow") { exportFixture(fixture(3, 40, false, 128), argv[2]); return 0; }
+        if (argc == 3 && std::string(argv[1]) == "--export-narrow") { exportFixture(fixture(3, 40, false, 512), argv[2]); return 0; }
         lossTest(color); lossTest(fixture(1)); lossTest(fixture(3, 232));
         lossTest(fixture(3, 256, true)); lossTest(fixture(1, 256, true)); lossTest(fixture(3, 232, true));
         rawStoreTest(color); rawStoreTest(fixture(3, 256, true));
-        lossTest(fixture(3, 40, false, 128)); lossTest(fixture(3, 40, true, 128));
-        encoderTest(false); encoderTest(true); permutationTest(); shuffleTest(1); shuffleTest(3); packingTest();
-        std::cout << "PASS: cross-row JPEG regions, narrow adaptive packing, 1300-byte MTU, 35% loss (96 trials), tile shuffle/no-loss equivalence, late/duplicate/stale packets, PATCH reference, HTTP catchup\n";
+        lossTest(fixture(3, 40, false, 512)); lossTest(fixture(3, 40, true, 512));
+        encoderTest(false); encoderTest(true); permutationTest(); shuffleTest(1); shuffleTest(3); packingTest(); singlePassTest();
+        std::cout << "PASS: one-pass JPEG, next-key feedback, soft target overshoot, cross-row regions, 35% loss (96 trials), tile shuffle/no-loss equivalence, late/duplicate/stale packets, PATCH reference, HTTP catchup\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

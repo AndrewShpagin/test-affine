@@ -35,7 +35,7 @@ F5 configures/builds first, then runs from the repository root.
 ## UDP codec prototype
 
 JPEG + STRIPS uses independently decodable 8-pixel-high regions, with a maximum
-1300-byte FlowX UDP payload and progressive even/odd recovery. See
+1300-byte FlowX UDP payload target and progressive even/odd recovery. See
 [JPEG restart assembly](README_JPEG_RESTART.md) for configuration, fixed tables,
 late-packet behavior, and tests. The chunk API example below describes classic
 JPEG mode.
@@ -56,7 +56,7 @@ encoder.pushImage(image, desired_jpeg_size, keyframe_once_in_N);
 
 std::vector<affinecodec::u_char> data;
 while (encoder.getNextChunk(data)) {
-    // one transport packet, maximum 1300 bytes
+    // one transport packet; restart JPEG may exceed the 1300-byte target
 }
 ```
 
@@ -84,7 +84,8 @@ decoder.render(destination, patch, jpeg_data);
 
 Current v1 model:
 
-- Hard transport packet size limit: `1300` bytes.
+- Transport packet target: `1300` bytes. JPEG restart packets may exceed it;
+  their absolute UDP payload limit is `65507` bytes.
 - A keyframe JPEG may span many packets; a motion patch still fits in one packet.
 - Keyframe chunks carry frame id, original/JPEG dimensions, chunk index/count, total JPEG bytes and chunk offset.
 - Decoder accepts keyframe chunks out of order and ignores duplicates.
@@ -130,7 +131,9 @@ The test passes every encoder packet directly into the decoder and writes side-b
 ORIGINAL | DECODED
 ```
 
-It prints packet count, total bytes and color MAE for every frame, while checking that every individual packet remains at most 1300 bytes.
+It prints packet count, total bytes and color MAE for every frame, while checking
+each packet type's hard limit. Restart JPEG uses a soft 1300-byte target and
+adapts only the next keyframe; each half is compressed once.
 
 ## Earlier experiments
 

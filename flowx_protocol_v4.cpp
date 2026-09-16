@@ -11,6 +11,8 @@
 
 namespace flowx {
 namespace {
+static_assert(kMaxUdpDatagramBytes == affinecodec::kRestartMaxDatagramBytes);
+static_assert(kTargetUdpDatagramBytes == affinecodec::kRestartTargetDatagramBytes);
 
 // Internal AFC1 v2 representation. It is produced by the stable codec and
 // reconstructed for the stable C++ decoder, but is no longer transmitted.
@@ -116,7 +118,10 @@ bool readFloat(const std::vector<u_char>& data, std::size_t& pos, float& v) {
 }
 
 bool readAfcCommon(const std::vector<u_char>& data, AfcCommon& h) {
-    if (data.size() < kAfcCommonBytes || data.size() > kMaxCodecPacketBytes) return false;
+    if (data.size() < kAfcCommonBytes) return false;
+    const auto limit = data[5] == affinecodec::kRestartPacketType
+        ? affinecodec::kRestartHeaderBytes + affinecodec::kRestartMaxEntropyBytes : kMaxCodecPacketBytes;
+    if (data.size() > limit) return false;
     std::size_t pos = 0;
     std::uint32_t magic = 0;
     std::uint8_t version = 0;
@@ -187,6 +192,7 @@ bool readWireCommon(const std::vector<u_char>& data,
         raw_type > static_cast<std::uint8_t>(WirePacketType::JpegRestartRegion))
         return false;
     type = static_cast<WirePacketType>(raw_type);
+    if (type != WirePacketType::JpegRestartRegion && data.size() > kTargetUdpDatagramBytes) return false;
     return true;
 }
 
@@ -700,7 +706,8 @@ bool wrapCodecPacket(const std::vector<u_char>& codec_packet,
         datagram.clear();
         return false;
     }
-    if (datagram.empty() || datagram.size() > kMaxUdpDatagramBytes) {
+    if (datagram.empty() || datagram.size() > kMaxUdpDatagramBytes ||
+        (h.type != affinecodec::kRestartPacketType && datagram.size() > kTargetUdpDatagramBytes)) {
         datagram.clear();
         setError(error, "FlowX v4 datagram exceeds maximum size");
         return false;

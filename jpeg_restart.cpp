@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <csetjmp>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -27,7 +28,8 @@ void jpegFailure(j_common_ptr jpeg) {
     std::longjmp(state->jump, 1);
 }
 
-bool encode(const cv::Mat& source, unsigned interval, std::vector<unsigned char>& bytes) {
+bool encode(const cv::Mat& source, unsigned interval, std::vector<unsigned char>& bytes,
+            unsigned* encode_calls = nullptr) {
     cv::Mat input;
     if (source.type() == CV_8UC1) input = source;
     else if (source.type() == CV_8UC3) cv::cvtColor(source, input, cv::COLOR_BGR2RGB);
@@ -60,6 +62,7 @@ bool encode(const cv::Mat& source, unsigned interval, std::vector<unsigned char>
     c.arith_code = FALSE;
     c.restart_interval = interval;
     c.dct_method = JDCT_ISLOW;
+    if (encode_calls) ++*encode_calls;
     jpeg_start_compress(&c, TRUE);
     while (c.next_scanline < c.image_height) {
         JSAMPROW row = const_cast<JSAMPROW>(input.ptr(c.next_scanline));
@@ -161,7 +164,8 @@ std::vector<std::uint32_t> restartTilePermutation(unsigned width, unsigned heigh
 
 bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
                             std::vector<JpegRestartRegion>& regions, unsigned* used_interval,
-                            bool tile_shuffle) {
+                            bool tile_shuffle, double prior_entropy_bytes_per_mcu,
+                            unsigned* encode_calls) {
     regions.clear();
     if (image.empty() || parity > 1 || image.cols % 8 || image.rows % 8 ||
         image.cols > 32760 || image.rows > 65528 ||
@@ -183,39 +187,14 @@ bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
     // Every segment is decoded locally as one 8-pixel-high JPEG strip. Its
     // blocks are then scattered back into the raster, including across rows.
     const unsigned max_interval = std::min(blocks, static_cast<unsigned>(JPEG_MAX_DIMENSION / 8));
-    unsigned interval = std::min(max_interval,
-        static_cast<unsigned>(kRestartMaxEntropyBytes / (64.0 * 0.35)));
-    unsigned fitted_interval = 0, growth_probes = 0;
+    const double cost = std::isfinite(prior_entropy_bytes_per_mcu) && prior_entropy_bytes_per_mcu > 0.0
+        ? prior_entropy_bytes_per_mcu : 64.0 * 0.35;
+    const unsigned interval = static_cast<unsigned>(std::clamp(
+        std::floor(kRestartTargetEntropyBytes / cost), 1.0, double(max_interval)));
     std::vector<unsigned char> jpeg;
     std::vector<std::vector<unsigned char>> segments;
-    for (;;) {
-        std::vector<std::vector<unsigned char>> trial;
-        if (!encode(input, interval, jpeg) || !split(jpeg, trial)) return false;
-        if (trial.size() != (blocks + interval - 1) / interval) return false;
-        std::size_t largest = 0;
-        for (const auto& segment : trial) largest = std::max(largest, segment.size());
-        if (largest <= kRestartMaxEntropyBytes) {
-            segments = std::move(trial);
-            fitted_interval = interval;
-            // A fixed bytes/pixel estimate can underfill smooth images. Try at
-            // most two larger intervals, aiming at 90% of the entropy budget.
-            // Keep the last fully checked result if a growth probe overshoots.
-            const unsigned target = static_cast<unsigned>(kRestartMaxEntropyBytes * 9 / 10);
-            if (largest >= target || interval == max_interval || growth_probes == 2) break;
-            const unsigned next = std::min(max_interval,
-                static_cast<unsigned>(interval * std::size_t(target) / largest));
-            if (next <= interval) break;
-            interval = next;
-            ++growth_probes;
-            continue;
-        }
-        if (fitted_interval) break;
-        if (interval == 1) return false;
-        interval = std::max(1u, std::min(interval - 1,
-            static_cast<unsigned>(interval * kRestartMaxEntropyBytes / largest)));
-        // No row alignment or row-divisor constraint: a restart counts MCUs.
-    }
-    interval = fitted_interval;
+    if (!encode(input, interval, jpeg, encode_calls) || !split(jpeg, segments)) return false;
+    if (segments.size() != (blocks + interval - 1) / interval) return false;
     std::vector<JpegRestartRegion> result;
     result.reserve(segments.size());
     for (std::size_t i = 0; i < segments.size(); ++i) {
@@ -229,7 +208,6 @@ bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
         r.profile = image.channels() == 1 ? kRestartGray85 : kRestartColor44485;
         r.layout = tile_shuffle ? kRestartTileShuffle : 0;
         r.entropy = std::move(segments[i]);
-        if (!validRestartEntropy(r.entropy)) return false;
         result.push_back(std::move(r));
     }
     if (used_interval) *used_interval = interval;

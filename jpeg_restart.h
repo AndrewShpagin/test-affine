@@ -15,7 +15,10 @@ constexpr std::uint8_t kRestartTileShuffle = 1; // layout byte: shared 16x8 perm
 constexpr std::uint8_t kRestartPacketType = 5; // internal AFC1
 constexpr std::size_t kRestartHeaderBytes = 32;
 constexpr std::size_t kRestartWireHeaderBytes = 36;
-constexpr std::size_t kRestartMaxEntropyBytes = 1300 - kRestartWireHeaderBytes;
+constexpr std::size_t kRestartTargetDatagramBytes = 1300;
+constexpr std::size_t kRestartMaxDatagramBytes = 65507; // absolute IPv4 UDP payload limit
+constexpr std::size_t kRestartTargetEntropyBytes = kRestartTargetDatagramBytes - kRestartWireHeaderBytes;
+constexpr std::size_t kRestartMaxEntropyBytes = kRestartMaxDatagramBytes - kRestartWireHeaderBytes;
 constexpr std::uint64_t kRestartMaxImagePixels = 16u * 1024u * 1024u;
 
 struct JpegRestartRegion {
@@ -37,9 +40,13 @@ bool validRestartEntropy(const std::vector<unsigned char>& entropy);
 // Maps encoded half-image block index to its original spatial block index.
 // Identical for both parities; independent of packet arrival order and frame ID.
 std::vector<std::uint32_t> restartTilePermutation(unsigned layer_width, unsigned layer_height);
+// Exactly one compression. Regions may exceed the soft target or even the UDP
+// hard limit; the caller measures all of them and drops unsendable regions.
 bool encodeJpegRestartLayer(const cv::Mat& image, unsigned parity,
                             std::vector<JpegRestartRegion>& regions,
-                            unsigned* restart_interval = nullptr, bool tile_shuffle = false);
+                            unsigned* restart_interval = nullptr, bool tile_shuffle = false,
+                            double prior_entropy_bytes_per_mcu = 0.0,
+                            unsigned* encode_calls = nullptr);
 // Builds a normal standalone JPEG locally; no header/table packet is needed.
 std::vector<unsigned char> restartJpegHeader(std::uint8_t profile, unsigned width);
 bool makeRestartJpeg(const JpegRestartRegion& region, std::vector<unsigned char>& jpeg);

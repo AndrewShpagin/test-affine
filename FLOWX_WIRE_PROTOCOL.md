@@ -34,7 +34,10 @@ Packet types:
 ```
 
 No `header_size`, `payload_size`, or second magic is transmitted. UDP already supplies the datagram size.
-Datagrams are limited to 1300 bytes, including the FlowX header.
+1300 bytes including the FlowX header is the target size. Types 1–3 retain that
+hard limit. Type 4 (JPEG restart regions) can exceed it, up to 65,507 bytes, so
+JPEG encoding never needs a second pass to fit a packet. IP fragmentation is
+permitted by the sender; there is no application drop threshold at the path MTU.
 
 ---
 
@@ -206,7 +209,7 @@ span multiple rows in the encoded raster. All offsets below include the common 2
 | 32 | 2 | Decoded strip width: block count times 8 |
 | 34 | 1 | Fixed JPEG profile: 1 = gray Q85, 2 = YCbCr 4:4:4 Q85 |
 | 35 | 1 | Layout: 0 = spatial order, 1 = shared 16x8 tile shuffle v1 |
-| 36 | 1–1264 | JPEG entropy data, without restart markers |
+| 36 | 1–65471 | JPEG entropy data, without restart markers (target: 1264 bytes) |
 
 The assembled keyframe dimensions are `2 * half_width` by `half_height`,
 and are scaled to the original output size when rendered. Let
@@ -253,6 +256,8 @@ Row-bound type-4 receivers also reject segments that cross a row. Update native
 receivers and reload browser decoders before using the cross-row sender. Updated
 receivers continue to accept older row-bound packets; header size and layout
 values have not changed.
+Receivers enforcing the former 1300-byte hard limit must also be updated before
+using the single-pass sender. No new flags, headers, or layout values are needed.
 
 ## Loss behavior
 

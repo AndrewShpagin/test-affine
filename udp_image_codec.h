@@ -50,6 +50,8 @@ struct EncoderTiming {
     bool strips_keyframe = false;
     KeyframeCodec keyframe_codec = KeyframeCodec::Jpeg;
     std::array<std::size_t, 3> jpeg_layer_bytes{};
+    unsigned jpeg_encode_calls = 0; // actual restart JPEG compressor calls this frame
+    std::size_t jpeg_unsendable_chunks = 0, jpeg_unsendable_bytes = 0, jpeg_unsendable_max = 0;
     cv::Size jpeg_size;
     int jpeg_quality = 0;
     int jpeg2000_compression_x1000 = 0;
@@ -90,11 +92,20 @@ public:
     }
     bool stripsKeyframes() const { return strips_keyframes_; }
     void setJpegTileShuffle(bool enabled) {
-        if (jpeg_tile_shuffle_ != enabled) strips_jpeg_bytes_per_pixel_ = 0.0;
+        if (jpeg_tile_shuffle_ != enabled) {
+            strips_jpeg_bytes_per_pixel_ = 0.0;
+            restart_entropy_bytes_per_mcu_ = {};
+        }
         jpeg_tile_shuffle_ = enabled;
     }
     bool jpegTileShuffle() const { return jpeg_tile_shuffle_; }
-    void setKeyframeCodec(KeyframeCodec codec) { keyframe_codec_ = codec; }
+    void setKeyframeCodec(KeyframeCodec codec) {
+        if (keyframe_codec_ != codec) {
+            strips_jpeg_bytes_per_pixel_ = 0.0;
+            restart_entropy_bytes_per_mcu_ = {};
+        }
+        keyframe_codec_ = codec;
+    }
     KeyframeCodec keyframeCodec() const { return keyframe_codec_; }
     void setHomographyTransform(bool enabled) { homography_transform_ = enabled; }
     bool homographyTransform() const { return homography_transform_; }
@@ -124,6 +135,7 @@ private:
     double mosaic_jpeg_bytes_per_pixel_ = 0.0;
     int mosaic_jpeg_model_channels_ = 0;
     double strips_jpeg_bytes_per_pixel_ = 0.0;
+    std::array<double, 2> restart_entropy_bytes_per_mcu_{};
     int strips_jpeg_model_channels_ = 0;
     KeyframeCodec keyframe_codec_ = KeyframeCodec::Jpeg;
     bool mosaic_keyframes_ = false;

@@ -12,6 +12,8 @@
 #include <ws2tcpip.h>
 #else
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -60,6 +62,23 @@ std::string socketErrorText(const char* operation) {
            std::to_string(lastSocketError()) + ")";
 }
 
+bool allowFragmentation(SocketHandle socket, int family) {
+    // The JPEG target is soft. Permit the IP stack to fragment an occasional
+    // overshoot rather than forcing another compression pass to satisfy MTU.
+    int value = 0, level = 0, option = 0;
+#ifdef _WIN32
+    level = family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+    option = family == AF_INET ? IP_DONTFRAGMENT : IPV6_DONTFRAG;
+#elif defined(__linux__)
+    level = family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+    option = family == AF_INET ? IP_MTU_DISCOVER : IPV6_MTU_DISCOVER;
+    value = family == AF_INET ? IP_PMTUDISC_DONT : IPV6_PMTUDISC_DONT;
+#else
+    return true; // retain platform defaults where this option is unavailable
+#endif
+    return ::setsockopt(socket, level, option, reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
+}
+
 } // namespace
 
 struct UdpSender::Impl {
@@ -103,6 +122,11 @@ bool UdpSender::open(const UdpTargetConfig& config, std::string& error) {
     for (addrinfo* ai = result; ai; ai = ai->ai_next) {
         SocketHandle socket = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (socket == kInvalidSocket) continue;
+        if (!allowFragmentation(socket, ai->ai_family)) {
+            error = socketErrorText("allow UDP fragmentation");
+            closeSocket(socket);
+            continue;
+        }
 #ifdef _WIN32
         const int address_length = static_cast<int>(ai->ai_addrlen);
 #else

@@ -1,4 +1,5 @@
 #include "udp_image_codec.h"
+#include "jpeg_restart.h"
 
 #include <opencv2/opencv.hpp>
 
@@ -331,7 +332,7 @@ int main(int argc, char** argv) {
               << "Homography transform: " << (kUseHomographyTransform ? "yes" : "no") << '\n'
               << "Mesh transform: " << (kUseMeshTransform ? "yes" : "no") << '\n'
               << "Reuse previous-frame borders: " << (kReusePreviousFrameBorders ? "yes" : "no") << '\n'
-              << "Max packet bytes: " << affinecodec::kMaxUdpPacketBytes << '\n'
+              << "Packet target bytes: " << affinecodec::kMaxUdpPacketBytes << " (JPEG restart may exceed it)\n"
               << "Number of images: " << files.size() << "\n\n";
 
     Encoder encoder;
@@ -379,7 +380,9 @@ int main(int argc, char** argv) {
             frame_bytes += chunk.size();
             total_bytes += chunk.size();
 
-            if (chunk.size() > affinecodec::kMaxUdpPacketBytes) {
+            const auto limit = chunk.size() > 5 && chunk[5] == affinecodec::kRestartPacketType
+                ? affinecodec::kRestartHeaderBytes + affinecodec::kRestartMaxEntropyBytes : affinecodec::kMaxUdpPacketBytes;
+            if (chunk.size() > limit) {
                 std::cerr << "ERROR: packet " << chunk.size() << " B exceeds codec limit\n";
                 return 3;
             }
@@ -518,7 +521,6 @@ int main(int argc, char** argv) {
                   << patch_frames << " patch frames\n";
     }
 
-    std::cout << "Every getNextChunk() result is <= "
-              << affinecodec::kMaxUdpPacketBytes << " bytes.\n";
+    std::cout << "Every getNextChunk() result fits its packet type's hard limit.\n";
     return 0;
 }
