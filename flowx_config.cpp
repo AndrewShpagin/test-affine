@@ -169,6 +169,12 @@ SenderConfig loadSenderConfig(const std::string& filename) {
     cfg.udp.host = udp.value("host", cfg.udp.host);
     cfg.udp.port = parsePort(udp, "port", cfg.udp.port);
     if (cfg.udp.host.empty()) throw std::runtime_error("udp.host must not be empty");
+    const auto mtu_it = udp.find("mtu");
+    if (mtu_it != udp.end()) {
+        if (!mtu_it->is_number_integer() || mtu_it->get<double>() < 68 || mtu_it->get<double>() > 65535)
+            throw std::runtime_error("udp.mtu must be an integer in [68, 65535]");
+        cfg.udp.mtu = mtu_it->get<int>();
+    }
 
     const auto control_it = root.find("control");
     if (control_it != root.end()) {

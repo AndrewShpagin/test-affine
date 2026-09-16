@@ -121,6 +121,26 @@ Each datagram has an independent 10% drop probability in this example. The seed 
 
 `--loss` is accepted as a short alias for `--loss-percent`.
 
+## UDP datagram statistics
+
+The periodic and final reports include, for example,
+`udp-atomic-limit=1472B udp-over-atomic=2.35%`.
+The percentage is the cumulative fraction of **all formed UDP datagrams** whose
+payload is strictly larger than the displayed unfragmented-size threshold.
+It includes JPEG/JPEG2000 chunks, PATCHes, and end markers, measured before
+simulated loss and socket sends. It excludes regions above the absolute UDP
+limit that could not be formed into datagrams. With no datagrams it is `0.00%`.
+
+The optional sender setting `udp.mtu` defaults to `1500` (integer, 68–65535).
+The threshold subtracts the base IP and UDP headers for the actual connected
+address family: 28 bytes for IPv4, 48 for IPv6. Thus MTU 1500 gives 1472/1452
+bytes respectively. For example, add `"mtu": 1400` beside `host` and `port` in
+the sender's `udp` object to use a 1372-byte threshold with IPv4.
+This setting affects statistics only; it does not change packet sizes or sending.
+The result estimates fragmentation against your configured path MTU, not observed
+IP fragments or automatic path MTU discovery. Account for tunnels or additional
+IP headers by lowering the configured MTU as appropriate.
+
 ## JPEG datagram statistics
 
 The periodic console report (every two seconds while encoding) and final report

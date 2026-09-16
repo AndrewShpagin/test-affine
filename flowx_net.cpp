@@ -83,6 +83,7 @@ bool allowFragmentation(SocketHandle socket, int family) {
 
 struct UdpSender::Impl {
     SocketHandle socket = kInvalidSocket;
+    std::size_t atomic_payload_bytes = 0;
     ~Impl() { closeSocket(socket); }
 };
 
@@ -97,6 +98,12 @@ bool UdpSender::open(const UdpTargetConfig& config, std::string& error) {
 
     closeSocket(impl_->socket);
     impl_->socket = kInvalidSocket;
+    impl_->atomic_payload_bytes = 0;
+
+    if (config.mtu < 68 || config.mtu > 65535) {
+        error = "udp.mtu must be an integer in [68, 65535]";
+        return false;
+    }
 
     if (!ensureSocketSystem(error)) return false;
 
@@ -134,6 +141,7 @@ bool UdpSender::open(const UdpTargetConfig& config, std::string& error) {
 #endif
         if (::connect(socket, ai->ai_addr, address_length) == 0) {
             impl_->socket = socket;
+            impl_->atomic_payload_bytes = config.mtu - (ai->ai_family == AF_INET6 ? 48 : 28);
             break;
         }
         closeSocket(socket);
@@ -175,6 +183,10 @@ bool UdpSender::send(const std::vector<u_char>& datagram, std::string& error) {
 
 bool UdpSender::isOpen() const {
     return impl_ && impl_->socket != kInvalidSocket;
+}
+
+std::size_t UdpSender::atomicPayloadBytes() const {
+    return impl_ ? impl_->atomic_payload_bytes : 0;
 }
 
 } // namespace flowx

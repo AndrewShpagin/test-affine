@@ -43,6 +43,7 @@ struct CodecConfig {
 struct UdpTargetConfig {
     std::string host = "127.0.0.1";
     std::uint16_t port = 5000;
+    int mtu = 1500; // Assumed path MTU, used only for unfragmented-size statistics.
 };
 
 struct SenderControlConfig {

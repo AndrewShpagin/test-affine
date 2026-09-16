@@ -157,6 +157,8 @@ int main(int argc, char** argv) {
             std::cout << ", mesh=off";
         std::cout << '\n'
                   << "  UDP target: " << cfg.udp.host << ':' << cfg.udp.port << '\n'
+                  << "  UDP atomic payload: " << udp.atomicPayloadBytes()
+                  << " B (configured MTU=" << cfg.udp.mtu << " B; statistics only)\n"
                   << "  FlowX wire: v" << static_cast<int>(flowx::kProtocolVersion)
                   << ", target datagram=" << flowx::kTargetUdpDatagramBytes
                   << " B, UDP hard limit=" << flowx::kMaxUdpDatagramBytes << " B\n";
@@ -215,16 +217,21 @@ int main(int argc, char** argv) {
         std::uint64_t simulated_lost_bytes = 0;
         std::uint64_t failed_packets = 0;
         std::uint64_t failed_bytes = 0;
+        const std::size_t udp_atomic_limit = udp.atomicPayloadBytes();
+        std::uint64_t udp_datagrams = 0, udp_over_atomic = 0;
         std::uint64_t jpeg_chunk_datagrams = 0, jpeg_chunk_bytes = 0;
         std::uint64_t jpeg_chunk_max = 0, jpeg_chunk_over_target = 0, jpeg_hard_dropped = 0;
-        const auto jpegStats = [&] {
+        const auto packetStats = [&] {
             std::ostringstream text;
             text << " jpeg-chunks=" << jpeg_chunk_datagrams
                  << " jpeg-chunk-avg=" << std::fixed << std::setprecision(1)
                  << (jpeg_chunk_datagrams ? double(jpeg_chunk_bytes) / jpeg_chunk_datagrams : 0.0)
                  << "B jpeg-chunk-max=" << jpeg_chunk_max << "B"
                  << " jpeg-chunk-over-target=" << jpeg_chunk_over_target
-                 << " jpeg-hard-dropped=" << jpeg_hard_dropped;
+                 << " jpeg-hard-dropped=" << jpeg_hard_dropped
+                 << " udp-atomic-limit=" << udp_atomic_limit << "B"
+                 << " udp-over-atomic=" << std::setprecision(2)
+                 << (udp_datagrams ? 100.0 * udp_over_atomic / udp_datagrams : 0.0) << '%';
             return text.str();
         };
         std::string last_udp_error;
@@ -292,6 +299,11 @@ int main(int argc, char** argv) {
                     break;
                 }
 
+                // All formed UDP datagrams, including PATCHes and end markers.
+                // Unsendable JPEG regions are not datagrams and are excluded.
+                ++udp_datagrams;
+                udp_over_atomic += datagram.size() > udp_atomic_limit;
+
                 // Count JPEG key data before loss simulation/send failures. The
                 // size includes FlowX framing, but not IP/UDP headers or PATCHes.
                 const auto type = static_cast<flowx::WirePacketType>(datagram[2] & 0x0f);
@@ -343,7 +355,7 @@ int main(int argc, char** argv) {
                           << " packets=" << sent_packets
                           << " sim-loss=" << simulated_lost_packets
                           << " failed=" << failed_packets
-                          << " bytes=" << sent_bytes << jpegStats() << std::endl;
+                          << " bytes=" << sent_bytes << packetStats() << std::endl;
                 next_report = now + std::chrono::seconds(2);
             }
         }
@@ -363,7 +375,7 @@ int main(int argc, char** argv) {
             std::cout << " sim-loss-bytes=" << simulated_lost_bytes;
         if (failed_bytes > 0)
             std::cout << " failed-bytes=" << failed_bytes;
-        std::cout << jpegStats() << '\n';
+        std::cout << packetStats() << '\n';
         return fatal_error ? 1 : 0;
     } catch (const std::exception& e) {
         std::cerr << "flowx_sender: " << e.what() << '\n';

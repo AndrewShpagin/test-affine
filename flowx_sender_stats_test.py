@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare sender JPEG statistics with real UDP datagrams, including loss=100%."""
+"""Compare sender JPEG/MTU statistics with real UDP datagrams, including loss=100%."""
 import json
 from pathlib import Path
 import re
@@ -11,9 +11,10 @@ import tempfile
 import threading
 
 
-def run(sender, folder, strips, codec='jpeg', loss=0):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.bind(('127.0.0.1', 0))
+def run(sender, folder, strips, codec='jpeg', loss=0, mtu=None, host='127.0.0.1', fps=20):
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        sock.bind((host, 0))
         sock.settimeout(.1)
         packets, stopped = [], threading.Event()
 
@@ -26,10 +27,12 @@ def run(sender, folder, strips, codec='jpeg', loss=0):
 
         collector = threading.Thread(target=collect)
         collector.start()
-        config = {'source': {'type': 'folder', 'path': str(folder), 'fps': 20, 'loop': False},
+        config = {'source': {'type': 'folder', 'path': str(folder), 'fps': fps, 'loop': False},
                   'codec': {'keyframe_bytes': 4000, 'keyframe_period': 5, 'grayscale': True,
                             'strips': strips, 'keyframe_codec': codec},
-                  'udp': {'host': '127.0.0.1', 'port': sock.getsockname()[1]}}
+                  'udp': {'host': host, 'port': sock.getsockname()[1]}}
+        if mtu is not None:
+            config['udp']['mtu'] = mtu
         path = folder.parent / 'sender.json'
         path.write_text(json.dumps(config))
         try:
@@ -49,6 +52,24 @@ def run(sender, folder, strips, codec='jpeg', loss=0):
         assert sizes, line
         maximum, overshoots, hard_drops = map(int, sizes.groups())
         assert hard_drops == 0, line
+        reports = [report for report in result.stdout.splitlines()
+                   if report.startswith(('frames captured=', 'FlowX sender stopped:'))]
+        if fps == 5:
+            assert len(reports) > 1, 'periodic report not exercised'
+        for report in reports:
+            atomic = re.search(r'udp-atomic-limit=(\d+)B udp-over-atomic=([\d.]+)%', report)
+            assert atomic, report
+            limit, percent = int(atomic[1]), float(atomic[2])
+            assert limit == (1500 if mtu is None else mtu) - (48 if family == socket.AF_INET6 else 28), report
+            if loss == 100:
+                # The fixture contains >1300-byte chunks, even though none reach UDP.
+                assert 0 < percent < 100, report
+            else:
+                sent = int(re.search(r' packets=(\d+)', report)[1])
+                assert sent > 0 and sent <= len(packets), (report, len(packets))
+                received = packets[:sent]
+                expected = 100 * sum(len(p) > limit for p in received) / len(received)
+                assert abs(percent - expected) <= .0051, (report, expected)
         if loss == 100:
             assert not packets and count > 0 and 0 < average <= maximum <= 65507, line
             assert overshoots > 0, 'fixture never exceeded soft target'
@@ -63,7 +84,9 @@ def run(sender, folder, strips, codec='jpeg', loss=0):
             assert overshoots == sum(len(p) > 1300 for p in chunks), line
             if strips:
                 assert overshoots > 0, 'fixture never exceeded soft target'
-        print(f'PASS: JPEG datagram mean, strips={strips}, codec={codec}, loss={loss}: {count}, {average}B')
+        print(f'PASS: datagram stats, strips={strips}, codec={codec}, loss={loss}, host={host}: '
+              f'{count}, {average}B, atomic={limit}B, over={percent}%')
+        return packets
 
 
 def main(sender):
@@ -78,10 +101,23 @@ def main(sender):
                struct.pack('<IiiHHIIiiII', 40, width, height, 1, 24, 0, len(pixels), 0, 0, 0, 0) + pixels)
         for i in range(16):
             (folder / f'{i:03}.bmp').write_bytes(bmp)
-        run(sender, folder, True)
+        packets = run(sender, folder, True)
         run(sender, folder, False)
-        run(sender, folder, True, loss=100)
+        run(sender, folder, True, loss=100, mtu=1280)
         run(sender, folder, False, codec='jpeg2000')
+        run(sender, folder, True, mtu=1280, fps=5)
+        # Exactly at the threshold is atomic; one byte above must count.
+        maximum = max(map(len, packets))
+        boundary = run(sender, folder, True, mtu=maximum + 28)
+        assert max(map(len, boundary)) == maximum, 'boundary fixture changed'
+        run(sender, folder, True, mtu=maximum + 27)
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+                probe.bind(('::1', 0))
+        except OSError:
+            print('SKIP: IPv6 loopback unavailable')
+        else:
+            run(sender, folder, True, host='::1')
 
 
 if __name__ == '__main__':
